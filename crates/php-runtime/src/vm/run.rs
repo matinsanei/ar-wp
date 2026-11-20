@@ -1,0 +1,7551 @@
+//! The bounded VM dispatch loop (run_loop) — the hot Op match. Split from
+//! vm/mod.rs verbatim (structural move only; hot-path unchanged).
+
+use std::borrow::Cow;
+
+use super::*;
+
+// S-102 punto 4 (A-BA-103-1): hook compatti del census pila operandi —
+// `scn!(Sito: op)` conta una esecuzione dell'arm, `scn!(Sito: Prim = n)`
+// conta n transiti della primitiva AL SENTIERO ESEGUITO (fast e slow si
+// contano dove eseguono, mai staticamente). Vuoto fuori dalla feature.
+#[cfg(feature = "zval-census")]
+macro_rules! scn {
+    ($site:ident: op) => {
+        super::stackcensus::note_op(super::stackcensus::Site::$site)
+    };
+    ($site:ident: $prim:ident = $n:expr) => {
+        super::stackcensus::note(
+            super::stackcensus::Site::$site,
+            super::stackcensus::Prim::$prim,
+            $n,
+        )
+    };
+}
+#[cfg(not(feature = "zval-census"))]
+macro_rules! scn {
+    ($($t:tt)*) => {};
+}
+
+// S-103 drop-census (design in wp103-harness/hc2-prep-design.md §2):
+// `dcn!(Sito: &v)` conta UNA fine-vita di Zval al sito, classificata per
+// specie col predicato `is_gc_container` — si piazza dove la vita del
+// valore finisce, sul sentiero eseguito. Vuoto fuori dalla feature.
+#[cfg(feature = "zval-census")]
+macro_rules! dcn {
+    ($site:ident: $v:expr) => {
+        super::stackcensus::note_drop(
+            super::stackcensus::Site::$site,
+            ($v).is_gc_container(),
+        )
+    };
+}
+#[cfg(not(feature = "zval-census"))]
+macro_rules! dcn {
+    ($($t:tt)*) => {};
+}
+
+// S-103 leva-nulla (A-BA-103-4 → KS-BA-104-2, design in
+// wp103-harness/hc2-prep-design.md §1): perturbazione di LAYOUT
+// semanticamente NULLA — mai chiamata, #[no_mangle] la tiene nel testo,
+// #[inline(never)] la tiene FUORI dai sentieri. Il |Δ| misurato sul
+// giudice tra pin e build `--features null-lever` È la banda-layout:
+// nessun A/B micro è giudicabile sotto quella banda.
+#[cfg(feature = "null-lever")]
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn phpr_null_lever_pad() -> u64 {
+    std::hint::black_box(0xC0FF_EEu64)
+}
+
+/// A file op that a userland stream wrapper (`stream_wrapper_register`) can
+/// service via its `stream_*` methods, if its first argument is a `UserStream`.
+fn is_user_stream_op(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"fread"
+            | b"fwrite"
+            | b"fputs"
+            | b"feof"
+            | b"fclose"
+            | b"fgets"
+            | b"stream_get_contents"
+            | b"rewind"
+            | b"fseek"
+            | b"ftell"
+    )
+}
+
+/// The resource handle if `v` (following a ref) is a userland-wrapper stream.
+fn user_stream_rc(v: &Zval) -> Option<Rc<RefCell<php_types::Resource>>> {
+    match v.deref_clone() {
+        Zval::Resource(rc) if rc.borrow().as_user_stream().is_some() => Some(rc),
+        _ => None,
+    }
+}
+
+/// A path-taking builtin serviceable on a registered userland wrapper URL:
+/// stat-family via the wrapper's `url_stat`, image/exif introspection via an
+/// open/read-to-EOF/close of the wrapper stream (see `user_wrapper_path_op`).
+pub(super) fn is_user_wrapper_path_op(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"file_exists"
+            | b"is_file"
+            | b"is_dir"
+            | b"is_readable"
+            | b"is_writable"
+            | b"is_writeable"
+            | b"filesize"
+            | b"filemtime"
+            | b"stat"
+            | b"getimagesize"
+            | b"exif_read_data"
+            | b"exif_imagetype"
+    )
+}
+
+/// The URL bytes if `v` is a string whose scheme is a registered userland wrapper
+/// (so `file_get_contents` routes through the wrapper instead of the filesystem).
+pub(super) fn user_wrapper_url(
+    v: &Zval,
+    wrappers: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let s = match v.deref_clone() {
+        Zval::Str(s) => s.as_bytes().to_vec(),
+        _ => return None,
+    };
+    let pos = s.windows(3).position(|w| w == b"://")?;
+    if wrappers.contains_key(&s[..pos].to_ascii_lowercase()) {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// WP-33 T1a: the identity class of an operand for the `===`/`!==` fast
+/// path. Mirrors the arm structure of [`ops::identical`] exactly: two
+/// operands of DIFFERENT classes are never identical (no coercion), same
+/// class falls back to the generic path unless handled inline. `Ref`,
+/// `ArgPlace` and `WeakHandle` return `None` (deref / special-cased there).
+#[inline(always)]
+fn ident_class(v: &Zval) -> Option<u8> {
+    Some(match v {
+        // `identical` treats Undef and Null as one identity class.
+        Zval::Undef | Zval::Null => 0,
+        Zval::Bool(_) => 1,
+        Zval::Long(_) => 2,
+        Zval::Double(_) => 3,
+        Zval::Str(_) => 4,
+        Zval::Array(_) => 5,
+        Zval::Object(_) => 6,
+        Zval::Resource(_) => 7,
+        Zval::Closure(_) => 8,
+        Zval::Generator(_) => 9,
+        _ => return None,
+    })
+}
+
+/// WP-33 T1a: monomorphic fast paths for the hottest operand tag pairs
+/// (census-driven: Concat/NotIdentical (Str,Str) ~30M each per WP suite
+/// run, Long arithmetic/compares, cross-class `===` constants). Tried
+/// straight after the two pops in [`Vm::binary_value`]; `None` falls
+/// through to the generic path (lazy realization, `__toString` rule,
+/// GMP/BcMath overloads, division/shift error paths, numeric-string
+/// loose equality) unchanged.
+///
+/// Semantics are inlined VERBATIM from ops.rs: Long overflow promotes to
+/// Double recomputing on the ORIGINAL operands (never the wrapped value);
+/// Double comparisons keep IEEE semantics (`Gt`/`Ge` written as the
+/// swapped `smaller` forms, NaN-exact; `===` is IEEE `==`: -0.0===0.0,
+/// NaN!==NaN). String LOOSE equality never fast-paths ("10"=="1e1" lives
+/// in smart_streq only). None of the handled pairs can involve a lazy
+/// object, an overload receiver, or a diagnostic.
+#[inline(always)]
+fn binary_fast(b: BinOp, lhs: &Zval, rhs: &Zval) -> Option<Zval> {
+    use BinOp::*;
+    Some(match (lhs, rhs) {
+        (Zval::Long(l), Zval::Long(r)) => {
+            let (l, r) = (*l, *r);
+            match b {
+                Add => match l.checked_add(r) {
+                    Some(s) => Zval::Long(s),
+                    None => Zval::Double(l as f64 + r as f64),
+                },
+                Sub => match l.checked_sub(r) {
+                    Some(s) => Zval::Long(s),
+                    None => Zval::Double(l as f64 - r as f64),
+                },
+                Mul => match l.checked_mul(r) {
+                    Some(s) => Zval::Long(s),
+                    None => Zval::Double(l as f64 * r as f64),
+                },
+                Lt => Zval::Bool(l < r),
+                Le => Zval::Bool(l <= r),
+                Gt => Zval::Bool(l > r),
+                Ge => Zval::Bool(l >= r),
+                Eq | Identical => Zval::Bool(l == r),
+                NotEq | NotIdentical => Zval::Bool(l != r),
+                Spaceship => Zval::Long(match l.cmp(&r) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }),
+                BitAnd => Zval::Long(l & r),
+                BitOr => Zval::Long(l | r),
+                BitXor => Zval::Long(l ^ r),
+                // S-112 H-A2a: shift semantics VERBATIM from ops::shl/shr —
+                // y<0 raises ArithmeticError, so that arm stays generic
+                // (binary_fast cannot error); y>=64 saturates to 0 (shl) or
+                // the sign fill (shr).
+                Shl => {
+                    if r < 0 {
+                        return None;
+                    }
+                    if r >= 64 {
+                        Zval::Long(0)
+                    } else {
+                        Zval::Long(((l as u64) << r) as i64)
+                    }
+                }
+                Shr => {
+                    if r < 0 {
+                        return None;
+                    }
+                    if r >= 64 {
+                        Zval::Long(if l < 0 { -1 } else { 0 })
+                    } else {
+                        Zval::Long(l >> r)
+                    }
+                }
+                // Div (zero / exact-division / MIN÷-1), Mod, Pow, negative
+                // shifts, Concat → generic.
+                _ => return None,
+            }
+        }
+        (Zval::Double(l), Zval::Double(r)) => {
+            let (l, r) = (*l, *r);
+            match b {
+                Add => Zval::Double(l + r),
+                Sub => Zval::Double(l - r),
+                Mul => Zval::Double(l * r),
+                Lt => Zval::Bool(l < r),
+                Le => Zval::Bool(l <= r),
+                // `a > b` is `smaller(b, a)`: the swapped form is NaN-exact.
+                Gt => Zval::Bool(r < l),
+                Ge => Zval::Bool(r <= l),
+                Identical => Zval::Bool(l == r),
+                NotIdentical => Zval::Bool(l != r),
+                // Eq/NotEq/Spaceship keep the generic compare() path.
+                _ => return None,
+            }
+        }
+        (Zval::Str(l), Zval::Str(r)) => match b {
+            // Operands are already strings — `ops::concat`'s to_zstr is an
+            // identity with no diagnostics; byte concat verbatim.
+            Concat => Zval::Str(PhpStr::concat2(l.as_bytes(), r.as_bytes())),
+            Identical => Zval::Bool(l.as_bytes() == r.as_bytes()),
+            NotIdentical => Zval::Bool(l.as_bytes() != r.as_bytes()),
+            // Loose ==/comparisons: numeric-string semantics stay in ONE
+            // place (smart_streq / compare) — never fast-pathed.
+            _ => return None,
+        },
+        (lhs, rhs) if matches!(b, Identical | NotIdentical) => {
+            // Cross-class `===` is a constant: no coercion, no lazy init,
+            // no overload (try_number_binop never handles ===/!==), and
+            // ops::identical's cross-class arms are all `_ => false`.
+            match (ident_class(lhs), ident_class(rhs)) {
+                (Some(ca), Some(cb)) if ca != cb => Zval::Bool(b == NotIdentical),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// S-171 L-SL1 «forma sigillata Long» (wp171-harness/s171-criterio.md p.1):
+/// the Long→Long subset of [`binary_fast`]'s `(Long, Long)` arm on bare
+/// `i64`, VERBATIM. An arm that would leave the Long domain (overflow →
+/// Double, `y<0` shift → ArithmeticError, Div/Mod/Pow/Concat → generic)
+/// answers `None` and the caller falls back to the exact generic body,
+/// which recomputes from scratch. No Zval is materialised on the hit path.
+#[inline(always)]
+fn long_arith_i64(b: BinOp, l: i64, r: i64) -> Option<i64> {
+    use BinOp::*;
+    Some(match b {
+        Add => l.checked_add(r)?,
+        Sub => l.checked_sub(r)?,
+        Mul => l.checked_mul(r)?,
+        BitAnd => l & r,
+        BitOr => l | r,
+        BitXor => l ^ r,
+        Shl => {
+            if r < 0 {
+                return None;
+            }
+            if r >= 64 {
+                0
+            } else {
+                ((l as u64) << r) as i64
+            }
+        }
+        Shr => {
+            if r < 0 {
+                return None;
+            }
+            if r >= 64 {
+                if l < 0 {
+                    -1
+                } else {
+                    0
+                }
+            } else {
+                l >> r
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// S-171 L-SL1: the comparison subset of [`binary_fast`]'s `(Long, Long)`
+/// arm as a bare `bool` — no `Zval::Bool`, no `to_bool`, no diagnostics
+/// possible. `Spaceship` and every non-comparison answer `None`.
+#[inline(always)]
+fn long_cmp_i64(b: BinOp, l: i64, r: i64) -> Option<bool> {
+    use BinOp::*;
+    Some(match b {
+        Lt => l < r,
+        Le => l <= r,
+        Gt => l > r,
+        Ge => l >= r,
+        Eq | Identical => l == r,
+        NotEq | NotIdentical => l != r,
+        _ => return None,
+    })
+}
+
+/// WP-34 flatten join for an all-Str `ConcatN`, kept OUT of `run_loop`
+/// (WP-33 ⭐⭐: extra rarely-taken code in the dispatch loop costs ~3%).
+#[inline(never)]
+fn concat_n_join(stack: &mut Vec<Zval>, base: usize, total: usize) -> php_types::ZStr {
+    // S-124 single-alloc: write the parts straight into the one block
+    // (`total` is the precomputed byte sum) — no transient Vec.
+    let mut out = PhpStr::builder(total);
+    for v in stack.drain(base..) {
+        if let Zval::Str(s) = v {
+            out.push(s.as_bytes());
+        }
+    }
+    out.finish()
+}
+
+impl<'m> super::Vm<'m> {
+    /// The bounded dispatch loop: runs until the frame at `baseline` returns
+    /// ([`RunExit::Returned`]) or a generator at `baseline` suspends at a `yield`
+    /// ([`RunExit::Yielded`]), or an op raises a `PhpError` (which the caller
+    /// routes through [`Self::unwind`]). Frames above `baseline` (ordinary
+    /// callees) return normally to their callers within this same loop.
+    /// Pop rhs/lhs and evaluate a binary operator exactly as [`Op::Binary`]
+    /// does — lazy-operand realization (init_trigger_compare), the
+    /// string-vs-object `__toString` comparison rule, and the GMP/BcMath
+    /// overloads of `apply_binop_ovl` — returning the result value. Extracted
+    /// (WP-32) so [`Op::CmpJmp`] shares the identical semantics (diag order,
+    /// TypeError paths) by construction instead of by duplication.
+    fn binary_value(&mut self, top: usize, b: BinOp) -> Result<Zval, PhpError> {
+        let rhs = self.frames[top].stack.pop().expect("Binary rhs");
+        let lhs = self.frames[top].stack.pop().expect("Binary lhs");
+        self.binary_value_ab(b, lhs, rhs)
+    }
+
+    /// Owned slot read with the semantics of the `LoadVar` the lowering pass
+    /// folded away (WP-44 v3, re-armed S-97.1): queue the PHP 8 "Undefined
+    /// variable" warning on `Undef` — the pass folds a slot only after
+    /// proving the slot's name equals the LoadVar's name const, so the
+    /// message is byte-identical — and deref-clone a Ref. The name resolves
+    /// seed-aware (`unit_slot_name`): a linked `{main}` cedes its
+    /// `slot_names` table to the VM seed prefix (WP-65) AFTER the pass ran,
+    /// and the seed prefix is byte-identical to the ceded table by contract.
+    fn reg_load_slot(&mut self, top: usize, f: &crate::bytecode::Func, slot: u16) -> Zval {
+        let i = slot as usize;
+        if matches!(self.frames[top].slots[i], Zval::Undef) {
+            let msg = format!(
+                "Undefined variable ${}",
+                String::from_utf8_lossy(
+                    super::unit_slot_name(&self.seed_globals, f, i).unwrap_or(b"")
+                )
+            );
+            self.diags.push(Diag::Warning(msg));
+        }
+        read_slot(&self.frames[top].slots[i])
+    }
+
+    /// Sink a fused result into a slot, replicating `Op::StoreSlot` in full:
+    /// typed-ref coercion guard, write-through via [`store_slot`], `gc_note`
+    /// on the overwritten value.
+    fn reg_store_slot(&mut self, top: usize, dst: u16, v: Zval) -> Result<(), PhpError> {
+        let i = dst as usize;
+        let mut v = v;
+        if !self.typed_refs.is_empty() {
+            if let Zval::Ref(cell) = &self.frames[top].slots[i] {
+                let cell = Rc::clone(cell);
+                let strict = self.frames[top].module.strict;
+                v = self.typed_ref_assign(&cell, v, strict)?;
+            }
+        }
+        let old = store_slot(&mut self.frames[top].slots[i], v);
+        self.gc_note(&old);
+        Ok(())
+    }
+
+    /// S-171 L-SL1: corpo ESATTO di `Op::BinarySCSCDst` (S-108 lotto-2 W10 +
+    /// S-112 H-A2b, INVARIATO) tenuto fuori linea — vi si arriva solo quando
+    /// il cammino i64 dell'arm non copre l'istanza (tag, overflow, shift
+    /// negativo, Div/Mod/Pow); ricomputa da zero, il fast path non ha
+    /// lasciato tracce.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn binary_scsc_dst_slow(
+        &mut self,
+        top: usize,
+        func: &crate::bytecode::Func,
+        opa: BinOp,
+        la: u16,
+        ca: u16,
+        opb: BinOp,
+        lb: u16,
+        cb: u16,
+        op: BinOp,
+        opd: BinOp,
+        l: u16,
+        dst: u16,
+    ) -> Result<(), PhpError> {
+        // S-108 lotto-2 W10: l'albero BinarySCSC ESATTO (tre
+        // funnel, ordine a→b→combine) poi la coda BinarySTDst
+        // sul risultato senza transito di pila — stessa
+        // read_slot silenziosa del lhs, stessa coda (guardia
+        // binary_fast + funnel, come l'op non fusa da S-112
+        // H-A2), stesso reg_store_slot.
+        let cva = func.consts[ca as usize].to_zval();
+        let a = 'r: {
+            {
+                let lv = &self.frames[top].slots[la as usize];
+                if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                    if let Some(v) = binary_fast(opa, lv, &cva) {
+                        break 'r v;
+                    }
+                }
+            }
+            let lhs = self.reg_load_slot(top, func, la);
+            self.binary_value_ab(opa, lhs, cva)?
+        };
+        let cvb = func.consts[cb as usize].to_zval();
+        let bv = 'r: {
+            {
+                let lv = &self.frames[top].slots[lb as usize];
+                if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                    if let Some(v) = binary_fast(opb, lv, &cvb) {
+                        break 'r v;
+                    }
+                }
+            }
+            let lhs = self.reg_load_slot(top, func, lb);
+            self.binary_value_ab(opb, lhs, cvb)?
+        };
+        let res = match binary_fast(op, &a, &bv) {
+            Some(v) => v,
+            None => self.binary_value_ab(op, a, bv)?,
+        };
+        let lhs = read_slot(&self.frames[top].slots[l as usize]);
+        // S-112 H-A2b: stessa guardia inline del combine qui
+        // sopra — hoisting puro della prima riga di
+        // binary_value_ab, il miss resta al funnel.
+        let res = match binary_fast(opd, &lhs, &res) {
+            Some(v) => v,
+            None => self.binary_value_ab(opd, lhs, res)?,
+        };
+        self.reg_store_slot(top, dst, res)
+    }
+
+    /// S-171 L-SL1: corpo ESATTO di `Op::CmpJmpSC` (materializzazione del
+    /// const, guardia + binary_fast + funnel, to_bool con diags) fuori
+    /// linea; restituisce il bool del confronto, il salto resta all'arm.
+    #[cold]
+    #[inline(never)]
+    fn cmp_jmp_sc_slow(
+        &mut self,
+        top: usize,
+        func: &crate::bytecode::Func,
+        op: BinOp,
+        slot: u16,
+        cidx: u16,
+    ) -> Result<bool, PhpError> {
+        let cv = func.consts[cidx as usize].to_zval();
+        dcn!(CmpJmpSC: &cv); // il const materializzato muore nell'arm (fast o slow)
+        let res = 'r: {
+            {
+                let lv = &self.frames[top].slots[slot as usize];
+                if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                    if let Some(v) = binary_fast(op, lv, &cv) {
+                        break 'r v;
+                    }
+                }
+            }
+            let lhs = self.reg_load_slot(top, func, slot);
+            self.binary_value_ab(op, lhs, cv)?
+        };
+        dcn!(CmpJmpSC: &res); // il Bool temporaneo muore dopo to_bool
+        Ok(convert::to_bool(&res, &mut self.diags))
+    }
+
+
+    /// S-172 L-SL2: corpo ESATTO di `Op::BinarySTDst` (S-106 H-A1 + S-112
+    /// H-A2c, INVARIATO: pop del rhs, `read_slot` silenziosa del lhs, guardia
+    /// binary_fast + funnel binary_value_ab, reg_store_slot) tenuto fuori
+    /// linea — vi si arriva solo quando il cammino i64 dell'arm non copre
+    /// l'istanza (tag, overflow, Div/Mod/Pow, shift negativo); ricomputa da
+    /// zero, il fast path non ha lasciato tracce.
+    #[cold]
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn binary_st_dst_slow(
+        &mut self,
+        top: usize,
+        func: &crate::bytecode::Func,
+        ip: usize,
+        b: BinOp,
+        l: u16,
+        dst: u16,
+    ) -> Result<(), PhpError> {
+        #[cfg(feature = "zval-census")]
+        super::zvalcensus::note_slot_load_site(func, ip, &self.frames[top].slots[l as usize]);
+        #[cfg(feature = "zval-census")]
+        super::zvalcensus::note_recv_load(&self.frames[top].slots[l as usize]);
+        scn!(BinarySTDst: Pop = 1);
+        let rhs = self.frames[top].stack.pop().expect("BinarySTDst rhs");
+        let lhs = read_slot(&self.frames[top].slots[l as usize]);
+        #[cfg(feature = "zval-census")]
+        {
+            super::zvalcensus::note_prop_val(2, &lhs);
+            super::zvalcensus::note_prop_val(2, &rhs);
+        }
+        dcn!(BinarySTDst: &lhs); // consumati dalla coda (fast o funnel)
+        dcn!(BinarySTDst: &rhs);
+        // S-112 H-A2c: guardia binary_fast inline (hoisting puro
+        // della prima riga di binary_value_ab), miss al funnel.
+        let res = match binary_fast(b, &lhs, &rhs) {
+            Some(v) => v,
+            None => self.binary_value_ab(b, lhs, rhs)?,
+        };
+        // il valore corrente del dst muore nello store
+        dcn!(BinarySTDst: &self.frames[top].slots[dst as usize]);
+        self.reg_store_slot(top, dst, res)
+    }
+
+    /// Corpo di `Op::Stringify` dopo il pop (S-107 lotto): UN solo sito
+    /// possiede la semantica — condiviso con [`Op::StringifySlot`], frame
+    /// `__toString` (RET_STRINGIFY) compreso.
+    #[inline(always)]
+    fn stringify_entry(&mut self, top: usize, v: Zval) -> Result<(), PhpError> {
+        let target = v.deref_clone();
+        match &target {
+            Zval::Object(o) => {
+                let cid = o.borrow().class_id as usize;
+                match resolve_method_runtime(&self.classes, cid, b"__toString") {
+                    // __toString's (stringified) return flows back via Ret.
+                    Some((defc, midx)) => {
+                        let callee = &self.classes[defc].methods[midx].func;
+                        let m = self.class_mod(defc);
+                        let mut frame = self.pooled_frame(callee, m);
+                        frame.this = Some(target.clone());
+                        frame.class = Some(defc);
+                        frame.static_class = Some(cid);
+                        frame.flags.set(FrameFlags::RET_STRINGIFY, true);
+                        self.frames.push(frame);
+                    }
+                    None => {
+                        let name = String::from_utf8_lossy(
+                            o.borrow().class_name.as_bytes(),
+                        )
+                        .into_owned();
+                        return Err(PhpError::Error(format!(
+                            "Object of class {name} could not be converted to string"
+                        )));
+                    }
+                }
+            }
+            // A Closure / Generator has no `__toString`: the explicit
+            // cast throws like any such object (the infallible
+            // echo/concat funnel still warns — D-19.18).
+            Zval::Closure(_) => {
+                return Err(PhpError::Error(
+                    "Object of class Closure could not be converted to string".into(),
+                ));
+            }
+            Zval::Generator(_) => {
+                return Err(PhpError::Error(
+                    "Object of class Generator could not be converted to string".into(),
+                ));
+            }
+            other => {
+                let s = convert::to_zstr(other, &mut self.diags);
+                self.frames[top].stack.push(Zval::Str(s));
+            }
+        }
+        Ok(())
+    }
+
+    /// Corpo di `Op::IncDecSlot` senza il push del risultato (S-107 lotto,
+    /// [`Op::IncDecSlotPop`]/[`Op::IncDecSlotJmp`]): stessa guardia Long del
+    /// braccio non fuso, stessi `compute_incdec`/`raise_diags`/`store_slot`
+    /// nello stesso ordine. `pre` non esiste più: pre/post differivano solo
+    /// nel valore SCARTATO.
+    #[inline(always)]
+    fn incdec_slot_discard(&mut self, top: usize, slot: u16, inc: bool) -> Result<(), PhpError> {
+        let i = slot as usize;
+        // WP-33 T1c guard (identica al braccio IncDecSlot): Long puro senza
+        // overflow = op di registro, nessun diag possibile. S-171 L-SL1
+        // (criterio p.1c): il payload si aggiorna IN PLACE — nessuna
+        // riscrittura del Zval intero, nessun drop dell'old; l'overflow e
+        // ogni altro tag vanno al corpo ESATTO fuori linea.
+        if let Zval::Long(l) = &mut self.frames[top].slots[i] {
+            if let Some(n) = l.checked_add(if inc { 1 } else { -1 }) {
+                *l = n;
+                return Ok(());
+            }
+        }
+        self.incdec_slot_discard_slow(top, i, inc)
+    }
+
+    /// S-174 «sweep-in-op» (criterio wp174-harness/s174-criterio.md p.2): il
+    /// corpo di [`Op::Sweep`] è INERTE quando il frame è in un distruttore
+    /// (Frame::in_destructor) o quando vale il fast-path WP-39/WP-50 del
+    /// handler: buffer delle note vuoto (cursore in coda), nessuna demozione
+    /// light da ri-esaminare per un main sweep, pressione del cycle collector
+    /// sotto `gc_sweep_bound`. UN solo testo: il handler `Op::Sweep` lo
+    /// richiama; gli op fusi lo interrogano sullo Sweep SEGUENTE
+    /// (`sweep_skip_next`) DOPO ogni loro effetto, dal solo sentiero in place
+    /// su Long (nessun drop, nessuna chiamata PHP possibile) — si scavalca
+    /// SOLO uno Sweep che non farebbe nulla; nessuna elisione statica.
+    /// S-176 «flag gc-idle» (wp176-harness/s176-criterio-flag.md): il
+    /// fast-path è CACHED in `Vm::gc_idle[main]` (mod.rs: `gc_idle_compute`
+    /// è il testo delle tre clausole, `gc_idle_set` l'unico store) — qui un
+    /// solo byte letto, mai le tre clausole.
+    #[inline(always)]
+    fn sweep_idle(&self, top: usize, main: bool) -> bool {
+        self.frames[top].flags.get(FrameFlags::IN_DESTRUCTOR) || self.gc_idle[main as usize]
+    }
+
+    /// Vero se `func.ops[at]` è uno `Sweep` inerte (vedi [`Self::sweep_idle`]):
+    /// l'op fuso può allora saltarlo senza dispatch. Nelle build census
+    /// risponde SEMPRE falso: lo Sweep resta contato dal suo handler.
+    #[inline(always)]
+    fn sweep_skip_next(&self, top: usize, func: &Func, at: usize) -> bool {
+        #[cfg(any(feature = "op-census", feature = "gc-census"))]
+        {
+            let _ = (top, func, at);
+            false
+        }
+        #[cfg(not(any(feature = "op-census", feature = "gc-census")))]
+        {
+            matches!(func.ops.get(at), Some(Op::Sweep { main }) if self.sweep_idle(top, *main))
+        }
+    }
+
+    /// S-171 L-SL1: corpo ESATTO di [`Self::incdec_slot_discard`] oltre il
+    /// Long senza overflow (Undef→Null, `compute_incdec`, `raise_diags`,
+    /// `store_slot`, nello stesso ordine di prima), tenuto fuori linea.
+    #[cold]
+    #[inline(never)]
+    fn incdec_slot_discard_slow(&mut self, top: usize, i: usize, inc: bool) -> Result<(), PhpError> {
+        if matches!(self.frames[top].slots[i], Zval::Undef) {
+            self.frames[top].slots[i] = Zval::Null;
+        }
+        let old = self.frames[top].slots[i].deref_clone();
+        let (newv, diags) = self.compute_incdec(old, inc)?;
+        // Raise before write-back (see IncDecGlobal).
+        self.raise_diags(diags, self.cur_line(top))?;
+        let _ = store_slot(&mut self.frames[top].slots[i], newv);
+        Ok(())
+    }
+
+    /// Fused `$slot .= rhs` (WP-55, [`Op::ConcatAssignSlot`]): in-place
+    /// append when the slot holds a directly-owned UNIQUE Str and the rhs is
+    /// a Str (`Rc::get_mut` — an alias, the const pool, or a Ref slot makes
+    /// it fail and the copy path runs: COW by construction). The fallback
+    /// reproduces the old `LoadSlot; Swap; Binary; Dup; StoreSlot` sequence
+    /// exactly: silent slot read (`read_slot`), shared `binary_value_ab`
+    /// (same diags/`__toString`-less funnel), typed-ref coercion on the
+    /// STORED copy only, write-through `store_slot`, `gc_note` on the
+    /// displaced value (dtor timing). The in-place arm skips `gc_note`
+    /// legitimately: the displaced value is the very Str being extended.
+    #[inline(never)]
+    fn concat_assign_slot(&mut self, top: usize, s: crate::hir::Slot) -> Result<Zval, PhpError> {
+        let rhs = self.frames[top].stack.pop().expect("ConcatAssignSlot rhs");
+        if let Zval::Str(rv) = &rhs {
+            if let Zval::Str(l) = &mut self.frames[top].slots[s as usize] {
+                if l.try_append(rv.as_bytes()) {
+                    return Ok(Zval::Str(l.clone()));
+                }
+            }
+        }
+        let lhs = read_slot(&self.frames[top].slots[s as usize]);
+        let v = self.binary_value_ab(BinOp::Concat, lhs, rhs)?;
+        let mut stored = v.clone();
+        if !self.typed_refs.is_empty() {
+            if let Zval::Ref(cell) = &self.frames[top].slots[s as usize] {
+                let cell = Rc::clone(cell);
+                let strict = self.frames[top].module.strict;
+                stored = self.typed_ref_assign(&cell, stored, strict)?;
+            }
+        }
+        let old = store_slot(&mut self.frames[top].slots[s as usize], stored);
+        self.gc_note(&old);
+        Ok(v)
+    }
+
+    /// Corpo di `ConcatN`, condiviso con `ConcatNConst` (S-109 F2, criterio
+    /// lotto-3: helper condivisi, zero biforcazione): join in un'allocazione
+    /// quando tutte le parti sono Str, altrimenti funnel pairwise.
+    fn concat_n(&mut self, top: usize, n: usize) -> Result<(), PhpError> {
+        let base = self.frames[top].stack.len() - n;
+        if self.frames[top].stack[base..].iter().all(|v| matches!(v, Zval::Str(_))) {
+            let total: usize = self.frames[top].stack[base..]
+                .iter()
+                .map(|v| match v {
+                    Zval::Str(s) => s.len(),
+                    _ => 0,
+                })
+                .sum();
+            let joined = concat_n_join(&mut self.frames[top].stack, base, total);
+            self.frames[top].stack.push(Zval::Str(joined));
+        } else {
+            let parts: Vec<Zval> = self.frames[top].stack.drain(base..).collect();
+            let mut it = parts.into_iter();
+            let mut acc = it.next().expect("ConcatN parts");
+            for p in it {
+                acc = self.binary_value_ab(BinOp::Concat, acc, p)?;
+            }
+            self.frames[top].stack.push(acc);
+        }
+        Ok(())
+    }
+
+    /// Operand-explicit core of [`Self::binary_value`] (WP-34): shared by
+    /// `Binary`/`CmpJmp` (operands popped) and `CmpJmpConst` (one operand
+    /// materialised from the constant pool) so all three evaluate a binary
+    /// operator with identical semantics by construction.
+    fn binary_value_ab(&mut self, b: BinOp, lhs: Zval, rhs: Zval) -> Result<Zval, PhpError> {
+        // WP-33 T1a: monomorphic tag-pair fast paths (census-driven); a
+        // miss falls through to the generic path below unchanged.
+        if let Some(r) = binary_fast(b, &lhs, &rhs) {
+            return Ok(r);
+        }
+        // A *loose* comparison reads the whole property table, so it
+        // initializes a lazy operand (PHP 8.4, init_trigger_compare)
+        // and compares a proxy's real instance; `===`/`!==` compare
+        // handles and never initialize — and neither does comparing
+        // an object with itself (same handle short-circuits).
+        // Only an object-vs-object comparison reads property tables:
+        // a lazy operand initializes then (init_trigger_compare) —
+        // never for object-vs-scalar (the object simply compares
+        // greater), `===`, or a same-handle compare.
+        let cmp_op = matches!(
+            b,
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Spaceship
+        );
+        let both_objects = match (deref_object(&lhs), deref_object(&rhs)) {
+            (Some(a), Some(b)) => Some(Rc::ptr_eq(&a, &b)),
+            _ => None,
+        };
+        let (lhs, rhs) = if matches!(both_objects, Some(false))
+            && cmp_op
+            && (self.is_lazy_value(&lhs) || self.is_lazy_value(&rhs))
+        {
+            (self.realize_full(&lhs)?, self.realize_full(&rhs)?)
+        } else {
+            (lhs, rhs)
+        };
+        // A string-vs-object comparison converts the object through
+        // its `__toString` when it has one (PHP semantics; a lazy
+        // wrapper is NOT initialized by this — the hook is a method
+        // call on the wrapper).
+        let (lhs, rhs) = if cmp_op && both_objects.is_none() {
+            // Tag peek only — no value clone (WP-32): the old
+            // deref_clone here cloned (and dropped) both operands
+            // on EVERY executed comparison just to read the tag.
+            fn is_str_operand(v: &Zval) -> bool {
+                match v {
+                    Zval::Str(_) => true,
+                    Zval::Ref(c) => matches!(&*c.borrow(), Zval::Str(_)),
+                    _ => false,
+                }
+            }
+            let l_str = is_str_operand(&lhs);
+            let r_str = is_str_operand(&rhs);
+            let to_str = |vm: &mut Self, v: Zval, other_is_str: bool| -> Result<Zval, PhpError> {
+                if !other_is_str {
+                    return Ok(v);
+                }
+                if let Some(o) = deref_object(&v) {
+                    // `BcMath\Number` / `GMP` overload comparison
+                    // themselves (their compare handler runs in
+                    // `apply_binop_ovl`); they must NOT be pre-coerced
+                    // to their `__toString` for a string comparison.
+                    let cn = o.borrow().class_name.as_bytes().to_vec();
+                    if cn == b"BcMath\\Number" || cn == b"GMP" {
+                        return Ok(v);
+                    }
+                    let cid = o.borrow().class_id as usize;
+                    if resolve_method_runtime(&vm.classes, cid, b"__toString").is_some() {
+                        return vm.call_method_sync(v, b"__toString", Vec::new());
+                    }
+                }
+                Ok(v)
+            };
+            let lhs = to_str(self, lhs, r_str)?;
+            let rhs = to_str(self, rhs, l_str)?;
+            (lhs, rhs)
+        } else {
+            (lhs, rhs)
+        };
+        self.apply_binop_ovl(b, &lhs, &rhs)
+    }
+
+    /// Everything below [`Op::PropGet`]'s inline-cache hit: the WP-25
+    /// per-class fast path, lazy initialization, hooks, `__get`, visibility
+    /// resolution and the actual slot read. Extracted (WP-34) so the fused
+    /// [`Op::ThisPropGet`] shares the identical semantics (warning order,
+    /// IC fill discipline, magic re-entry) by construction. Pushes the read
+    /// value (or re-enters the VM via a hook/`__get` frame) and returns.
+    /// Corpo di `Op::PropGet` dopo il pop del ricevitore (S-107 lotto):
+    /// condiviso con [`Op::PropGetSlot`] — deref del Ref, IC-hit, fallback.
+    /// Il `continue` del braccio storico è il `return Ok(())` dell'IC-hit.
+    #[inline(always)]
+    fn prop_get_entry(
+        &mut self,
+        top: usize,
+        obj: Zval,
+        name: &Rc<[u8]>,
+        ic: &crate::bytecode::PropIc,
+    ) -> Result<(), PhpError> {
+        let sk = crate::bytecode::PropIc::scope_key(self.frames[top].class);
+        // H-C1b (S-101): the popped handle is OWNED — move it
+        // instead of cloning a second handle that dies at arm end.
+        // Only a Ref clones out its inner value (the wrapper never
+        // travels past this point).
+        // INV-RECV-1 (S-102 audit, wp102-harness/inv-recv-1-audit.md):
+        // at every point of this arm reachable by synchronous PHP
+        // or by an absolute strong_count observer, ≥1 owned handle
+        // of the receiver is alive — `target` here, then the frame
+        // clone in push_hook/push_magic_prop before the fallback
+        // returns. Extending the move to other forms requires
+        // re-auditing that table (KS-MA-103-2).
+        let target = if matches!(obj, Zval::Ref(_)) {
+            let t = obj.deref_clone();
+            // S-101 census: bump Rc del ricevitore (P2, solo Ref).
+            #[cfg(feature = "zval-census")]
+            super::zvalcensus::note_recv_clone_prop(&t);
+            t
+        } else {
+            obj
+        };
+        // INLINE CACHE (WP-29): the site's last cacheable
+        // resolution — a PUBLIC hook-free backed slot on this
+        // class — reads with zero hashing. A present non-`Undef`
+        // value is the only hit; everything else (absent = unset →
+        // `__get`, `Undef` = typed-uninit fatal, other class, lazy
+        // wrapper) falls through to the paths that own it.
+        if let Zval::Object(o) = &target {
+            if let Some((cid1, slot)) = ic.get(sk) {
+                let b = o.borrow();
+                if b.class_id + 1 == cid1 && b.lazy.is_none() {
+                    if let Some(v) = b.props.get_slot(slot) {
+                        if !matches!(v, Zval::Undef) {
+                            let v = v.deref_clone();
+                            drop(b);
+                            // S-101 census: specie del valore letto (P1).
+                            #[cfg(feature = "zval-census")]
+                            super::zvalcensus::note_prop_val(0, &v);
+                            scn!(PropGet: Push = 1);
+                            self.frames[top].stack.push(v);
+                            dcn!(PropGet: &target); // l'handle mosso muore a fine arm
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        self.prop_get_fallback(top, target, name, ic)
+    }
+
+    /// Corpo di `Op::PropSet` dopo i due pop (S-107 lotto): condiviso con
+    /// [`Op::PropSetPop`] via const-generic `DISCARD` (monomorfizzato: zero
+    /// dispatch a runtime). Con `DISCARD` il valore assegnato NON viene
+    /// spinto — era il push che il `Pop` fuso scartava; ogni altro effetto
+    /// (hook, `__set`, typed/readonly, gc_note sul valore rimpiazzato) è
+    /// il codice storico del braccio, `continue` → `return Ok(())`.
+    #[inline(always)]
+    fn prop_set_entry<const DISCARD: bool>(
+        &mut self,
+        top: usize,
+        obj: Zval,
+        mut value: Zval,
+        name: &Rc<[u8]>,
+        ic: &crate::bytecode::PropIc,
+    ) -> Result<(), PhpError> {
+        let cur = self.frames[top].class;
+        // H-C1b (S-101): move the owned handle (see PropGet).
+        // INV-RECV-1 holds here too: `target` is owned through
+        // lazy_prop_access and every write path below; the old
+        // value's synchronous __destruct always sees ≥1 owned
+        // receiver handle (audit: wp102-harness/inv-recv-1-audit.md).
+        let target = if matches!(obj, Zval::Ref(_)) {
+            let t = obj.deref_clone();
+            // S-101 census: bump Rc del ricevitore (P2, solo Ref).
+            #[cfg(feature = "zval-census")]
+            super::zvalcensus::note_recv_clone_prop(&t);
+            t
+        } else {
+            obj
+        };
+        // S-101 census: specie del valore scritto (P1).
+        #[cfg(feature = "zval-census")]
+        super::zvalcensus::note_prop_val(1, &value);
+        // A write to a lazy object initializes it first (PHP 8.4) —
+        // unless a set hook/`__set` serves it; a no-op during the
+        // object's own construction (it is no longer lazy then).
+        // Proxy forwarding is transitive (a reset instance re-triggers).
+        let target = if !self.frames[top].flags.get(FrameFlags::INIT_PROPS) {
+            self.lazy_prop_access(target, name, cur, Some(true), (MagicKind::Set, b"__set"))?
+        } else {
+            target
+        };
+        // A `prop_init` thunk writes defaults directly: no `__set`, no
+        // visibility check (so a subclass can set an inherited private).
+        // The slot is the declared one (unconditional, mangled for a
+        // private) regardless of the running scope.
+        if self.frames[top].flags.get(FrameFlags::INIT_PROPS) {
+            let key = match object_class_id(&target) {
+                Some(ocid) => self.prop_decl_storage_key(ocid, name),
+                None => Cow::Borrowed(&name[..]),
+            };
+            if let Some(old) = write_property(&target, &key, value.clone())? {
+                #[cfg(feature = "zval-census")]
+                super::zvalcensus::note_gcnote_site_propset_old();
+                self.gc_note(&old);
+            }
+            if !DISCARD {
+                scn!(PropSet: Push = 1);
+                self.frames[top].stack.push(value);
+            }
+            return Ok(());
+        }
+        // INLINE CACHE (WP-29): the WP-25 guards below, but
+        // slot-indexed — zero hashing on a monomorphic site. Only
+        // fills from a `plain_set_props` class, so a class-id
+        // match re-implies every per-class guard; the per-object
+        // ones (lazy, enum, present slot, Ref×typed_refs) are
+        // re-checked here.
+        if let Zval::Object(o) = &target {
+            if let Some((cid1, raw)) = ic.get(crate::bytecode::PropIc::scope_key(cur)) {
+                let slot = raw & crate::bytecode::PropIc::SLOT_MASK;
+                let hit = {
+                    let b = o.borrow();
+                    b.class_id + 1 == cid1
+                        && b.lazy.is_none()
+                        && !b.info.is_enum_case
+                        && match b.props.get_slot(slot) {
+                            Some(Zval::Ref(_)) => self.typed_refs.is_empty(),
+                            Some(_) => true,
+                            None => false,
+                        }
+                };
+                if hit {
+                    // S-134 IC non-plain (s134-criterio-icnp p.1): il ramo TY
+                    // coercisce nello stesso ordine del cammino pieno (coerce
+                    // PRIMA della scrittura, stessa esposizione a __toString)
+                    // e ri-onora le typed_refs sul post-coercizione come il
+                    // blocco del cammino pieno; ogni altro salto del ramo NP
+                    // è un fatto di classe provato al fill.
+                    // S-176 census «typed» (op-census builds only): IC hit
+                    // on a typed (TY) vs plain class.
+                    #[cfg(feature = "op-census")]
+                    super::census::census_prop_set(if raw & crate::bytecode::PropIc::TY != 0 {
+                        &super::census::PROP_SET_IC_TYPED
+                    } else {
+                        &super::census::PROP_SET_IC_PLAIN
+                    });
+                    if raw & crate::bytecode::PropIc::TY != 0 {
+                        let ocid = o.borrow().class_id as usize;
+                        value = self.coerce_typed_prop_write(ocid, name, value)?;
+                        if !self.typed_refs.is_empty() {
+                            let cell = {
+                                let b = o.borrow();
+                                match b.props.get_slot(slot) {
+                                    Some(Zval::Ref(c)) => Some(Rc::clone(c)),
+                                    _ => None,
+                                }
+                            };
+                            if let Some(cell) = cell {
+                                let strict = self.frames[top].module.strict;
+                                value = self.typed_ref_assign(&cell, value, strict)?;
+                            }
+                        }
+                    }
+                    if let Some(old) =
+                        write_property_at(&target, name, Some(slot), value.clone())?
+                    {
+                        #[cfg(feature = "zval-census")]
+                        super::zvalcensus::note_gcnote_site_propset_old();
+                        self.gc_note(&old);
+                        dcn!(PropSet: &old); // il vecchio valore muore qui
+                    }
+                    if !DISCARD {
+                        scn!(PropSet: Push = 1);
+                        self.frames[top].stack.push(value);
+                    }
+                    dcn!(PropSet: &target); // l'handle mosso muore a fine arm
+                    return Ok(());
+                }
+            }
+        }
+        // S-176 census «typed»: not served by the IC (fill/slow path).
+        #[cfg(feature = "op-census")]
+        super::census::census_prop_set(&super::census::PROP_SET_MISS);
+        // FAST PATH (WP-25): overwrite of a *present* slot on a
+        // non-lazy, non-enum instance of a class whose declared
+        // properties are all plain for writing (public, symmetric,
+        // untyped, non-readonly, hook-free): no visibility walk,
+        // no magic probe, no coercion. A miss falls through
+        // (dynamic-prop creation/deprecation, `__set`); a Ref slot
+        // with live typed refs falls through (typed_ref_assign).
+        if let Zval::Object(o) = &target {
+            let (fast, fcid) = {
+                let b = o.borrow();
+                let ok = b.lazy.is_none()
+                    && !b.info.is_enum_case
+                    && self.classes[b.class_id as usize].plain_set_props
+                    // A scope-private override writes the scope's
+                    // mangled slot, not the leaf entry (WP-35).
+                    && !scope_private_overrides(&self.classes, b.class_id as usize, name, cur)
+                    && match b.props.get(name) {
+                        Some(Zval::Ref(_)) => self.typed_refs.is_empty(),
+                        Some(_) => true,
+                        None => false,
+                    };
+                (ok, b.class_id)
+            };
+            if fast {
+                // IC fill from the fast path too (see PropGet):
+                // plain_set_props classes never reach the general
+                // resolve, so without this the cache stays cold.
+                let slot = self.classes[fcid as usize]
+                    .prop_info
+                    .get(&name[..])
+                    .and_then(|pi| pi.slot);
+                if let Some(i) = slot {
+                    ic.fill(fcid, crate::bytecode::PropIc::scope_key(cur), i);
+                }
+                if let Some(old) = write_property_at(&target, name, slot, value.clone())? {
+                    #[cfg(feature = "zval-census")]
+                    super::zvalcensus::note_gcnote_site_propset_old();
+                    self.gc_note(&old);
+                }
+                if !DISCARD {
+                    self.frames[top].stack.push(value);
+                }
+                return Ok(());
+            }
+        }
+        // Storage slot to write (plain name for a dynamic/non-object
+        // target; a mangled key for an accessible private — set below).
+        let mut key: Cow<[u8]> = Cow::Borrowed(&name[..]);
+        let mut slot_idx: Option<u32> = None;
+        if let Zval::Object(o) = &target {
+            // An enum case is immutable: every property is readonly and
+            // no dynamic property may be created (step 23).
+            {
+                let ob = o.borrow();
+                if ob.info.is_enum_case {
+                    let cls = String::from_utf8_lossy(ob.class_name.as_bytes()).into_owned();
+                    let prop = String::from_utf8_lossy(name).into_owned();
+                    return Err(PhpError::Error(if ob.props.contains(name) {
+                        format!("Cannot modify readonly property {cls}::${prop}")
+                    } else {
+                        format!("Cannot create dynamic property {cls}::${prop}")
+                    }));
+                }
+            }
+            // A `set` hook takes precedence over `__set` and direct write
+            // (step 50); skipped while a hook for this property is active
+            // (a backing write inside the hook). The expression still
+            // yields the assigned value; the hook's own return is dropped.
+            let (oid, cid) = { let b = o.borrow(); (b.id, b.class_id as usize) };
+            // S-134: vero solo sul percorso che ha ESEGUITO i check hook qui
+            // sotto con esito negativo — condizione di fill del ramo NP.
+            let mut np_fillable = false;
+            if !self.hook_guarded(oid, name) {
+                if let Some(func) = self.prop_hook(cid, name, true) {
+                    if !DISCARD {
+                        self.frames[top].stack.push(value.clone());
+                    }
+                    self.push_hook(func, target.clone(), oid, name, Some(value));
+                    return Ok(());
+                }
+                // A virtual hooked property with no set hook is read-only.
+                if self.is_virtual_hooked(cid, name) {
+                    return Err(PhpError::Error(format!(
+                        "Property {}::${} is read-only",
+                        String::from_utf8_lossy(&self.classes[cid].name),
+                        String::from_utf8_lossy(name),
+                    )));
+                }
+                np_fillable = true;
+            }
+            // S-133 ctor resolve-once: ONE `resolve_prop_access` for the
+            // whole non-plain path — the magic-set decision and the key/slot/
+            // IC block below share it (formerly two identical resolves: the 4
+            // ctor resolves of the S-131 model; sonda S-133 split 2+2).
+            // Computed AFTER the hook checks so the hooked-set path keeps
+            // zero resolves. Same (class, name, scope) triple both sites used
+            // before, nothing between them mutates class or props.
+            let ocid = o.borrow().class_id as usize;
+            let access = resolve_prop_access(&self.classes, ocid, name, cur);
+            if let Some((defc, midx, oid)) =
+                self.magic_applies_resolved(o, name, &access, MagicKind::Set, b"__set")
+            {
+                // The expression yields the assigned value; __set's own
+                // return is discarded into a throwaway cell.
+                if !DISCARD {
+                    self.frames[top].stack.push(value.clone());
+                }
+                let discard = php_types::zcell(Zval::Null);
+                self.push_magic_prop(defc, midx, oid, MagicKind::Set, target.clone(), name, Some(value), Some(discard), false);
+                return Ok(());
+            }
+            // Storage slot (mangled for an accessible private); per-instance
+            // state (props, readonly tracking) is keyed by it. A single
+            // resolution decides visibility (`Denied` errors here) and the
+            // slot: the write is either a declared slot or a dynamic
+            // creation — readonly / typed enforcement applies only to the
+            // former (a parent's private reached from a child scope is a
+            // *dynamic* write, untyped and unguarded). The resolution is the
+            // S-133 hoisted one above (shared with the magic-set check).
+            let declared_slot = matches!(access, PropAccess::Slot { .. });
+            key = match access {
+                PropAccess::Slot { key: k, slot } => {
+                    slot_idx = slot;
+                    // IC fill: only from a plain_set_props class
+                    // (public, symmetric, untyped, non-readonly,
+                    // hook-free in blocco — see PropIc).
+                    if let Some(i) = slot {
+                        if self.classes[ocid].plain_set_props {
+                            ic.fill(ocid as u32, crate::bytecode::PropIc::scope_key(cur), i);
+                        }
+                    }
+                    Cow::Borrowed(k)
+                }
+                PropAccess::Denied { decl, vis } => {
+                    return Err(prop_access_error(&self.classes, decl, name, vis))
+                }
+                PropAccess::Dynamic => Cow::Borrowed(&name[..]),
+            };
+            // PHP 8.4 asymmetric visibility: a declared slot whose set
+            // visibility excludes this scope cannot be assigned (the
+            // readonly path below keeps its own message shapes).
+            if declared_slot {
+                if let Some(err) = asym_write_error(&self.classes, cur, ocid, name, "modify") {
+                    return Err(err);
+                }
+            }
+            // Readonly write-once enforcement (after the visibility check,
+            // so a private/protected readonly reports the access error
+            // first, matching PHP). A permitted first initialisation is
+            // recorded so any later write fatals.
+            let ro_decl = if declared_slot {
+                prop_readonly_decl(&self.classes, ocid, name)
+            } else {
+                None
+            };
+            if declared_slot {
+                if let Some(decl) = ro_decl {
+                    if o.borrow().readonly_clone_writable(&key) {
+                        // Permitted re-initialisation during `__clone` (8.3).
+                        let mut ob = o.borrow_mut();
+                        ob.consume_clone_writable(&key);
+                        ob.mark_readonly_init(&key);
+                    } else {
+                        let inited = o.borrow().is_readonly_init(&key);
+                        let set_vis = prop_info(&self.classes, ocid, name)
+                            .and_then(|pi| pi.set_visibility);
+                        if let Some(err) = readonly_write_error(&self.classes, cur, decl, name, inited, set_vis) {
+                            return Err(err);
+                        }
+                        o.borrow_mut().mark_readonly_init(&key);
+                    }
+                }
+            }
+            // S-134 «IC non-plain» (s134-criterio-icnp p.1): cache del
+            // risultato della resolve per (classe, scope) nella cella IC
+            // esistente, bit NP+TY nello slot. Fill SOLO coi fatti di classe
+            // provati SU QUESTO percorso: check hook eseguiti e negativi,
+            // slot dichiarato con key == name (mai un private mangled), asym
+            // già superato (siamo oltre il suo check), non readonly, `__set`
+            // strutturalmente ASSENTE — con un `__set` il typed-unset DEVE
+            // dispatchare il magic: l'assenza è ciò che rende il salto del
+            // magic-check un fatto di classe e non di istanza.
+            if np_fillable && declared_slot && ro_decl.is_none() && key.as_ref() == &name[..] {
+                if let Some(i) = slot_idx {
+                    if resolve_method_runtime(&self.classes, ocid, b"__set").is_none() {
+                        debug_assert_eq!(i & !crate::bytecode::PropIc::SLOT_MASK, 0);
+                        let bits = crate::bytecode::PropIc::NP
+                            | if prop_type_decl(&self.classes, ocid, name).is_some() {
+                                crate::bytecode::PropIc::TY
+                            } else {
+                                0
+                            };
+                        ic.fill(ocid as u32, crate::bytecode::PropIc::scope_key(cur), i | bits);
+                    }
+                }
+            }
+            // PHP 8.2: creating an *undeclared* property on a class that
+            // does not allow dynamic properties is deprecated (the
+            // property is still created). `__set`/hooks already
+            // short-circuited above. A *declared* property that was
+            // `unset` is absent from the store yet is not a dynamic
+            // creation when re-assigned — `declared_slot` covers it.
+            if !declared_slot
+                && !o.borrow().props.contains(&key)
+                && !self.allows_dynamic_props(ocid)
+            {
+                let cls = String::from_utf8_lossy(&self.classes[ocid].name).into_owned();
+                let prop = String::from_utf8_lossy(name).into_owned();
+                self.diags.push(Diag::Deprecated(format!(
+                    "Creation of dynamic property {cls}::${prop} is deprecated"
+                )));
+            }
+            // Typed-property write enforcement: coerce the value to the
+            // property's declared type (or TypeError). The assignment
+            // expression yields the coerced value.
+            if declared_slot {
+                value = self.coerce_typed_prop_write(ocid, name, value)?;
+            }
+        }
+        // A declared slot written on a lazy wrapper (guarded writes
+        // during its own initializer) keeps declaration order.
+        if let Zval::Object(o) = &target {
+            self.lazy_ordered_insert(o, &key);
+        }
+        // A write through a reference slot honours ALL of the
+        // cell's typed sources (an aliased pair enforces both,
+        // typed_properties_002).
+        if !self.typed_refs.is_empty() {
+            if let Zval::Object(o) = &target {
+                let b = o.borrow();
+                let cur_val = match slot_idx {
+                    Some(i) => b.props.get_slot(i),
+                    None => b.props.get(&key),
+                };
+                let cell = match cur_val {
+                    Some(Zval::Ref(c)) => Some(Rc::clone(c)),
+                    _ => None,
+                };
+                drop(b);
+                if let Some(cell) = cell {
+                    let strict = self.frames[top].module.strict;
+                    value = self.typed_ref_assign(&cell, value, strict)?;
+                }
+            }
+        }
+        if let Some(old) = write_property_at(&target, &key, slot_idx, value.clone())? {
+            self.gc_note(&old);
+        }
+        if !DISCARD {
+            self.frames[top].stack.push(value);
+        }
+        Ok(())
+    }
+
+    fn prop_get_fallback(
+        &mut self,
+        top: usize,
+        target: Zval,
+        name: &Rc<[u8]>,
+        ic: &crate::bytecode::PropIc,
+    ) -> Result<(), PhpError> {
+        let cur = self.frames[top].class;
+        let sk = crate::bytecode::PropIc::scope_key(cur);
+        // FAST PATH (WP-25): a present, initialized slot on a
+        // non-lazy instance of a hook-free all-public class reads
+        // straight off the table. A miss or `Undef` falls through —
+        // `__get`, the undefined-property warning and the
+        // typed-uninit fatal all live in the general path below.
+        if let Zval::Object(o) = &target {
+            let b = o.borrow();
+            if b.lazy.is_none() {
+                let ci = &self.classes[b.class_id as usize];
+                if ci.all_props_public
+                    && !ci.has_prop_hooks
+                    // A scope-private override targets the scope's mangled
+                    // slot, not the leaf entry this shortcut reads (WP-35).
+                    && !scope_private_overrides(&self.classes, b.class_id as usize, &name, cur)
+                {
+                    if let Some(v) = b.props.get(&name) {
+                        if !matches!(v, Zval::Undef) {
+                            // IC fill from the fast path too —
+                            // all-public classes NEVER reach the
+                            // general resolve, and without this
+                            // the site's cache stays cold forever
+                            // (every access re-pays slot_of).
+                            if let Some(pi) = ci.prop_info.get(&name[..]) {
+                                if let Some(i) = pi.slot {
+                                    ic.fill(b.class_id, sk, i);
+                                }
+                            }
+                            // deref_clone: a slot holding a Ref
+                            // reads as its inner value (same as
+                            // read_property).
+                            let v = v.deref_clone();
+                            drop(b);
+                            // S-101 census: specie del valore letto (P1).
+                            #[cfg(feature = "zval-census")]
+                            super::zvalcensus::note_prop_val(0, &v);
+                            self.frames[top].stack.push(v);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        // A read of a lazy object initializes it first (PHP 8.4) —
+        // unless a hook/`__get` serves it; an initialized proxy then
+        // forwards the read to its real instance (transitively).
+        let target = self.lazy_prop_access(target, &name, cur, Some(false), (MagicKind::Get, b"__get"))?;
+        // Storage slot to read (the plain name for a dynamic/non-object
+        // target; a mangled key for an accessible private — set below).
+        let mut key: Cow<[u8]> = Cow::Borrowed(&name[..]);
+        let mut slot_idx: Option<u32> = None;
+        if let Zval::Object(o) = &target {
+            // A `get` hook takes precedence over `__get` and direct read
+            // (step 50). Skip it while a hook for this property is active
+            // (a backing read inside the hook).
+            let (oid, cid) = { let b = o.borrow(); (b.id, b.class_id as usize) };
+            if !self.hook_guarded(oid, &name) {
+                if let Some(func) = self.prop_hook(cid, &name, false) {
+                    self.push_hook(func, target.clone(), oid, &name, None);
+                    return Ok(());
+                }
+                // A virtual hooked property with no get hook is write-only.
+                if self.is_virtual_hooked(cid, &name) {
+                    return Err(PhpError::Error(format!(
+                        "Property {}::${} is write-only",
+                        String::from_utf8_lossy(&self.classes[cid].name),
+                        String::from_utf8_lossy(&name),
+                    )));
+                }
+            }
+            if let Some((defc, midx, oid)) =
+                self.magic_applies(o, &name, cur, MagicKind::Get, b"__get")
+            {
+                // __get's return *is* the read result (flows via Ret).
+                self.push_magic_prop(defc, midx, oid, MagicKind::Get, target.clone(), &name, None, None, false);
+                return Ok(());
+            }
+            // Single resolution decides visibility AND the storage key
+            // (was check_prop_access + prop_storage_key = two walks).
+            let ocid = o.borrow().class_id as usize;
+            key = match resolve_prop_access(&self.classes, ocid, &name, cur) {
+                PropAccess::Slot { key: k, slot } => {
+                    slot_idx = slot;
+                    // IC fill (WP-35): ANY visibility — the scope is part of
+                    // the cell key, so a hit re-derives this resolution
+                    // exactly. Gated on `!hook_guarded`: reaching Slot with
+                    // the guard off means prop_hook/is_virtual_hooked were
+                    // checked EMPTY this very execution (class-level fact);
+                    // under an active hook nothing is cached (a future
+                    // unguarded read must dispatch the hook).
+                    if let Some(i) = slot {
+                        if !self.hook_guarded(oid, &name) {
+                            ic.fill(ocid as u32, sk, i);
+                        }
+                    }
+                    Cow::Borrowed(k)
+                }
+                PropAccess::Dynamic => Cow::Borrowed(&name[..]),
+                PropAccess::Denied { decl, vis } => {
+                    return Err(prop_access_error(&self.classes, decl, &name, vis))
+                }
+            };
+            if let Some(err) = self.uninit_typed_read_at(o, &key, slot_idx, &name) {
+                return Err(err);
+            }
+        }
+        // §3.13 (A-ST-103-4): il warning della lettura si timbra con la riga
+        // dell'op che LEGGE, all'accodamento — il flush può cadere sulla
+        // riga successiva (fixture 09).
+        let before_diags = self.diags.len();
+        let v = read_property_at(&target, &key, slot_idx, &mut self.diags);
+        let read_line = self.cur_line(top);
+        self.mark_pending_diag_lines(before_diags, read_line);
+        // S-101 census: specie del valore letto (P1, percorso generale).
+        #[cfg(feature = "zval-census")]
+        super::zvalcensus::note_prop_val(0, &v);
+        self.frames[top].stack.push(v);
+        Ok(())
+    }
+
+    /// Corpo condiviso di `Op::CallBuiltin` (L-HD2 forma-2, S-125): riceve gli
+    /// argomenti già sfilati dalla pila (array esatto per arità <=4, Vec oltre)
+    /// e restituisce il valore da pushare. Fuori da `run_loop` di proposito:
+    /// i rami freddi non pesano sul layout del dispatcher.
+    fn value_builtin_call(
+        &mut self,
+        top: usize,
+        f: crate::builtin::BuiltinFn,
+        name: &std::rc::Rc<[u8]>,
+        args: &mut [Zval],
+    ) -> Result<Zval, PhpError> {
+        // A whole-object exporter initializes a lazy argument first
+        // (PHP 8.4, init_trigger_var_export); the pure builtin then
+        // formats the realized instance.
+        if matches!(&name[..], b"var_export" | b"print_r") {
+            for a in &mut *args {
+                if self.is_lazy_value(a) {
+                    *a = self.realize_full(a)?;
+                }
+            }
+        }
+        // `var_dump` calls each debuggable object's `__debugInfo()`
+        // (PHP 8.4) *before* rendering — a lazy object initializes only
+        // if that method touches its state — and dumps the returned
+        // array under the object header. Results handed to the builtin
+        // via `var_dump_debug` (taken in `run_value_builtin`).
+        if name[..] == *b"var_dump" {
+            self.var_dump_debug = self.compute_debug_info(args)?;
+        }
+        // `count($obj)`/`sizeof($obj)` on a Countable dispatches its
+        // user `count()` method (step 56); the builtin only handles
+        // arrays. A non-Countable object still TypeErrors in the
+        // builtin below, matching PHP.
+        if args.len() == 1
+            && (name[..] == *b"count" || name[..] == *b"sizeof")
+        {
+            if let Some(obj) = self.as_countable(&args[0]) {
+                return self.call_method_sync(obj, b"count", Vec::new());
+            }
+        }
+        // A userland stream wrapper (stream_wrapper_register): a file
+        // op whose first argument is such a resource dispatches to the
+        // wrapper object's stream_* methods (VM re-entrant), never the
+        // pure value builtin. Only fires for UserStream resources, so
+        // ordinary file I/O is untouched.
+        if !args.is_empty() && is_user_stream_op(&name) {
+            if let Some(rc) = user_stream_rc(&args[0]) {
+                let line = self.cur_line(top);
+                self.flush_diags(line)?;
+                let result = self.user_stream_op(&name, rc, args)?;
+                self.flush_diags(line)?;
+                return Ok(result);
+            }
+        }
+        // `file_get_contents("scheme://…")` on a registered wrapper.
+        if !args.is_empty() && name[..] == *b"file_get_contents" {
+            if let Some(path) = user_wrapper_url(&args[0], &self.stream_wrappers) {
+                let line = self.cur_line(top);
+                self.flush_diags(line)?;
+                let result = self.user_wrapper_get_contents(&path)?;
+                self.flush_diags(line)?;
+                return Ok(result);
+            }
+        }
+        // Stat-family / image / exif builtins on a wrapper URL:
+        // url_stat or read-to-EOF through the wrapper object.
+        if !args.is_empty() && is_user_wrapper_path_op(&name) {
+            if let Some(path) = user_wrapper_url(&args[0], &self.stream_wrappers) {
+                let line = self.cur_line(top);
+                self.flush_diags(line)?;
+                let result = self.user_wrapper_path_op(&name, &path, args)?;
+                self.flush_diags(line)?;
+                return Ok(result);
+            }
+        }
+        // A builtin that unconditionally string-coerces its (string)
+        // arguments gets each Stringable object's `__toString()`
+        // precomputed, so the pure builtin honors it (handed over via
+        // `stringify_args`, taken in `run_value_builtin`). The `deep`
+        // family (`implode`/`str_replace`) also coerces array
+        // *elements*, so its precompute recurses into array arguments.
+        if value_builtin_string_coerces(&name) {
+            self.stringify_args = self.compute_stringify(args, false)?;
+        } else if value_builtin_string_coerces_deep(&name, args) {
+            self.stringify_args = self.compute_stringify(args, true)?;
+        }
+        let line = self.cur_line(top);
+        self.run_value_builtin(f, args, line)
+    }
+
+    pub(super) fn run_loop(&mut self, baseline: usize) -> Result<RunExit, PhpError> {
+        // WP-60 P2(a): park the VM for the census window-context renderer
+        // (tag=ctx). Two relaxed stores, census builds only.
+        #[cfg(feature = "mem-census")]
+        {
+            php_types::memcensus::set_ctx_hook(super::census_ctx_hook);
+            super::census_vm_park(self as *const Self as usize);
+        }
+        loop {
+            // Defensive call-stack depth guard (mirrors `eval::guard_call_depth`):
+            // surface a catchable PHP `Error` before runaway recursion exhausts
+            // memory (pure PHP recursion is iterative here, growing `frames`) or
+            // overflows the native stack (callback-nested `run_loop`s).
+            if self.frames.len() > MAX_CALL_DEPTH {
+                return Err(PhpError::Error(format!(
+                    "Maximum call stack depth of {MAX_CALL_DEPTH} exceeded"
+                )));
+            }
+            let top = self.frames.len() - 1;
+            let ip = self.frames[top].ip;
+            // WP-31: `func` is `&'m Func` (Copy) — copying the reference out
+            // unties the op from `self`, so the match runs on `&'m Op` with
+            // ZERO per-instruction clone (the old `.clone()` copied the Op
+            // struct plus an Rc bump per payload on every VM tick). Handlers
+            // clone payloads only where they genuinely take ownership.
+            let func = self.frames[top].func;
+            // WP-57 diagnostic trap (census builds only): one full full-suite
+            // census run fetched ops[len] (non-deterministic, never seen on
+            // parity binaries). Convert the next occurrence into a diagnosis
+            // instead of a bare index-out-of-bounds.
+            #[cfg(feature = "op-census")]
+            if ip >= func.ops.len() {
+                eprintln!(
+                    "[phpr op-census diag] PC out of bounds: ip={} len={} fn={} file={} line={} generator={}",
+                    ip,
+                    func.ops.len(),
+                    String::from_utf8_lossy(&func.name),
+                    String::from_utf8_lossy(&func.file),
+                    func.line,
+                    func.is_generator,
+                );
+                eprintln!("[phpr op-census diag] tail ops: {:?}", &func.ops[func.ops.len().saturating_sub(5)..]);
+                eprintln!("[phpr op-census diag] exc_table: {:?}", func.exc_table);
+                for (i, fr) in self.frames.iter().enumerate().rev().take(12) {
+                    eprintln!(
+                        "[phpr op-census diag]   frame[{i}] fn={} ip={} len={}",
+                        String::from_utf8_lossy(&fr.func.name),
+                        fr.ip,
+                        fr.func.ops.len(),
+                    );
+                }
+            }
+            let op = &func.ops[ip];
+            // WP-33 T0: op census — compiled out unless the `op-census`
+            // feature is on (even a never-taken branch here costs ~3%).
+            #[cfg(feature = "op-census")]
+            if self.census_on {
+                super::census::census_record(
+                    op,
+                    &self.frames[top].stack,
+                    &self.frames[top].slots,
+                );
+            }
+            // Default fall-through advance. Jumps overwrite `ip`; `Call` advances
+            // the *caller* before pushing the callee; `Ret` discards this frame.
+            self.frames[top].ip = ip + 1;
+
+            match op {
+                Op::PushConst(i) => {
+                    scn!(PushConst: op);
+                    scn!(PushConst: Push = 1);
+                    let v = self.frames[top].func.consts[*i as usize].to_zval();
+                    self.frames[top].stack.push(v);
+                }
+                Op::ConstFetch { name, fallback } => {
+                    // A user constant (B3). An unqualified constant inside a
+                    // namespace is looked up as `CURNS\NAME` first, then the
+                    // global `NAME` (step 50) — where the global step ALSO
+                    // consults the engine-constant table: inside a namespace
+                    // the lowering cannot fold `INI_ALL` eagerly (a namespaced
+                    // `const INI_ALL` shadows it — ns_043), so the fold happens
+                    // here on the fallback. An "Undefined constant" error
+                    // reports the namespaced name.
+                    let v = self
+                        .constants
+                        .get(&name[..])
+                        .or_else(|| fallback.as_ref().and_then(|g| self.constants.get(&g[..])))
+                        .cloned()
+                        .or_else(|| {
+                            fallback
+                                .as_ref()
+                                .and_then(|g| crate::lower::resolve_constant(g))
+                                .and_then(super::calls::const_literal_to_zval)
+                        })
+                        .ok_or_else(|| {
+                            PhpError::Error(format!(
+                                "Undefined constant \"{}\"",
+                                String::from_utf8_lossy(&name)
+                            ))
+                        })?;
+                    self.frames[top].stack.push(v);
+                }
+                Op::DefineConst { name } => {
+                    // `const NAME = value;` — register the constant, warning and
+                    // keeping the first value on redefinition (like `define()`).
+                    let value = self.frames[top].stack.pop().expect("DefineConst value");
+                    if self.constant_known(&name) {
+                        self.diags.push(Diag::Warning(format!(
+                            "Constant {} already defined, this will be an error in PHP 9",
+                            String::from_utf8_lossy(&name)
+                        )));
+                    } else {
+                        self.constants.insert(name.to_vec(), value);
+                    }
+                }
+                Op::Pop => {
+                    scn!(Pop: op);
+                    scn!(Pop: Pop = 1);
+                    if let Some(v) = self.frames[top].stack.pop() {
+                        // S-101 census: sito Pop taggato (P2 drop-handle, P3 gc_note).
+                        #[cfg(feature = "zval-census")]
+                        super::zvalcensus::note_pop(&v);
+                        self.gc_note(&v);
+                        dcn!(Pop: &v); // il valore scartato muore a fine scope
+                    }
+                }
+                Op::Dup => {
+                    let v = self.frames[top].stack.last().expect("Dup on empty stack").clone();
+                    self.frames[top].stack.push(v);
+                }
+                Op::Swap => {
+                    scn!(Swap: op);
+                    scn!(Swap: Len = 1);
+                    scn!(Swap: Elem = 2);
+                    let st = &mut self.frames[top].stack;
+                    let n = st.len();
+                    st.swap(n - 1, n - 2);
+                }
+                Op::LoadSlot(s) => {
+                    // An unset local reads as NULL (silent — used for compiler
+                    // temporaries and PHP's warning-free contexts). A reference
+                    // slot is followed. Source-level `$x` reads use `LoadVar`.
+                    // S-95.0 A-ZV2 F1: conta se QUESTO sito è un ultimo uso
+                    // (sola misura, design95-liveness.md).
+                    #[cfg(feature = "zval-census")]
+                    super::zvalcensus::note_slot_load_site(func, ip, &self.frames[top].slots[*s as usize]);
+                    // S-101 census: clone di un handle Object in pila (P2).
+                    #[cfg(feature = "zval-census")]
+                    super::zvalcensus::note_recv_load(&self.frames[top].slots[*s as usize]);
+                    scn!(LoadSlot: op);
+                    scn!(LoadSlot: Push = 1);
+                    let v = read_slot(&self.frames[top].slots[*s as usize]);
+                    self.frames[top].stack.push(v);
+                }
+                Op::LoadVar { slot, name } => {
+                    // A source-level `$x` read: an `Undef` slot raises the PHP 8
+                    // "Undefined variable" warning (queued; flushed at the next
+                    // emit point with the reading op's line) and yields NULL.
+                    if matches!(self.frames[top].slots[*slot as usize], Zval::Undef) {
+                        if let crate::bytecode::Const::Str(b) =
+                            &self.frames[top].func.consts[*name as usize]
+                        {
+                            let msg = format!("Undefined variable ${}", String::from_utf8_lossy(b.as_bytes()));
+                            self.diags.push(Diag::Warning(msg));
+                        }
+                    }
+                    // S-95.0 A-ZV2 F1: conta se QUESTO sito è un ultimo uso
+                    // (sola misura, design95-liveness.md).
+                    #[cfg(feature = "zval-census")]
+                    super::zvalcensus::note_slot_load_site(func, ip, &self.frames[top].slots[*slot as usize]);
+                    // S-101 census: clone di un handle Object in pila (P2).
+                    #[cfg(feature = "zval-census")]
+                    super::zvalcensus::note_recv_load(&self.frames[top].slots[*slot as usize]);
+                    scn!(LoadVar: op);
+                    scn!(LoadVar: Push = 1);
+                    let v = read_slot(&self.frames[top].slots[*slot as usize]);
+                    self.frames[top].stack.push(v);
+                }
+                Op::StoreSlot(s) => {
+                    // A slot aliasing a *typed property* (a registered typed
+                    // reference) coerces/checks the value first (PHP's typed-ref
+                    // assignment: "Cannot assign string to reference held by
+                    // property C::$p of type int").
+                    if !self.typed_refs.is_empty() {
+                        if let Zval::Ref(cell) = &self.frames[top].slots[*s as usize] {
+                            let cell = Rc::clone(cell);
+                            let strict = self.frames[top].module.strict;
+                            let v = self.frames[top].stack.pop().expect("StoreSlot value");
+                            let v = self.typed_ref_assign(&cell, v, strict)?;
+                            self.frames[top].stack.push(v);
+                        }
+                    }
+                    let v = self.frames[top].stack.pop().expect("StoreSlot on empty stack");
+                    let old = store_slot(&mut self.frames[top].slots[*s as usize], v);
+                    self.gc_note(&old);
+                }
+                Op::LoadVarDyn => {
+                    // `$$x` read: resolve the runtime name in the current frame.
+                    let nv = self.frames[top].stack.pop().expect("LoadVarDyn name");
+                    let name = convert::to_zstr_cast(&nv, &mut self.diags).as_bytes().to_vec();
+                    let v = self.var_dyn_read(top, &name);
+                    self.frames[top].stack.push(v);
+                }
+                Op::StoreVarDyn => {
+                    // `$$x = rhs`: resolve/create by runtime name; the rhs stays
+                    // on the stack as the assignment's value.
+                    let rhs = self.frames[top].stack.pop().expect("StoreVarDyn value");
+                    let nv = self.frames[top].stack.pop().expect("StoreVarDyn name");
+                    let name = convert::to_zstr_cast(&nv, &mut self.diags).as_bytes().to_vec();
+                    self.var_dyn_write(top, &name, rhs.clone())?;
+                    self.frames[top].stack.push(rhs);
+                }
+                Op::BindGlobalDyn => {
+                    // `global $$x`: alias the same-named local to the global
+                    // cell resolved by the runtime name. An object name goes
+                    // through the throwing conversion (`global ${new stdClass}`
+                    // is Zend's catchable "could not be converted to string").
+                    let nv = self.frames[top].stack.pop().expect("BindGlobalDyn name");
+                    let nv = nv.deref_clone();
+                    let name = match &nv {
+                        Zval::Object(_) => self.vm_stringify(&nv)?.as_bytes().to_vec(),
+                        other => {
+                            convert::to_zstr_cast(other, &mut self.diags).as_bytes().to_vec()
+                        }
+                    };
+                    self.bind_global_dyn(top, &name)?;
+                }
+                Op::StaticGuard { id, skip } => {
+                    // First execution of this `static` declaration falls through to
+                    // run the initialiser; every later one skips to the alias. A
+                    // closure keys its own per-instance storage (fresh statics per
+                    // closure object); everything else the program-global `statics`.
+                    let id = &self.rbs(*id);
+                    let exists = match self.frames[top].closure_id() {
+                        Some(cid) => self.closure_statics.contains_key(&(cid, *id)),
+                        None => self.statics[*id as usize].is_some(),
+                    };
+                    if exists {
+                        self.frames[top].ip = *skip as usize;
+                    }
+                }
+                Op::StaticStore { id } => {
+                    let id = &self.rbs(*id);
+                    let v = self.frames[top].stack.pop().expect("StaticStore on empty stack");
+                    let cell = php_types::zcell(v);
+                    let old = match self.frames[top].closure_id() {
+                        Some(cid) => self.closure_statics.insert((cid, *id), cell),
+                        None => self.statics[*id as usize].replace(cell),
+                    };
+                    if let Some(cell) = old {
+                        // OBS-10 (INV-RECV-1, FUORI perimetro move: observes
+                        // the replaced static cell, never the moved handle).
+                        if Rc::strong_count(&cell) == 1 {
+                            let inner = cell.borrow();
+                            self.gc_note(&inner);
+                        }
+                    }
+                }
+                Op::StaticAlias { slot, id } => {
+                    let id = &self.rbs(*id);
+                    // Alias the local slot to the persistent cell: reads/writes of
+                    // the variable now go through it (the slot holds a `Zval::Ref`,
+                    // followed by `read_slot`/`store_slot` like any reference).
+                    let cell = match self.frames[top].closure_id() {
+                        Some(cid) => Rc::clone(
+                            self.closure_statics
+                                .get(&(cid, *id))
+                                .expect("StaticAlias reached before its StaticStore"),
+                        ),
+                        None => Rc::clone(
+                            self.statics[*id as usize]
+                                .as_ref()
+                                .expect("StaticAlias reached before its StaticStore"),
+                        ),
+                    };
+                    // Rebinding the slot to the static cell drops whatever it held
+                    // (`$x = new T; static $x;` discards the temporary T here).
+                    let old = std::mem::replace(&mut self.frames[top].slots[*slot as usize], Zval::Ref(cell));
+                    self.gc_note(&old);
+                }
+                Op::LoadGlobal(s) => {
+                    // `$GLOBALS['x']` read: the global lives in the script frame.
+                    let v = read_slot(&self.frames[0].slots[*s as usize]);
+                    self.frames[top].stack.push(v);
+                }
+                Op::StoreGlobal(s) => {
+                    // `$GLOBALS['x'] = …`: write/create the global in the script frame.
+                    let v = self.frames[top].stack.pop().expect("StoreGlobal on empty stack");
+                    let old = store_slot(&mut self.frames[0].slots[*s as usize], v);
+                    self.gc_note(&old);
+                }
+                Op::IncDecGlobal { slot, inc, pre } => {
+                    let i = *slot as usize;
+                    if matches!(self.frames[0].slots[i], Zval::Undef) {
+                        self.frames[0].slots[i] = Zval::Null;
+                    }
+                    // Value snapshot + write-through (see IncDecSlot: a reference
+                    // slot must yield the pre-increment VALUE and keep aliases).
+                    let old = self.frames[0].slots[i].deref_clone();
+                    let (newv, diags) = self.compute_incdec(old.clone(), *inc)?;
+                    // PHP raises the diagnostic *before* writing the result back, so a
+                    // `set_error_handler` runs here (it may throw, unwinding this op, or
+                    // mutate the variable — which the write-back below then overwrites).
+                    self.raise_diags(diags, self.cur_line(top))?;
+                    let _ = store_slot(&mut self.frames[0].slots[i], newv.clone());
+                    let pushed = if *pre { newv } else { old };
+                    self.frames[top].stack.push(pushed);
+                }
+                Op::LoadSuperglobal(idx) => {
+                    // `$_SERVER` (&c.) read: the value lives in the VM-level store,
+                    // resolved by name — correct from any unit/frame. Silent like
+                    // `LoadGlobal`.
+                    let v = read_slot(&self.superglobals[*idx as usize]);
+                    self.frames[top].stack.push(v);
+                }
+                Op::StoreSuperglobal(idx) => {
+                    let v = self.frames[top].stack.pop().expect("StoreSuperglobal on empty stack");
+                    let old = store_slot(&mut self.superglobals[*idx as usize], v);
+                    self.gc_note(&old);
+                }
+                Op::GlobalsDynAssign => {
+                    // `$GLOBALS[$name] = v`: resolve-or-create the global slot.
+                    let v = self.frames[top].stack.pop().expect("GlobalsDynAssign value");
+                    let key = self.frames[top].stack.pop().expect("GlobalsDynAssign key");
+                    let name = convert::to_zstr_cast(&key, &mut self.diags).as_bytes().to_vec();
+                    let slot = self.global_slot_by_name(&name);
+                    match &mut self.frames[0].slots[slot] {
+                        Zval::Ref(rc) => *rc.borrow_mut() = v.clone(),
+                        cell => *cell = v.clone(),
+                    }
+                    self.frames[top].stack.push(v);
+                }
+                Op::LoadGlobals => {
+                    // Bare `$GLOBALS`: snapshot the script frame's named locals
+                    // plus the seeded data superglobals (PHP 8.1 read-only-copy
+                    // semantics; `$GLOBALS` itself excluded). The cross-unit
+                    // registry (seed_globals) supersedes the main func's own
+                    // slot names once includes/dynamic writes extended it.
+                    let mut out = PhpArray::new();
+                    let names: Vec<Vec<u8>> = if self.seed_globals.is_empty() {
+                        self.frames[0].func.slot_names.iter().map(|n| n.to_vec()).collect()
+                    } else {
+                        self.seed_globals.iter().map(|n| n.to_vec()).collect()
+                    };
+                    for (i, name) in names.iter().enumerate() {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        // Undef must be tested on the RAW slot (through a ref
+                        // cell): read_slot maps unset to NULL, so testing its
+                        // result kept every unset global in the snapshot as
+                        // null (GetBookmark's `unset($GLOBALS['link'])`,
+                        // WP-17).
+                        let raw = &self.frames[0].slots[i];
+                        let is_undef = match raw {
+                            Zval::Undef => true,
+                            Zval::Ref(c) => matches!(&*c.borrow(), Zval::Undef),
+                            _ => false,
+                        };
+                        if is_undef {
+                            continue;
+                        }
+                        let v = read_slot(raw);
+                        out.insert(Key::from_bytes(name), v);
+                    }
+                    for (i, name) in crate::bytecode::SUPERGLOBAL_NAMES.iter().enumerate() {
+                        let v = read_slot(&self.superglobals[i]);
+                        if matches!(v, Zval::Undef) {
+                            continue;
+                        }
+                        out.insert(Key::from_bytes(name), v);
+                    }
+                    self.frames[top].stack.push(Zval::Array(Rc::new(out)));
+                }
+                Op::IncDecSuperglobal { idx, inc, pre } => {
+                    let i = *idx as usize;
+                    if matches!(self.superglobals[i], Zval::Undef) {
+                        self.superglobals[i] = Zval::Null;
+                    }
+                    // Value snapshot + write-through (see IncDecSlot).
+                    let old = self.superglobals[i].deref_clone();
+                    let (newv, diags) = self.compute_incdec(old.clone(), *inc)?;
+                    self.raise_diags(diags, self.cur_line(top))?;
+                    let _ = store_slot(&mut self.superglobals[i], newv.clone());
+                    let pushed = if *pre { newv } else { old };
+                    self.frames[top].stack.push(pushed);
+                }
+                Op::PushUndef => {
+                    self.frames[top].stack.push(Zval::Undef);
+                }
+                Op::FillDefault { slot, skip } => {
+                    // Default-parameter prologue (PAR): skip the default if the
+                    // argument was supplied (the slot is not `Undef`).
+                    if !matches!(self.frames[top].slots[*slot as usize], Zval::Undef) {
+                        self.frames[top].ip = *skip as usize;
+                    }
+                }
+                Op::CoerceParam { slot, hint } => {
+                    // Coerce a just-filled scalar-hinted default (step 14). A valid
+                    // constant default always coerces; keep the value otherwise.
+                    let v = self.frames[top].slots[*slot as usize].clone();
+                    if let Ok(c) = coerce_to_hint(v, &hint, &mut self.diags, self.frames[top].module.strict) {
+                        self.frames[top].slots[*slot as usize] = c;
+                    }
+                }
+                Op::CheckArity { required, exactly } => {
+                    let argc = self.frames[top].argc;
+                    if argc < *required {
+                        // `Class::method` for a method, bare name for a function.
+                        let func_name = self.frames[top].func.name.clone();
+                        let name = match self.frames[top].class {
+                            Some(cid) => format!(
+                                "{}::{}",
+                                String::from_utf8_lossy(&self.classes[cid].name),
+                                String::from_utf8_lossy(&func_name)
+                            ),
+                            None => String::from_utf8_lossy(&func_name).into_owned(),
+                        };
+                        // The message reports the *call site* line (the caller's
+                        // current op), recovered from the EXC-3b line table.
+                        let line = if self.frames.len() >= 2 {
+                            self.cur_line(self.frames.len() - 2)
+                        } else {
+                            self.cur_line(top)
+                        };
+                        let qualifier = if *exactly { "exactly" } else { "at least" };
+                        let msg = format!(
+                            "Too few arguments to function {name}(), {argc} passed in {} on line {line} and {qualifier} {required} expected",
+                            String::from_utf8_lossy(&self.module.file)
+                        );
+                        return Err(PhpError::ArgumentCountError(msg));
+                    }
+                }
+                Op::IncDecSlot { slot, inc, pre } => {
+                    scn!(IncDecSlot: op);
+                    let i = *slot as usize;
+                    // WP-33 T1c guard: a raw Long slot with no overflow is a
+                    // pure register op — no diags possible, no reference
+                    // write-through, store is a plain (non-Rc) overwrite.
+                    // Overflow (MAX++ → Double per ops::increment), Ref/
+                    // Undef/Double/object slots all fail → generic.
+                    if let Zval::Long(l) = &self.frames[top].slots[i] {
+                        let l = *l;
+                        if let Some(n) = l.checked_add(if *inc { 1 } else { -1 }) {
+                            scn!(IncDecSlot: Push = 1);
+                            dcn!(IncDecSlot: &self.frames[top].slots[i]); // old Long sovrascritto
+                            self.frames[top].slots[i] = Zval::Long(n);
+                            self.frames[top].stack.push(Zval::Long(if *pre { n } else { l }));
+                            continue;
+                        }
+                    }
+                    if matches!(self.frames[top].slots[i], Zval::Undef) {
+                        self.frames[top].slots[i] = Zval::Null;
+                    }
+                    // Snapshot the VALUE (deref a reference slot): the postfix
+                    // result is the pre-increment value, not the live cell —
+                    // `$c++ === 0` on a by-ref captured `$c` compared the
+                    // already-incremented cell. The write-back goes *through*
+                    // the reference so aliases keep seeing the update.
+                    let old = self.frames[top].slots[i].deref_clone();
+                    let (newv, diags) = self.compute_incdec(old.clone(), *inc)?;
+                    // Raise before write-back (see IncDecGlobal).
+                    self.raise_diags(diags, self.cur_line(top))?;
+                    let _ = store_slot(&mut self.frames[top].slots[i], newv.clone());
+                    let pushed = if *pre { newv } else { old };
+                    scn!(IncDecSlot: Push = 1);
+                    self.frames[top].stack.push(pushed);
+                }
+                Op::Binary(b) => {
+                    let r = self.binary_value(top, *b)?;
+                    self.frames[top].stack.push(r);
+                }
+                Op::BinaryAdd => {
+                    // H-B2 (S-98.0): `+` specialized at emission. Tag guard
+                    // with FULL fallback (KS-ST-99-3): the Long+Long hit
+                    // writes the sum in place on the stack top (overflow
+                    // promotes to Double on the ORIGINAL operands, verbatim
+                    // from `binary_fast`); any miss re-enters the generic
+                    // funnel — same diags, overloads and errors by
+                    // construction.
+                    scn!(BinaryAdd: op);
+                    scn!(BinaryAdd: Pop = 1);
+                    scn!(BinaryAdd: Peek = 1);
+                    let rhs = self.frames[top].stack.pop().expect("BinaryAdd rhs");
+                    let fast = match (self.frames[top].stack.last(), &rhs) {
+                        (Some(Zval::Long(l)), Zval::Long(r)) => Some((*l, *r)),
+                        _ => None,
+                    };
+                    match fast {
+                        Some((l, r)) => {
+                            scn!(BinaryAdd: Peek = 1);
+                            dcn!(BinaryAdd: &rhs); // rhs consumato, muore a fine arm
+                            let v = match l.checked_add(r) {
+                                Some(s) => Zval::Long(s),
+                                None => Zval::Double(l as f64 + r as f64),
+                            };
+                            // il vecchio top (Long, guardato) muore nell'overwrite
+                            dcn!(BinaryAdd: self.frames[top].stack.last().expect("BinaryAdd lhs"));
+                            *self.frames[top]
+                                .stack
+                                .last_mut()
+                                .expect("BinaryAdd lhs") = v;
+                        }
+                        None => {
+                            scn!(BinaryAdd: Pop = 1);
+                            scn!(BinaryAdd: Push = 1);
+                            let lhs =
+                                self.frames[top].stack.pop().expect("BinaryAdd lhs");
+                            dcn!(BinaryAdd: &lhs); // consumati da binary_value_ab
+                            dcn!(BinaryAdd: &rhs);
+                            let r = self.binary_value_ab(BinOp::Add, lhs, rhs)?;
+                            self.frames[top].stack.push(r);
+                        }
+                    }
+                }
+                Op::ConcatAssignSlot(s) => {
+                    // Fused `$s .= rhs` (WP-55): body out of the loop
+                    // (WP-33 discipline), arm = one call + push.
+                    let r = self.concat_assign_slot(top, *s)?;
+                    self.frames[top].stack.push(r);
+                }
+                Op::CmpJmp { op, addr, when } => {
+                    // Fused compare+branch (WP-32): identical semantics to
+                    // Binary+JumpIfX by construction (shared binary_value;
+                    // to_bool on a Bool is free and emits no diag) — minus
+                    // the Zval::Bool stack round-trip and one dispatch.
+                    let r = self.binary_value(top, *op)?;
+                    if convert::to_bool(&r, &mut self.diags) == *when {
+                        self.frames[top].ip = *addr as usize;
+                    }
+                }
+                Op::CmpJmpConst { op, cidx, addr, when, const_lhs } => {
+                    // CmpJmp with one literal operand inlined (WP-34): the
+                    // PushConst dispatch and its stack round-trip disappear;
+                    // the compare runs through binary_value_ab — identical
+                    // semantics to Binary/CmpJmp by construction.
+                    let x = self.frames[top].stack.pop().expect("CmpJmpConst operand");
+                    let c = func.consts[*cidx as usize].to_zval();
+                    let (lhs, rhs) = if *const_lhs { (c, x) } else { (x, c) };
+                    let r = self.binary_value_ab(*op, lhs, rhs)?;
+                    if convert::to_bool(&r, &mut self.diags) == *when {
+                        self.frames[top].ip = *addr as usize;
+                    }
+                }
+                Op::BinarySS { op: b, l, r } => {
+                    // Raw-register fusion (WP-44 v3, re-armed S-97.1): bare
+                    // u16 slot indices, zero runtime operand dispatch. Fast
+                    // path borrows both slots into binary_fast; Undef
+                    // (LoadVar warning), Ref (deref) and tag-pair misses
+                    // take the owned funnel.
+                    let res = 'r: {
+                        {
+                            let fr = &self.frames[top];
+                            let lv = &fr.slots[*l as usize];
+                            let rv = &fr.slots[*r as usize];
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_))
+                                && !matches!(rv, Zval::Undef | Zval::Ref(_))
+                            {
+                                if let Some(v) = binary_fast(*b, lv, rv) {
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.reg_load_slot(top, func, *l);
+                        let rhs = self.reg_load_slot(top, func, *r);
+                        self.binary_value_ab(*b, lhs, rhs)?
+                    };
+                    self.frames[top].stack.push(res);
+                }
+                Op::BinarySSDst { op: b, l, r, dst } => {
+                    let res = 'r: {
+                        {
+                            let fr = &self.frames[top];
+                            let lv = &fr.slots[*l as usize];
+                            let rv = &fr.slots[*r as usize];
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_))
+                                && !matches!(rv, Zval::Undef | Zval::Ref(_))
+                            {
+                                if let Some(v) = binary_fast(*b, lv, rv) {
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.reg_load_slot(top, func, *l);
+                        let rhs = self.reg_load_slot(top, func, *r);
+                        self.binary_value_ab(*b, lhs, rhs)?
+                    };
+                    self.reg_store_slot(top, *dst, res)?;
+                }
+                Op::BinarySC { op: b, slot, cidx } => {
+                    // Const materialised ONCE (ZStr = refcount bump) and
+                    // reused by the miss path.
+                    let cv = func.consts[*cidx as usize].to_zval();
+                    let res = 'r: {
+                        {
+                            let lv = &self.frames[top].slots[*slot as usize];
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                                if let Some(v) = binary_fast(*b, lv, &cv) {
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.reg_load_slot(top, func, *slot);
+                        self.binary_value_ab(*b, lhs, cv)?
+                    };
+                    self.frames[top].stack.push(res);
+                }
+                Op::BinarySCDst { op: b, slot, cidx, dst } => {
+                    let cv = func.consts[*cidx as usize].to_zval();
+                    let res = 'r: {
+                        {
+                            let lv = &self.frames[top].slots[*slot as usize];
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                                if let Some(v) = binary_fast(*b, lv, &cv) {
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.reg_load_slot(top, func, *slot);
+                        self.binary_value_ab(*b, lhs, cv)?
+                    };
+                    self.reg_store_slot(top, *dst, res)?;
+                }
+                Op::BinaryDst { op: b, dst } => {
+                    // Assign-and-discard tail: operands pop exactly like
+                    // binary_value (rhs first), result sinks into the slot.
+                    scn!(BinaryDst: op);
+                    scn!(BinaryDst: Pop = 2);
+                    let rhs = self.frames[top].stack.pop().expect("BinaryDst rhs");
+                    let lhs = self.frames[top].stack.pop().expect("BinaryDst lhs");
+                    // S-101 census: specie degli operandi transitati (P1).
+                    #[cfg(feature = "zval-census")]
+                    {
+                        super::zvalcensus::note_prop_val(2, &lhs);
+                        super::zvalcensus::note_prop_val(2, &rhs);
+                    }
+                    dcn!(BinaryDst: &lhs); // consumati da binary_value_ab
+                    dcn!(BinaryDst: &rhs);
+                    let res = self.binary_value_ab(*b, lhs, rhs)?;
+                    // il valore corrente del dst muore nello store
+                    dcn!(BinaryDst: &self.frames[top].slots[*dst as usize]);
+                    self.reg_store_slot(top, *dst, res)?;
+                }
+                Op::BinarySTDst { op: b, l, dst } => {
+                    // S-106 leva H-A1 (ha1-criterio.out): fonde il tris
+                    // `LoadSlot(l); Swap; BinaryDst{op,dst}` del compound assign;
+                    // corpo ESATTO in `binary_st_dst_slow` (S-172).
+                    scn!(BinarySTDst: op);
+                    // S-172 L-SL2 «forma sigillata Long» fetta 2 = prop (criterio
+                    // wp172-harness/s172-criterio.md p.2b): rhs in cima alla pila
+                    // Long e slot l Long ⇒ catena i64 (`long_arith_i64` = arm Long
+                    // di binary_fast, VERBATIM), pop del Long e scrittura IN PLACE
+                    // su un dst già Long (= store_slot su Long: nessun typed-ref,
+                    // gc_note di un Long è no-op); ogni miss (tag, overflow,
+                    // Div/Mod/Pow, shift negativo) va al corpo ESATTO fuori linea,
+                    // che ricomputa da zero: il fast path non ha effetti
+                    // collaterali. I `dcn!` restano nel corpo esatto (sul hit
+                    // nessun Zval è materializzato).
+                    let fast = {
+                        let fr = &self.frames[top];
+                        match (fr.stack.last(), &fr.slots[*l as usize]) {
+                            (Some(Zval::Long(rv)), Zval::Long(lv)) => long_arith_i64(*b, *lv, *rv),
+                            _ => None,
+                        }
+                    };
+                    match fast {
+                        Some(r) => {
+                            self.frames[top].stack.pop();
+                            if let Zval::Long(x) = &mut self.frames[top].slots[*dst as usize] {
+                                *x = r;
+                                // S-174 «sweep-in-op» B (criterio p.2): dal solo
+                                // sentiero in place, Sweep seguente inerte ⇒ ip+2.
+                                if self.sweep_skip_next(top, func, ip + 1) {
+                                    self.frames[top].ip = ip + 2;
+                                }
+                            } else {
+                                self.reg_store_slot(top, *dst, Zval::Long(r))?;
+                            }
+                        }
+                        None => self.binary_st_dst_slow(top, func, ip, *b, *l, *dst)?,
+                    }
+                }
+                Op::BinaryTC { op: b, cidx } => {
+                    // S-107 lotto: BinarySC a lhs di PILA (bigram
+                    // PushConst→Binary). Const materializzato una volta;
+                    // stesso binary_fast + funnel binary_value_ab del
+                    // braccio Binary — il lhs arriva dalla pila ESATTAMENTE
+                    // come nell'op non fusa.
+                    let cv = func.consts[*cidx as usize].to_zval();
+                    let res = 'r: {
+                        if let Some(lv) = self.frames[top].stack.last() {
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                                if let Some(v) = binary_fast(*b, lv, &cv) {
+                                    self.frames[top].stack.pop();
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.frames[top].stack.pop().expect("BinaryTC lhs");
+                        self.binary_value_ab(*b, lhs, cv)?
+                    };
+                    self.frames[top].stack.push(res);
+                }
+                Op::BinarySCSC { opa, la, ca, opb, lb, cb, op } => {
+                    // S-107 lotto: l'albero `(la⊚ca) ⊚ (lb⊚cb)` (giudice
+                    // arith) in un'unica forma monomorfa. Ordine di
+                    // valutazione e diagnostica ORIGINALI: a per intero
+                    // (lettura con parità warning + funnel), poi b, poi il
+                    // combine — stessi binary_fast/binary_value_ab/
+                    // reg_load_slot delle forme SC.
+                    let cva = func.consts[*ca as usize].to_zval();
+                    let a = 'r: {
+                        {
+                            let lv = &self.frames[top].slots[*la as usize];
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                                if let Some(v) = binary_fast(*opa, lv, &cva) {
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.reg_load_slot(top, func, *la);
+                        self.binary_value_ab(*opa, lhs, cva)?
+                    };
+                    let cvb = func.consts[*cb as usize].to_zval();
+                    let bv = 'r: {
+                        {
+                            let lv = &self.frames[top].slots[*lb as usize];
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                                if let Some(v) = binary_fast(*opb, lv, &cvb) {
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.reg_load_slot(top, func, *lb);
+                        self.binary_value_ab(*opb, lhs, cvb)?
+                    };
+                    let res = match binary_fast(*op, &a, &bv) {
+                        Some(v) => v,
+                        None => self.binary_value_ab(*op, a, bv)?,
+                    };
+                    self.frames[top].stack.push(res);
+                }
+                Op::BinarySCSCDst { opa, la, ca, opb, lb, cb, op, opd, l, dst } => {
+                    // S-171 L-SL1 «forma sigillata Long» (criterio
+                    // wp171-harness/s171-criterio.md p.1a): quando i tre slot
+                    // sono Long e i due const sono Int, la catena a→b→combine→
+                    // dst gira INTERA su i64 (`long_arith_i64` = arm Long→Long
+                    // di binary_fast, VERBATIM, un match per op: forma
+                    // GENERICA, nessuna tupla cotta) senza Zval temporanei,
+                    // senza to_zval/read_slot/guardie; il risultato si scrive
+                    // IN PLACE sul payload di un dst già Long (= store_slot su
+                    // Long: nessun typed-ref, gc_note di un Long è no-op).
+                    // Ogni miss (tag, overflow, shift negativo, Div/Mod/Pow)
+                    // va al corpo ESATTO fuori linea, che ricomputa da zero:
+                    // il fast path non ha effetti collaterali.
+                    let fast = {
+                        let fr = &self.frames[top];
+                        if let (
+                            Zval::Long(xa),
+                            Zval::Long(xb),
+                            Zval::Long(xl),
+                            crate::bytecode::Const::Int(ka),
+                            crate::bytecode::Const::Int(kb),
+                        ) = (
+                            &fr.slots[*la as usize],
+                            &fr.slots[*lb as usize],
+                            &fr.slots[*l as usize],
+                            &func.consts[*ca as usize],
+                            &func.consts[*cb as usize],
+                        ) {
+                            long_arith_i64(*opa, *xa, *ka)
+                                .and_then(|a| long_arith_i64(*opb, *xb, *kb).map(|b| (a, b)))
+                                .and_then(|(a, b)| long_arith_i64(*op, a, b))
+                                .and_then(|r| long_arith_i64(*opd, *xl, r))
+                        } else {
+                            None
+                        }
+                    };
+                    match fast {
+                        Some(r) => {
+                            if let Zval::Long(x) = &mut self.frames[top].slots[*dst as usize] {
+                                *x = r;
+                                // S-174 «sweep-in-op» B (criterio p.2): dal solo
+                                // sentiero in place, se lo Sweep seguente è inerte
+                                // (`sweep_skip_next`, predicato del handler valutato
+                                // DOPO l'effetto) lo si scavalca senza dispatch.
+                                if self.sweep_skip_next(top, func, ip + 1) {
+                                    self.frames[top].ip = ip + 2;
+                                }
+                            } else {
+                                self.reg_store_slot(top, *dst, Zval::Long(r))?;
+                            }
+                        }
+                        None => self.binary_scsc_dst_slow(
+                            top, func, *opa, *la, *ca, *opb, *lb, *cb, *op, *opd, *l, *dst,
+                        )?,
+                    }
+                }
+                Op::LoadVarPushConst { slot, cidx } => {
+                    // S-108 lotto-2 W13: pura coppia di push — LoadVar
+                    // (parità warning via reg_load_slot/unit_slot_name,
+                    // guardia fold_slot) poi il const. Nessun effetto eliso.
+                    let v = self.reg_load_slot(top, func, *slot);
+                    self.frames[top].stack.push(v);
+                    let cv = func.consts[*cidx as usize].to_zval();
+                    self.frames[top].stack.push(cv);
+                }
+                Op::IncDecSlotPop { slot, inc } => {
+                    // S-107 lotto: `$x++;` come statement — IncDecSlot ESATTO
+                    // (metodo condiviso) senza push+Pop del transiente.
+                    self.incdec_slot_discard(top, *slot, *inc)?;
+                }
+                Op::IncDecSlotJmp { slot, inc, addr } => {
+                    // S-107 lotto: il trigramma IncDecSlot;Pop;Jump del
+                    // back-edge di loop — incremento poi salto incondizionato.
+                    self.incdec_slot_discard(top, *slot, *inc)?;
+                    // S-174 leva «Sweep-in-op» braccio C = «back-edge fuso» (criterio
+                    // wp174-harness/s174-criterio.md p.2): se la meta del salto è il
+                    // CmpJmpSC di testa del loop e il suo fast path è in dominio (const
+                    // Int, slot Long: `long_cmp_i64` VERBATIM dal handler), il confronto
+                    // si decide QUI e `ip` va direttamente alla meta del CmpJmpSC (o
+                    // all'op che lo segue): un dispatch in meno per iterazione. Ogni miss
+                    // ⇒ `ip = addr`, il CmpJmpSC gira come oggi (corpo esatto compreso).
+                    // Spento sotto op-census (il CmpJmpSC resta contato dal suo handler).
+                    let a = *addr as usize;
+                    self.frames[top].ip = a;
+                    #[cfg(not(feature = "op-census"))]
+                    if let Some(Op::CmpJmpSC { op: c_op, slot: c_slot, cidx, addr: c_addr, when }) = func.ops.get(a) {
+                        if let (crate::bytecode::Const::Int(c), Zval::Long(l)) =
+                            (&func.consts[*cidx as usize], &self.frames[top].slots[*c_slot as usize])
+                        {
+                            if let Some(jump) = long_cmp_i64(*c_op, *l, *c) {
+                                self.frames[top].ip = if jump == *when { *c_addr as usize } else { a + 1 };
+                            }
+                        }
+                    }
+                }
+                Op::CmpJmpSS { op, l, r, addr, when } => {
+                    let res = 'r: {
+                        {
+                            let fr = &self.frames[top];
+                            let lv = &fr.slots[*l as usize];
+                            let rv = &fr.slots[*r as usize];
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_))
+                                && !matches!(rv, Zval::Undef | Zval::Ref(_))
+                            {
+                                if let Some(v) = binary_fast(*op, lv, rv) {
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.reg_load_slot(top, func, *l);
+                        let rhs = self.reg_load_slot(top, func, *r);
+                        self.binary_value_ab(*op, lhs, rhs)?
+                    };
+                    if convert::to_bool(&res, &mut self.diags) == *when {
+                        self.frames[top].ip = *addr as usize;
+                    }
+                }
+                Op::CmpJmpSC { op, slot, cidx, addr, when } => {
+                    scn!(CmpJmpSC: op);
+                    // S-171 L-SL1 (criterio p.1b): const `Int` e slot `Long`
+                    // letti al posto (niente to_zval; niente guardia
+                    // Undef/Ref: il match sul tag la ingloba), confronto a
+                    // `bool` diretto (`long_cmp_i64` = arm Long/Long di
+                    // binary_fast, VERBATIM) senza Zval::Bool/to_bool/diags;
+                    // ogni altro caso va al corpo ESATTO fuori linea.
+                    let fast = match (&func.consts[*cidx as usize], &self.frames[top].slots[*slot as usize]) {
+                        (crate::bytecode::Const::Int(c), Zval::Long(l)) => long_cmp_i64(*op, *l, *c),
+                        _ => None,
+                    };
+                    let jump = match fast {
+                        Some(b) => b,
+                        None => self.cmp_jmp_sc_slow(top, func, *op, *slot, *cidx)?,
+                    };
+                    if jump == *when {
+                        self.frames[top].ip = *addr as usize;
+                    }
+                }
+                Op::ConcatN(n) => {
+                    // Flattened concat chain (WP-34): every part arrived
+                    // through `Stringify` or as a Str literal, so the join is
+                    // pure — one allocation instead of n-1 left-associated
+                    // reallocs. A non-Str part (unreachable by construction)
+                    // folds pairwise through binary_value_ab to keep concat
+                    // semantics owned in one place.
+                    let n = *n as usize;
+                    self.concat_n(top, n)?;
+                }
+                Op::ConcatNConst { n, cidx } => {
+                    // S-109 F2: la parte literal (Str per guardia della
+                    // finestra) è l'ultimo push del join; poi lo STESSO
+                    // corpo di ConcatN (concat_n, helper condiviso).
+                    let n = *n as usize;
+                    let cv = func.consts[*cidx as usize].to_zval();
+                    self.frames[top].stack.push(cv);
+                    self.concat_n(top, n)?;
+                }
+                Op::Unary(u) => {
+                    let a = self.frames[top].stack.pop().expect("Unary operand");
+                    let r = self.apply_unop_ovl(*u, &a)?;
+                    self.frames[top].stack.push(r);
+                }
+                Op::Cast(k) => {
+                    let a = self.frames[top].stack.pop().expect("Cast operand");
+                    // `(array)` does NOT initialize a lazy object (an
+                    // uninitialized wrapper casts to its raw — mostly empty —
+                    // view, init_trigger_array_cast), but an initialized proxy
+                    // casts its real instance: follow the forwarding chain.
+                    let a = if matches!(k, CastKind::Array) && self.is_lazy_value(&a) {
+                        self.proxy_view(a)
+                    } else {
+                        a
+                    };
+                    // `(object)` needs the object table (stdClass alloc); the rest
+                    // are pure value conversions — EXCEPT SimpleXML, whose
+                    // cast_object handler converts the node TEXT for (int)/
+                    // (float) where a generic object casts to 1 (WP-17,
+                    // export_wp's `(int) $item->post_id`).
+                    let r = if matches!(k, CastKind::Object) {
+                        self.object_cast(a)?
+                    } else if matches!(k, CastKind::Int | CastKind::Float)
+                        && deref_object(&a).is_some_and(|o| {
+                            self.class_index.get(&b"simplexmlelement"[..]).is_some_and(|&t| {
+                                self.instance_of(o.borrow().class_id as usize,
+                                    t,
+                                )
+                            })
+                        })
+                    {
+                        let s = self.vm_stringify(&a.deref_clone())?;
+                        apply_cast(*k, &Zval::Str(s), &mut self.diags)
+                    } else if matches!(k, CastKind::Int | CastKind::Float)
+                        && deref_object(&a).is_some_and(|o| {
+                            let cid = o.borrow().class_id as usize;
+                            [&b"tidy"[..], &b"tidynode"[..]].iter().any(|n| {
+                                self.class_index.get(*n).is_some_and(|&t| {
+                                    self.instance_of(cid,
+                                        t,
+                                    )
+                                })
+                            })
+                        })
+                    {
+                        // tidy_doc_cast_handler / tidy_node_cast_handler:
+                        // numeric casts yield 0, silently.
+                        match k {
+                            CastKind::Int => Zval::Long(0),
+                            _ => Zval::Double(0.0),
+                        }
+                    } else {
+                        apply_cast(*k, &a, &mut self.diags)
+                    };
+                    self.frames[top].stack.push(r);
+                }
+                Op::Jump(addr) => {
+                    scn!(Jump: op);
+                    self.frames[top].ip = *addr as usize;
+                }
+                Op::JumpIfFalse(addr) => {
+                    let c = self.frames[top].stack.pop().expect("JumpIfFalse cond");
+                    if !convert::to_bool(&c, &mut self.diags) {
+                        self.frames[top].ip = *addr as usize;
+                    }
+                }
+                Op::JumpIfTrue(addr) => {
+                    let c = self.frames[top].stack.pop().expect("JumpIfTrue cond");
+                    if convert::to_bool(&c, &mut self.diags) {
+                        self.frames[top].ip = *addr as usize;
+                    }
+                }
+                Op::Echo => {
+                    let v = self.frames[top].stack.pop().expect("Echo operand");
+                    let s = convert::to_zstr(&v, &mut self.diags);
+                    self.emit_str(top, s.as_bytes())?;
+                }
+                Op::Print => {
+                    let v = self.frames[top].stack.pop().expect("Print operand");
+                    let s = convert::to_zstr(&v, &mut self.diags);
+                    self.emit_str(top, s.as_bytes())?;
+                    self.frames[top].stack.push(Zval::Long(1));
+                }
+                Op::Stringify => {
+                    let v = self.frames[top].stack.pop().expect("Stringify operand");
+                    self.stringify_entry(top, v)?;
+                }
+                Op::StringifySlot { slot } => {
+                    // S-107 lotto: LoadVar (parità warning via reg_load_slot)
+                    // + Stringify ESATTO — stesso metodo condiviso, frame
+                    // __toString compreso.
+                    let v = self.reg_load_slot(top, func, *slot);
+                    self.stringify_entry(top, v)?;
+                }
+                Op::JumpIfNotNull(addr) => {
+                    let keep = !matches!(
+                        self.frames[top].stack.last(),
+                        Some(Zval::Null | Zval::Undef)
+                    );
+                    if keep {
+                        self.frames[top].ip = *addr as usize;
+                    } else {
+                        self.frames[top].stack.pop();
+                    }
+                }
+                Op::JumpIfNull(addr) => {
+                    // Peek; the value is kept either way (nullsafe `?->`).
+                    if matches!(self.frames[top].stack.last(), Some(Zval::Null | Zval::Undef)) {
+                        self.frames[top].ip = *addr as usize;
+                    }
+                }
+                Op::ArrayInit => {
+                    self.frames[top].stack.push(Zval::Array(Rc::new(PhpArray::new())));
+                }
+                Op::ArrayPush => {
+                    let value = self.frames[top].stack.pop().expect("ArrayPush value");
+                    let mut arr = self.frames[top].stack.pop().expect("ArrayPush array");
+                    if let Zval::Array(rc) = &mut arr {
+                        let _ = Rc::make_mut(rc).append(value);
+                    }
+                    self.frames[top].stack.push(arr);
+                }
+                Op::ArrayInsert => {
+                    let value = self.frames[top].stack.pop().expect("ArrayInsert value");
+                    let key = self.frames[top].stack.pop().expect("ArrayInsert key");
+                    let mut arr = self.frames[top].stack.pop().expect("ArrayInsert array");
+                    if let Zval::Array(rc) = &mut arr {
+                        let k = coerce_key_diag(&key, &mut self.diags)
+                            .ok_or_else(|| PhpError::TypeError("Illegal offset type".to_string()))?;
+                        Rc::make_mut(rc).insert(k, value);
+                    }
+                    self.frames[top].stack.push(arr);
+                }
+                Op::ArrayAppendSpread => {
+                    let src = self.frames[top].stack.pop().expect("ArrayAppendSpread source");
+                    // Collect the (int-key → append, string-key → insert) pairs to
+                    // merge. A generator is driven to completion (its keys are
+                    // re-yielded verbatim, so honour them like an array's).
+                    let pairs: Vec<(Key, Zval)> = match src.deref_clone() {
+                        Zval::Array(s) => {
+                            s.iter().map(|(k, v)| (k.clone(), v.deref_clone())).collect()
+                        }
+                        Zval::Generator(rc) => {
+                            let mut out = Vec::new();
+                            self.ensure_started(&rc)?;
+                            loop {
+                                let (k, v, done) = {
+                                    let g = rc.borrow();
+                                    (g.cur_key.clone(), g.cur_val.clone(), matches!(g.status, GenStatus::Done))
+                                };
+                                if done {
+                                    break;
+                                }
+                                let key = coerce_key_silent(&k).unwrap_or(Key::Int(0));
+                                out.push((key, v));
+                                self.resume_generator(&rc, Zval::Null)?;
+                            }
+                            out
+                        }
+                        obj @ Zval::Object(_)
+                            if object_class_id(&obj).is_some_and(|c| self.is_traversable(c)) =>
+                        {
+                            self.collect_traversable(obj)?
+                        }
+                        _ => Vec::new(),
+                    };
+                    let mut arr = self.frames[top].stack.pop().expect("ArrayAppendSpread array");
+                    if let Zval::Array(rc) = &mut arr {
+                        let dest = Rc::make_mut(rc);
+                        for (k, v) in pairs {
+                            if matches!(k, Key::Int(_)) {
+                                let _ = dest.append(v);
+                            } else {
+                                dest.insert(k, v);
+                            }
+                        }
+                    }
+                    self.frames[top].stack.push(arr);
+                }
+                Op::FetchDim => {
+                    let key = self.frames[top].stack.pop().expect("FetchDim key");
+                    let base = self.frames[top].stack.pop().expect("FetchDim base");
+                    // WP-33 T1b guard: Array base + Long/Str key (census:
+                    // 98.8% of FetchDim in the WP suites) resolved with ONE
+                    // canonical-key lookup, skipping the ArrayAccess probe
+                    // and the diag-ful funnel. Key canonicalization matches
+                    // coerce_key ("5" → Int(5) via Key::from_zstr); float
+                    // keys (deprecation), Bool/Null/Ref keys and Ref/Str/
+                    // object bases all fail the guard → generic. A MISS
+                    // (key absent) also falls through so the "Undefined
+                    // array key" warning keeps its single source of truth.
+                    if let Zval::Array(a) = &base {
+                        let k = match &key {
+                            Zval::Long(i) => Some(Key::Int(*i)),
+                            Zval::Str(s) => Some(Key::from_zstr(s)),
+                            _ => None,
+                        };
+                        if let Some(v) = k.as_ref().and_then(|k| a.get(k)) {
+                            let v = v.deref_clone();
+                            // The pending-diag flush MUST stay on the hit
+                            // path (trap #1): a warning staged by the
+                            // preceding op surfaces AT this read, and a
+                            // throwing error handler unwinds from HERE.
+                            if self.diags_rendered < self.diags.len() {
+                                let line = self.cur_line(top);
+                                self.flush_diags(line)?;
+                                let top = self.frames.len() - 1;
+                                self.frames[top].stack.push(v);
+                                continue;
+                            }
+                            self.frames[top].stack.push(v);
+                            continue;
+                        }
+                    }
+                    // `$o[$k]` on an ArrayAccess object dispatches `offsetGet` (step 51).
+                    if let Some(recv) = self.as_arrayaccess(&base) {
+                        self.enter_object_method(recv, b"offsetGet", vec![key], RetMode::Stack)?;
+                        continue;
+                    }
+                    let v = read_dim_warn(&base, &key, &mut self.diags)?;
+                    // Deliver the undefined-key warning AT the faulting read:
+                    // Zend raises it synchronously, and a throwing user error
+                    // handler (PHPUnit's expectWarning) must unwind from THIS
+                    // statement — a deferred flush surfaced it at a later op,
+                    // outside the test's expectation scope (WP-18, Tests_Locale).
+                    if self.diags_rendered < self.diags.len() {
+                        let line = self.cur_line(top);
+                        self.flush_diags(line)?;
+                        let top = self.frames.len() - 1;
+                        self.frames[top].stack.push(v);
+                        continue;
+                    }
+                    self.frames[top].stack.push(v);
+                }
+                Op::FetchDimList => {
+                    // A `list()` element read: undefined-key warns, a scalar
+                    // base stays silent (Zend's list path).
+                    let key = self.frames[top].stack.pop().expect("FetchDimList key");
+                    let base = self.frames[top].stack.pop().expect("FetchDimList base");
+                    if let Some(recv) = self.as_arrayaccess(&base) {
+                        self.enter_object_method(recv, b"offsetGet", vec![key], RetMode::Stack)?;
+                        continue;
+                    }
+                    let v = read_dim_warn_list(&base, &key, &mut self.diags);
+                    self.frames[top].stack.push(v);
+                }
+                Op::CoalesceFetchDim => {
+                    let key = self.frames[top].stack.pop().expect("CoalesceFetchDim key");
+                    let base = self.frames[top].stack.pop().expect("CoalesceFetchDim base");
+                    // WP-33 T1b guard (silent twin of the FetchDim guard):
+                    // for an Array base with a Long/Str key the coalesce
+                    // read is get-or-null with NO diagnostics by semantics,
+                    // so hit AND miss resolve inline; other keys/bases →
+                    // generic (float-key deprecation fires there via the
+                    // shared coerce funnel — read_dim_nullable is silent,
+                    // matching today's behavior).
+                    if let Zval::Array(a) = &base {
+                        let k = match &key {
+                            Zval::Long(i) => Some(Key::Int(*i)),
+                            Zval::Str(s) => Some(Key::from_zstr(s)),
+                            _ => None,
+                        };
+                        if let Some(k) = k {
+                            let v = a.get(&k).map(|v| v.deref_clone()).unwrap_or(Zval::Null);
+                            self.frames[top].stack.push(v);
+                            continue;
+                        }
+                    }
+                    // `$aa[$k] ?? $default` on an ArrayAccess object dispatches
+                    // the protocol quietly: !offsetExists → null (the coalesce
+                    // takes the default), else offsetGet (a null result also
+                    // falls through to the default).
+                    if let Some(recv) = self.as_arrayaccess(&base) {
+                        let ex = self
+                            .call_method_sync(recv.clone(), b"offsetExists", vec![key.clone()])?;
+                        let v = if convert::is_true_silent(&ex.deref_clone()) {
+                            self.call_method_sync(recv, b"offsetGet", vec![key])?.deref_clone()
+                        } else {
+                            Zval::Null
+                        };
+                        self.frames[top].stack.push(v);
+                        continue;
+                    }
+                    self.frames[top].stack.push(read_dim_nullable(&base, &key));
+                }
+                Op::AssignPath { base, nkeys, append } => {
+                    let value = self.frames[top].stack.pop().expect("AssignPath value");
+                    let mut keys = self.pop_keys(top, *nkeys);
+                    // `$o[$k] = v` / `$o[] = v` on an ArrayAccess object dispatches
+                    // `offsetSet` (a single step only); the expression yields `v`.
+                    if nkeys + *append as u32 == 1 {
+                        if let Some(recv) = self.as_arrayaccess(self.base_cell(*base, top)) {
+                            let key = if *append { Zval::Null } else { keys.pop().expect("set key") };
+                            self.frames[top].stack.push(value.clone());
+                            self.enter_object_method(recv, b"offsetSet", vec![key, value], RetMode::Discard)?;
+                            continue;
+                        }
+                    }
+                    // S-135 leva AP1 (criterio s135-criterio-ap1.md): caso
+                    // monomorfo `$a[k] = v` con base slot GIÀ Array — la
+                    // specializzazione letterale del cammino pieno (coerce →
+                    // make_mut → set_returning_displaced → gc_note → push),
+                    // senza il plumbing path_op/path_walk/Last. Il peek NON
+                    // coercisce e non vivifica: ogni altro caso (base
+                    // Ref/Object/Str/Null-vivify, append, nkeys>1, chiave
+                    // illegale a parte il TypeError condiviso, Busy) resta
+                    // al cammino pieno sotto, INVARIATO.
+                    if !*append && *nkeys == 1 {
+                        let is_plain_arr = {
+                            let cell = match *base {
+                                DimBase::Local(s) => &self.frames[top].slots[s as usize],
+                                DimBase::Global(s) => &self.frames[0].slots[s as usize],
+                                DimBase::Superglobal(i) => &self.superglobals[i as usize],
+                            };
+                            matches!(cell, Zval::Array(_))
+                        };
+                        if is_plain_arr {
+                            let key = keys.pop().expect("AssignPath key");
+                            let k = coerce_key_diag(&key, &mut self.diags)
+                                .ok_or_else(|| PhpError::TypeError("Illegal offset type".to_string()))?;
+                            let lw = {
+                                let cell = match *base {
+                                    DimBase::Local(s) => &mut self.frames[top].slots[s as usize],
+                                    DimBase::Global(s) => &mut self.frames[0].slots[s as usize],
+                                    DimBase::Superglobal(i) => &mut self.superglobals[i as usize],
+                                };
+                                let Zval::Array(rc) = cell else { unreachable!("peeked array") };
+                                Rc::make_mut(rc).set_returning_displaced(k, value.clone())
+                            };
+                            match lw {
+                                LeafWrite::Done(d) => {
+                                    if let Some(d) = d {
+                                        self.gc_note(&d);
+                                    }
+                                }
+                                LeafWrite::Busy(cell, val) => {
+                                    // Drain Set di path_op replicato (H-70.1;
+                                    // H-71.3: Err dichiarato irraggiungibile).
+                                    // S-136 az.rev. S-135 #3: QUI Busy stesso è
+                                    // dichiarato irraggiungibile (nessun guard
+                                    // di walk vivo, borrow del base cell chiuso
+                                    // prima del drain, nessun codice utente in
+                                    // mezzo): replica difensiva tenuta, ma il
+                                    // contatore dedicato denuncia se mai morde.
+                                    ap1_busy_note();
+                                    match cell.try_borrow_mut() {
+                                        Ok(mut g) => {
+                                            let d = std::mem::replace(&mut *g, val);
+                                            drop(g);
+                                            self.gc_note(&d);
+                                        }
+                                        Err(_) => drain_fail_note(),
+                                    }
+                                }
+                            }
+                            self.frames[top].stack.push(value);
+                            continue;
+                        }
+                    }
+                    let last = if *append {
+                        Last::Append { value }
+                    } else {
+                        Last::Set { key: keys.pop().expect("AssignPath key"), value }
+                    };
+                    let result = self.path_op(*base, top, keys, last)?;
+                    self.frames[top].stack.push(result);
+                }
+                Op::AssignOpPath { base, nkeys, op } => {
+                    let rhs = self.frames[top].stack.pop().expect("AssignOpPath rhs");
+                    let mut keys = self.pop_keys(top, *nkeys);
+                    let key = keys.pop().expect("AssignOpPath key");
+                    let result = self.path_op(*base, top, keys, Last::OpSet { key, op: *op, rhs })?;
+                    self.frames[top].stack.push(result);
+                }
+                Op::IncDecPath { base, nkeys, inc, pre } => {
+                    let mut keys = self.pop_keys(top, *nkeys);
+                    let key = keys.pop().expect("IncDecPath key");
+                    let result = self.path_op(*base, top, keys, Last::IncDec { key, inc: *inc, pre: *pre })?;
+                    self.frames[top].stack.push(result);
+                }
+                Op::IssetPath { base, nkeys } => {
+                    let keys = self.pop_keys(top, *nkeys);
+                    // `isset($o[$k])` on an ArrayAccess object is `offsetExists($k)`
+                    // (a single step only; it does not call `offsetGet`).
+                    if *nkeys == 1 {
+                        if let Some(recv) = self.as_arrayaccess(self.base_cell(*base, top)) {
+                            let key = keys.into_iter().next().expect("isset key");
+                            self.enter_object_method(recv, b"offsetExists", vec![key], RetMode::Stack)?;
+                            continue;
+                        }
+                    }
+                    // Nested form: BP_VAR_IS walk (an intermediate ArrayAccess
+                    // dispatches offsetExists/offsetGet; the protocol runs on
+                    // an ArrayAccess leaf).
+                    let set = match self.dim_is_walk(*base, top, &keys, super::IsMode::Exists)? {
+                        super::DimIsLeaf::Missing => false,
+                        super::DimIsLeaf::Aa(recv, key) => {
+                            let r = self.call_method_sync(recv, b"offsetExists", vec![key])?;
+                            convert::is_true_silent(&r.deref_clone())
+                        }
+                        super::DimIsLeaf::Verdict(set) => set,
+                    };
+                    self.frames[top].stack.push(Zval::Bool(set));
+                }
+                Op::EmptyPath { base, nkeys } => {
+                    let keys = self.pop_keys(top, *nkeys);
+                    // `empty($o[$k])` on an ArrayAccess object: `!offsetExists($k)`
+                    // short-circuits to empty (so `offsetGet` — which may throw for
+                    // an absent key, e.g. WeakMap — is skipped); otherwise
+                    // `!truthy(offsetGet($k))`. A single step only.
+                    if *nkeys == 1 {
+                        if let Some(recv) = self.as_arrayaccess(self.base_cell(*base, top)) {
+                            let key = keys.into_iter().next().expect("empty key");
+                            let exists =
+                                self.call_method_sync(recv.clone(), b"offsetExists", vec![key.clone()])?;
+                            let empty = if convert::is_true_silent(&exists) {
+                                let v = self.call_method_sync(recv, b"offsetGet", vec![key])?;
+                                !convert::is_true_silent(&v)
+                            } else {
+                                true
+                            };
+                            self.frames[top].stack.push(Zval::Bool(empty));
+                            continue;
+                        }
+                    }
+                    // Nested form: same BP_VAR_IS walk as `isset` above.
+                    let empty = match self.dim_is_walk(*base, top, &keys, super::IsMode::Truthy)? {
+                        super::DimIsLeaf::Missing => true,
+                        super::DimIsLeaf::Aa(recv, key) => {
+                            let exists = self
+                                .call_method_sync(recv.clone(), b"offsetExists", vec![key.clone()])?;
+                            if convert::is_true_silent(&exists.deref_clone()) {
+                                let v = self.call_method_sync(recv, b"offsetGet", vec![key])?;
+                                !convert::is_true_silent(&v.deref_clone())
+                            } else {
+                                true
+                            }
+                        }
+                        super::DimIsLeaf::Verdict(truthy) => !truthy,
+                    };
+                    self.frames[top].stack.push(Zval::Bool(empty));
+                }
+                Op::UnsetPath { base, nkeys } => {
+                    let keys = self.pop_keys(top, *nkeys);
+                    // `unset($o[$k])` on an ArrayAccess object is `offsetUnset($k)`
+                    // (a single step only).
+                    if *nkeys == 1 {
+                        if let Some(recv) = self.as_arrayaccess(self.base_cell(*base, top)) {
+                            let key = keys.into_iter().next().expect("unset key");
+                            self.enter_object_method(recv, b"offsetUnset", vec![key], RetMode::Discard)?;
+                            continue;
+                        }
+                    }
+                    if let Some((recv, key)) = self.dim_aa_leaf(*base, top, &keys) {
+                        self.call_method_sync(recv, b"offsetUnset", vec![key])?;
+                        continue;
+                    }
+                    // `unset($x)` drops the variable's value: capture and note it
+                    // (it may hold the last reference to an object with a
+                    // destructor, which then runs at this point). A nested
+                    // `unset($x[$k])` removes a deep element — left to the cascade
+                    // / full scan.
+                    let dropped = if keys.is_empty() {
+                        Some(match base {
+                            DimBase::Local(s) => std::mem::replace(&mut self.frames[top].slots[*s as usize], Zval::Undef),
+                            DimBase::Global(s) => std::mem::replace(&mut self.frames[0].slots[*s as usize], Zval::Undef),
+                            DimBase::Superglobal(i) => std::mem::replace(&mut self.superglobals[*i as usize], Zval::Undef),
+                        })
+                    } else {
+                        let cell = match base {
+                            DimBase::Local(s) => &mut self.frames[top].slots[*s as usize],
+                            DimBase::Global(s) => &mut self.frames[0].slots[*s as usize],
+                            DimBase::Superglobal(i) => &mut self.superglobals[*i as usize],
+                        };
+                        let mut aa = None;
+                        unset_into(cell, &keys, &mut aa);
+                        self.drain_unset_aa(aa, top)?;
+                        None
+                    };
+                    if let Some(old) = dropped {
+                        self.gc_note(&old);
+                    }
+                }
+                Op::BindRef { target, source } => {
+                    // REF-1: promote `source` to a shared cell, alias `target` to
+                    // the same `Rc`, and push the cell's value (the assignment
+                    // expression yields the aliased value). The two slot reads are
+                    // sequential, so the borrows never overlap.
+                    let cell = make_cell(ref_base_mut(
+                        &mut self.frames,
+                        &mut self.superglobals,
+                        top,
+                        *source,
+                    ));
+                    let value = cell.borrow().clone();
+                    let old = std::mem::replace(
+                        ref_base_mut(&mut self.frames, &mut self.superglobals, top, *target),
+                        Zval::Ref(cell),
+                    );
+                    self.frames[top].stack.push(value);
+                    // The displaced target is a reference drop (WP-46,
+                    // gc_019/gc_021: `$a =& $b` rebinding away from a cyclic
+                    // array) — note it like any assignment's displaced value.
+                    self.gc_note(&old);
+                }
+                Op::PushRef(slot) => {
+                    // REF-2: promote the local to a shared cell and push the ref;
+                    // the next `Op::Call` binds it into the by-ref callee slot.
+                    let cell = make_cell(&mut self.frames[top].slots[*slot as usize]);
+                    self.frames[top].stack.push(Zval::Ref(cell));
+                }
+                Op::MakeClosure { fn_idx, captures, bind_this } => {
+                    let mut bound = Vec::with_capacity(captures.len());
+                    for cap in captures.iter() {
+                        let val = if cap.by_ref {
+                            Zval::Ref(make_cell(&mut self.frames[top].slots[cap.src as usize]))
+                        } else {
+                            read_slot(&self.frames[top].slots[cap.src as usize])
+                        };
+                        bound.push((cap.dst, val));
+                    }
+                    let bound_this = if *bind_this { self.frames[top].this.clone() } else { None };
+                    let m = self.frames[top].module;
+                    // A closure index always resolves in the unit that compiled the
+                    // body — except a trait method flattened into a class from
+                    // *another* unit: its closure indices point at the trait's unit,
+                    // not the consumer's (cross-unit trait-closure relocation is not
+                    // yet implemented). Surface a catchable error rather than panic.
+                    let Some(func) = m.closures.get(*fn_idx as usize) else {
+                        return Err(PhpError::Error(format!(
+                            "closure from a trait used across files is not yet supported \
+                             (closure #{fn_idx} of {} in unit '{}' [{} closures])",
+                            String::from_utf8_lossy(&self.frames[top].func.name),
+                            String::from_utf8_lossy(&m.file),
+                            m.closures.len(),
+                        )));
+                    };
+                    let info = Rc::new(ClosureInfo {
+                        kind: ClosureRender::Closure {
+                            name: PhpStr::new(func.name.to_vec()),
+                            file: PhpStr::new(m.file.to_vec()),
+                            line: func.line,
+                        },
+                        params: closure_params(func),
+                    });
+                    let id = self.next_id();
+                    let module_id = self.module_id(m);
+                    let scope = self.frames[top].class;
+                    // `static::` inside the body keeps the CREATING frame's
+                    // late-static-binding class (Child::getCb() returning a
+                    // closure whose `static::` is Child, WP-17).
+                    let lsb = self.frames[top].static_class.or(scope);
+                    let cl = Closure {
+                        fn_idx: *fn_idx as usize,
+                        captures: bound,
+                        named: None,
+                        bound_this,
+                        id,
+                        info,
+                        module_id,
+                        scope,
+                        is_static: !bind_this,
+                        lsb,
+                        walk: Default::default(),
+                    };
+                    self.frames[top].stack.push(Zval::Closure(Rc::new(cl)));
+                }
+                Op::MakeFcc { name } => {
+                    // CLO-2: a first-class callable wraps a function *name*. A user
+                    // function contributes its `[parameter]` dump; an internal
+                    // (registry) callable has none.
+                    let params = self
+                        .module
+                        .functions
+                        .iter()
+                        .find(|f| name_eq_ignore_case(&f.name, &name))
+                        .map(|f| closure_params(f))
+                        .unwrap_or_default();
+                    let info = Rc::new(ClosureInfo {
+                        kind: ClosureRender::Function(PhpStr::new(name.to_vec())),
+                        params,
+                    });
+                    let id = self.next_id();
+                    let cl = Closure {
+                        fn_idx: 0,
+                        captures: Vec::new(),
+                        named: Some(PhpStr::new(name.to_vec())),
+                        bound_this: None,
+                        id,
+                        info,
+                        module_id: 0,
+                        scope: None,
+                        is_static: false,
+                        lsb: None,
+                        walk: Default::default(),
+                    };
+                    self.frames[top].stack.push(Zval::Closure(Rc::new(cl)));
+                }
+                Op::CallValue { argc } => {
+                    let n = *argc as usize;
+                    let mut args = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        args.push(self.frames[top].stack.pop().expect("CallValue argument"));
+                    }
+                    args.reverse();
+                    let callee = self.frames[top].stack.pop().expect("CallValue callee");
+                    self.invoke_value(callee, args)?;
+                }
+                Op::CallNsFallback { name, fallback, argc } => {
+                    let n = *argc as usize;
+                    let mut args = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        args.push(self.frames[top].stack.pop().expect("CallNsFallback argument"));
+                    }
+                    args.reverse();
+                    self.invoke_named_fallback(&name, &fallback, args)?;
+                }
+                Op::CallValueArgs => {
+                    // Spread `$f(...$a)`: the arguments are the values of a runtime
+                    // array (the callee sits beneath it), expanded in order.
+                    let argsval = self.frames[top].stack.pop().expect("CallValueArgs array");
+                    let args = args_from_array_value(argsval);
+                    let callee = self.frames[top].stack.pop().expect("CallValueArgs callee");
+                    self.invoke_value(callee, args)?;
+                }
+                Op::CallNsFallbackArgs { name, fallback } => {
+                    // Spread on the two-step namespaced lookup: arguments from a
+                    // runtime array, resolution deferred like `CallNsFallback`.
+                    let argsval =
+                        self.frames[top].stack.pop().expect("CallNsFallbackArgs array");
+                    let args = args_from_array_value(argsval);
+                    self.invoke_named_fallback(&name, &fallback, args)?;
+                }
+                Op::Throw => {
+                    let v = self.frames[top].stack.pop().expect("throw operand");
+                    return Err(PhpError::Thrown(v.deref_clone()));
+                }
+                Op::Rethrow => {
+                    let v = self.frames[top].stack.pop().expect("rethrow operand");
+                    return Err(PhpError::Thrown(v));
+                }
+                Op::CatchMatch { types, names, var, body } => {
+                    let exc = self.frames[top].stack.last().expect("in-flight exception").clone();
+                    let caught = object_class_id(&exc).is_some_and(|ec| {
+                        types
+                            .iter()
+                            .any(|&t| self.instance_of(ec, t))
+                            // Classes declared after compile time (by eval/include) are
+                            // resolved by name against the live class table (Phase 2).
+                            || names.iter().any(|n| {
+                                self.class_index
+                                    .get(&n.to_ascii_lowercase())
+                                    .is_some_and(|&t| {
+                                        self.instance_of(ec, t)
+                                    })
+                            })
+                    });
+                    if caught {
+                        self.frames[top].stack.pop();
+                        if let Some(slot) = var {
+                            let displaced =
+                                store_slot(&mut self.frames[top].slots[*slot as usize], exc);
+                            self.gc_note(&displaced);
+                        } else {
+                            // A capture-less catch drops the throwable right here.
+                            self.gc_note(&exc);
+                        }
+                        self.frames[top].ip = *body as usize;
+                    }
+                    // else: fall through to the next CatchMatch / Rethrow.
+                }
+                Op::EndFinally { after } => {
+                    // EXC-2/2b: resolve the finally's pending action. A propagating
+                    // exception wins; then a parked return (push the value and fall
+                    // through to the trailing `Ret`); then a parked break/continue
+                    // (jump to its loop target); otherwise skip past the `try`.
+                    if let Some(v) =
+                        self.frames[top].ext_opt_mut().and_then(|e| e.pending_throw.take())
+                    {
+                        return Err(PhpError::Thrown(v));
+                    }
+                    match self.frames[top].ext_opt_mut().and_then(|e| e.pending_transfer.take()) {
+                        Some(Transfer::Return(val)) => {
+                            self.frames[top].stack.push(val);
+                            // fall through to the `Ret` emitted right after this op
+                        }
+                        Some(Transfer::Jump(addr)) => {
+                            self.frames[top].ip = addr as usize;
+                        }
+                        None => {
+                            self.frames[top].ip = *after as usize;
+                        }
+                    }
+                }
+                Op::ParkReturn => {
+                    let v = self.frames[top].stack.pop().unwrap_or(Zval::Null);
+                    self.frames[top].ext_mut().pending_transfer = Some(Transfer::Return(v));
+                }
+                Op::ParkJump(addr) => {
+                    self.frames[top].ext_mut().pending_transfer = Some(Transfer::Jump(*addr));
+                }
+                Op::DerefTop => {
+                    // REF-4b: copy a by-ref return used in value context.
+                    if let Some(Zval::Ref(_)) = self.frames[top].stack.last() {
+                        let v = self.frames[top].stack.pop().unwrap().deref_clone();
+                        self.frames[top].stack.push(v);
+                    }
+                }
+                Op::MakeRef { base, steps } => {
+                    // REF-4: navigate to the place's leaf, promote it to a shared
+                    // cell, and push a reference to it. Keys (for `Index` steps)
+                    // were pushed in source order and sit on top of the stack.
+                    let keys = self.pop_field_keys(top, &steps);
+                    let cell = self.make_ref_cell(top, *base, &steps, keys)?;
+                    self.frames[top].stack.push(Zval::Ref(cell));
+                }
+                Op::PushArgPlace { base, steps, name } => {
+                    // SEND_VAR_EX place argument (FETCH_DIM/OBJ_FUNC_ARG):
+                    // capture the evaluated keys and defer the fetch to the
+                    // dispatch binder, which W-fetches (by-ref param) or
+                    // R-fetches.
+                    let keys = self.pop_field_keys(top, &steps);
+                    let pbase = match base {
+                        FieldBase::Local(s) => ArgPlaceBase::Local(*s),
+                        FieldBase::Global(s) => ArgPlaceBase::Global(*s),
+                        FieldBase::Superglobal(i) => ArgPlaceBase::Superglobal(*i),
+                        FieldBase::This => ArgPlaceBase::This,
+                    };
+                    let psteps: Box<[ArgPlaceStep]> = steps
+                        .iter()
+                        .map(|s| match s {
+                            FieldStep::Index => ArgPlaceStep::Index,
+                            FieldStep::Prop(n) => ArgPlaceStep::Prop(n.clone()),
+                            FieldStep::Append => ArgPlaceStep::Append,
+                            _ => unreachable!("PushArgPlace step"),
+                        })
+                        .collect();
+                    let pname: Box<[u8]> = match &self.frames[top].func.consts[*name as usize] {
+                        crate::bytecode::Const::Str(b) => Box::from(b.as_bytes()),
+                        _ => Box::default(),
+                    };
+                    self.frames[top].stack.push(Zval::ArgPlace(Rc::new(ArgPlace {
+                        base: pbase,
+                        steps: psteps,
+                        keys,
+                        name: pname,
+                    })));
+                }
+                Op::BindRefTo { base, steps } => {
+                    // REF-4: pop the reference, bind the target place to its cell,
+                    // and push the aliased value (the assignment's result).
+                    // Binding a reference *into* a hooked property is forbidden.
+                    if self.field_starts_at_hook(*base, top, &steps) {
+                        if steps.len() > 1 {
+                            // Navigating *into* the property: a `&get` hook's cell
+                            // is an addressable root — bind the leaf inside it.
+                            if let Some(root) = self.byref_hook_root(*base, top, &steps)? {
+                                let top_val = self.frames[top].stack.pop().expect("BindRefTo value");
+                                let cell = match top_val {
+                                    Zval::Ref(rc) => rc,
+                                    other => php_types::zcell(other),
+                                };
+                                let value = cell.borrow().clone();
+                                let keys = self.pop_field_keys(top, &steps);
+                                self.field_set_in_root(root, top, &steps[1..], keys, Zval::Ref(cell), true, false)?;
+                                self.frames[top].stack.push(value);
+                                continue;
+                            }
+                        } else {
+                            // The write fetch of the rebind target runs a `&get`
+                            // hook first (observable side effects, bug007) — then
+                            // PHP still rejects rebinding the property slot.
+                            let _ = self.byref_hook_root(*base, top, &steps)?;
+                        }
+                        return Err(PhpError::Error(
+                            "Cannot assign by reference to overloaded object".to_string(),
+                        ));
+                    }
+                    let top_val = self.frames[top].stack.pop().expect("BindRefTo value");
+                    let cell = match top_val {
+                        Zval::Ref(rc) => rc,
+                        other => php_types::zcell(other),
+                    };
+                    let mut keys = self.pop_field_keys(top, &steps);
+                    // A lazy base initializes/forwards; binding into a typed
+                    // property validates the reference's value at bind time and
+                    // registers the typed source (typed_properties_001).
+                    let lazy_root = self.field_lazy_root(*base, top, &steps, &keys, true)?;
+                    {
+                        let target = match &lazy_root {
+                            Some(r) => Some(r.clone()),
+                            None => match base {
+                                FieldBase::Local(s) => self.frames[top].slots.get(*s as usize).map(|v| v.deref_clone()),
+                                FieldBase::Global(s) => self.frames[0].slots.get(*s as usize).map(|v| v.deref_clone()),
+                                FieldBase::Superglobal(i) => self.superglobals.get(*i as usize).map(|v| v.deref_clone()),
+                                FieldBase::This => self.frames[top].this.as_ref().map(|v| v.deref_clone()),
+                            },
+                        };
+                        self.bind_ref_typed_check(target.as_ref(), &steps, &mut keys, &cell)?;
+                    }
+                    let value = cell.borrow().clone();
+                    if let Some(root) = lazy_root {
+                        self.field_set_in_root(php_types::zcell_prop(root), top, &steps, keys, Zval::Ref(cell), true, false)?;
+                    } else if steps.is_empty() {
+                        // A step-less base is rebound directly (not written
+                        // through), matching `eval::bind_ref_target`.
+                        let base_cell = field_base_mut(&mut self.frames, &mut self.superglobals, top, *base)?;
+                        *base_cell = Zval::Ref(cell);
+                    } else {
+                        self.field_set_mode(*base, top, &steps, keys, Zval::Ref(cell), true, false)?;
+                    }
+                    self.frames[top].stack.push(value);
+                }
+                Op::BindRefToChecked { base, steps } => {
+                    // `$t = &m()` for a method/static call: the callee's by-ref-ness
+                    // is only known now. A non-`Ref` source means the callee did not
+                    // return by reference — raise the notice, then bind a copy.
+                    if self.field_starts_at_hook(*base, top, &steps) {
+                        if steps.len() == 1 {
+                            // Run a `&get` hook's observable side effects before
+                            // rejecting the rebind (mirrors `Op::BindRefTo`).
+                            let _ = self.byref_hook_root(*base, top, &steps)?;
+                        } else if let Some(root) = self.byref_hook_root(*base, top, &steps)? {
+                            let top_val = self.frames[top].stack.pop().expect("BindRefToChecked value");
+                            let cell = match top_val {
+                                Zval::Ref(rc) => rc,
+                                other => {
+                                    self.diags.push(Diag::Notice(
+                                        "Only variables should be assigned by reference".to_string(),
+                                    ));
+                                    let line = self.cur_line(top);
+                                    self.flush_diags(line)?;
+                                    php_types::zcell(other)
+                                }
+                            };
+                            let value = cell.borrow().clone();
+                            let keys = self.pop_field_keys(top, &steps);
+                            self.field_set_in_root(root, top, &steps[1..], keys, Zval::Ref(cell), true, false)?;
+                            self.frames[top].stack.push(value);
+                            continue;
+                        }
+                        return Err(PhpError::Error(
+                            "Cannot assign by reference to overloaded object".to_string(),
+                        ));
+                    }
+                    let top_val = self.frames[top].stack.pop().expect("BindRefToChecked value");
+                    let cell = match top_val {
+                        Zval::Ref(rc) => rc,
+                        other => {
+                            self.diags.push(Diag::Notice(
+                                "Only variables should be assigned by reference".to_string(),
+                            ));
+                            let line = self.cur_line(top);
+                            self.flush_diags(line)?;
+                            php_types::zcell(other)
+                        }
+                    };
+                    let value = cell.borrow().clone();
+                    let keys = self.pop_field_keys(top, &steps);
+                    if steps.is_empty() {
+                        let base_cell = field_base_mut(&mut self.frames, &mut self.superglobals, top, *base)?;
+                        *base_cell = Zval::Ref(cell);
+                    } else {
+                        self.field_set_mode(*base, top, &steps, keys, Zval::Ref(cell), true, false)?;
+                    }
+                    self.frames[top].stack.push(value);
+                }
+                Op::IterInit => {
+                    let iterable = self.frames[top].stack.pop().expect("IterInit iterable");
+                    let deref = iterable.deref_clone();
+                    // foreach over a lazy object initializes it first (PHP 8.4); a
+                    // proxy then iterates its real instance's properties.
+                    let deref = if deref_object(&deref).is_some_and(|o| o.borrow().lazy.is_some()) {
+                        self.realize_full(&deref)?
+                    } else {
+                        deref
+                    };
+                    // A generator iterates live (no snapshot); an `Iterator` /
+                    // `IteratorAggregate` object drives the protocol via the
+                    // re-entrant state machine in `IterNext` (step 51); an array /
+                    // plain object is snapshotted by value (GEN).
+                    let scope = self.frames[top].class;
+                    let it_state = match &deref {
+                        Zval::Generator(gs) => IterState::Gen { rc: Rc::clone(gs), primed: false },
+                        Zval::Object(o) if self.is_traversable(o.borrow().class_id as usize) => {
+                            IterState::Object {
+                                it: deref.clone(),
+                                stage: ObjStage::Start,
+                                pending: None,
+                                cur_val: None,
+                            }
+                        }
+                        // A plain (non-Traversable) object iterates its visible
+                        // properties (declared first, then dynamic): the key set is
+                        // fixed here, values are read live at each step.
+                        Zval::Object(_) => {
+                            IterState::ObjVals { obj: deref.clone(), scope, yielded: Vec::new() }
+                        }
+                        _ => IterState::ByVal { entries: snapshot_entries(&iterable), pos: 0 },
+                    };
+                    self.frames[top].iters.push(it_state);
+                }
+                Op::IterNext { value, key, end } => {
+                    // A generator step: prime on the first visit, otherwise resume
+                    // to the next yield, then bind the current `(key, value)` or
+                    // jump to `end` when the generator is done (GEN).
+                    let gen = match self.frames[top].iters.last_mut() {
+                        Some(IterState::Gen { rc, primed }) => {
+                            let rc = Rc::clone(rc);
+                            let was_primed = *primed;
+                            *primed = true;
+                            Some((rc, was_primed))
+                        }
+                        _ => None,
+                    };
+                    if let Some((rc, was_primed)) = gen {
+                        if was_primed {
+                            self.resume_generator(&rc, Zval::Null)?;
+                        } else {
+                            self.ensure_started(&rc)?;
+                        }
+                        let (k, v, done) = {
+                            let gs = rc.borrow();
+                            (gs.cur_key.clone(), gs.cur_val.clone(), matches!(gs.status, GenStatus::Done))
+                        };
+                        if done {
+                            self.frames[top].ip = *end as usize;
+                        } else {
+                            store_slot(&mut self.frames[top].slots[*value as usize], v.deref_clone());
+                            if let Some(ks) = key {
+                                store_slot(&mut self.frames[top].slots[*ks as usize], k);
+                            }
+                        }
+                        continue;
+                    }
+                    // Plain-object foreach: yield the next not-yet-visited visible
+                    // property, recomputed live (a property added in the body is
+                    // reached, a removed one skipped); a hooked property reads
+                    // through its `get` hook at this step.
+                    if matches!(self.frames[top].iters.last(), Some(IterState::ObjVals { .. })) {
+                        let pair = loop {
+                            let (obj, entry) = {
+                                let Some(IterState::ObjVals { obj, scope, yielded }) =
+                                    self.frames[top].iters.last()
+                                else {
+                                    unreachable!("ObjVals iterator")
+                                };
+                                let Zval::Object(o) = obj else { break None };
+                                let next = self
+                                    .object_iter_entries(o, *scope)
+                                    .into_iter()
+                                    .find(|(d, _)| !yielded.iter().any(|y| y == d));
+                                let Some(next) = next else { break None };
+                                (obj.clone(), next)
+                            };
+                            let (display, entry) = entry;
+                            if let Some(IterState::ObjVals { yielded, .. }) =
+                                self.frames[top].iters.last_mut()
+                            {
+                                yielded.push(display.clone());
+                            }
+                            match entry {
+                                PropIterEntry::Slot { key } => {
+                                    let v = deref_object(&obj).and_then(|o| o.borrow().props.get(&key).cloned());
+                                    if let Some(v) = v {
+                                        if !matches!(v, Zval::Undef) {
+                                            break Some((
+                                                Zval::Str(PhpStr::new(display.to_vec())),
+                                                v.deref_clone(),
+                                            ));
+                                        }
+                                    }
+                                    // Vanished since the entry list was built: skip.
+                                }
+                                PropIterEntry::Hook { name, view } => {
+                                    // `push_hook` already derefs a `&get` return in
+                                    // this value context (`ret_deref`).
+                                    let v = self.run_iter_get_hook(&obj, &name, view, true)?;
+                                    break Some((Zval::Str(PhpStr::new(display.to_vec())), v.deref_clone()));
+                                }
+                            }
+                        };
+                        match pair {
+                            None => self.frames[top].ip = *end as usize,
+                            Some((k, v)) => {
+                                store_slot(&mut self.frames[top].slots[*value as usize], v);
+                                if let Some(ks) = key {
+                                    store_slot(&mut self.frames[top].slots[*ks as usize], k);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // Object iterator (Iterator / IteratorAggregate): a re-entrant
+                    // state machine drives the protocol methods one per re-entry,
+                    // each call's return captured via `ret_cell` (step 51).
+                    let obj_stage = match self.frames[top].iters.last() {
+                        Some(IterState::Object { stage, .. }) => Some(*stage),
+                        _ => None,
+                    };
+                    if let Some(stage) = obj_stage {
+                        match stage {
+                            ObjStage::Start => {
+                                let it = self.obj_iter_value(top);
+                                let cid = object_class_id(&it).unwrap_or(0);
+                                if self.is_aggregate(cid) {
+                                    self.issue_iter_call(top, ip, b"getIterator", vec![], true, ObjStage::AfterAggregate)?;
+                                } else {
+                                    self.set_obj_stage(top, ObjStage::NeedRewind);
+                                    self.frames[top].ip = ip;
+                                }
+                                continue;
+                            }
+                            ObjStage::AfterAggregate => {
+                                let inner = self.take_obj_pending(top).deref_clone();
+                                let it_obj_cid = object_class_id(&inner);
+                                let new_state = match &inner {
+                                    Zval::Generator(gs) => IterState::Gen { rc: Rc::clone(gs), primed: false },
+                                    Zval::Object(_) if it_obj_cid.is_some_and(|c| self.is_traversable(c)) => {
+                                        IterState::Object { it: inner.clone(), stage: ObjStage::Start, pending: None, cur_val: None }
+                                    }
+                                    _ => {
+                                        let cls = String::from_utf8_lossy(&self.classes[object_class_id(&self.obj_iter_value(top)).unwrap_or(0)].name).into_owned();
+                                        return Err(PhpError::Error(format!(
+                                            "Objects returned by {cls}::getIterator() must be traversable or implement interface Iterator"
+                                        )));
+                                    }
+                                };
+                                *self.frames[top].iters.last_mut().expect("object iterator") = new_state;
+                                self.frames[top].ip = ip; // re-run with the resolved iterator
+                                continue;
+                            }
+                            ObjStage::NeedRewind => {
+                                self.issue_iter_call(top, ip, b"rewind", vec![], false, ObjStage::NeedValid)?;
+                                continue;
+                            }
+                            ObjStage::NeedValid => {
+                                self.issue_iter_call(top, ip, b"valid", vec![], true, ObjStage::AfterValid)?;
+                                continue;
+                            }
+                            ObjStage::AfterValid => {
+                                let v = self.take_obj_pending(top);
+                                let valid = convert::to_bool(&v, &mut self.diags);
+                                if valid {
+                                    self.set_obj_stage(top, ObjStage::NeedCurrent);
+                                    self.frames[top].ip = ip;
+                                } else {
+                                    self.frames[top].ip = *end as usize;
+                                }
+                                continue;
+                            }
+                            ObjStage::NeedCurrent => {
+                                self.issue_iter_call(top, ip, b"current", vec![], true, ObjStage::AfterCurrent)?;
+                                continue;
+                            }
+                            ObjStage::AfterCurrent => {
+                                let v = self.take_obj_pending(top);
+                                if let Some(IterState::Object { cur_val, stage, .. }) = self.frames[top].iters.last_mut() {
+                                    *cur_val = Some(v);
+                                    *stage = ObjStage::NeedKey;
+                                }
+                                self.frames[top].ip = ip;
+                                continue;
+                            }
+                            ObjStage::NeedKey => {
+                                self.issue_iter_call(top, ip, b"key", vec![], true, ObjStage::AfterKey)?;
+                                continue;
+                            }
+                            ObjStage::AfterKey => {
+                                let k = self.take_obj_pending(top);
+                                let v = match self.frames[top].iters.last_mut() {
+                                    Some(IterState::Object { cur_val, stage, .. }) => {
+                                        *stage = ObjStage::NeedNext;
+                                        cur_val.take().unwrap_or(Zval::Null)
+                                    }
+                                    _ => Zval::Null,
+                                };
+                                store_slot(&mut self.frames[top].slots[*value as usize], v.deref_clone());
+                                if let Some(ks) = key {
+                                    store_slot(&mut self.frames[top].slots[*ks as usize], k.deref_clone());
+                                }
+                                continue; // ip is already past IterNext: run the body
+                            }
+                            ObjStage::NeedNext => {
+                                self.issue_iter_call(top, ip, b"next", vec![], false, ObjStage::NeedValid)?;
+                                continue;
+                            }
+                        }
+                    }
+                    // Read the cursor and bump it in a scoped borrow, then touch
+                    // the slots — keeping the `iters` and `slots` borrows disjoint.
+                    let pair = {
+                        let it = self.frames[top].iters.last_mut().expect("IterNext without iterator");
+                        let IterState::ByVal { entries, pos } = it else {
+                            unreachable!("IterNext on a by-reference iterator");
+                        };
+                        if *pos >= entries.len() {
+                            None
+                        } else {
+                            let pair = entries[*pos].clone();
+                            *pos += 1;
+                            Some(pair)
+                        }
+                    };
+                    match pair {
+                        None => self.frames[top].ip = *end as usize,
+                        Some((k, v)) => {
+                            // Deref at bind time: a reference element snapshots its
+                            // cell and is read live here. `store_slot` writes
+                            // *through* a value slot that is itself a reference (the
+                            // lingering-ref gotcha), matching the tree-walker.
+                            store_slot(&mut self.frames[top].slots[*value as usize], v.deref_clone());
+                            if let Some(ks) = key {
+                                store_slot(&mut self.frames[top].slots[*ks as usize], k);
+                            }
+                        }
+                    }
+                }
+                Op::IterInitRef(source) => {
+                    // REF-3: snapshot the source's keys once; each step rebinds the
+                    // live element/property by reference. A plain object binds each
+                    // visible property by reference (ObjRefs); an array uses ByRef.
+                    let src = self.frames[top].slots[*source as usize].deref_clone();
+                    // A by-ref foreach over a lazy object initializes it first
+                    // (PHP 8.4); a proxy then iterates its real instance.
+                    let src = if deref_object(&src).is_some_and(|o| o.borrow().lazy.is_some()) {
+                        self.realize_full(&src)?
+                    } else {
+                        src
+                    };
+                    if let Zval::Object(o) = &src {
+                        if !self.is_traversable(o.borrow().class_id as usize) {
+                            let scope = self.frames[top].class;
+                            self.frames[top].iters.push(IterState::ObjRefs { obj: src.clone(), scope, yielded: Vec::new() });
+                            continue;
+                        }
+                    }
+                    let keys = ref_array_keys(&self.frames[top].slots[*source as usize]);
+                    self.frames[top].iters.push(IterState::ByRef { source: *source, keys, pos: 0 });
+                }
+                Op::IterNextRef { value, key, end } => {
+                    // A plain-object by-ref foreach: bind `$v` to the property's
+                    // storage cell — or, for a hooked property, to the cell its
+                    // `&get` hook returns (a by-value get hook is a fatal). The
+                    // entry list is recomputed live, like `IterState::ObjVals`.
+                    if matches!(self.frames[top].iters.last(), Some(IterState::ObjRefs { .. })) {
+                        let bound = loop {
+                            let (obj, entry) = {
+                                let Some(IterState::ObjRefs { obj, scope, yielded }) =
+                                    self.frames[top].iters.last()
+                                else {
+                                    unreachable!("ObjRefs iterator")
+                                };
+                                let Zval::Object(o) = obj else { break None };
+                                let next = self
+                                    .object_iter_entries(o, *scope)
+                                    .into_iter()
+                                    .find(|(d, _)| !yielded.iter().any(|y| y == d));
+                                let Some(next) = next else { break None };
+                                (obj.clone(), next)
+                            };
+                            let (display, entry) = entry;
+                            if let Some(IterState::ObjRefs { yielded, .. }) =
+                                self.frames[top].iters.last_mut()
+                            {
+                                yielded.push(display.clone());
+                            }
+                            match entry {
+                                PropIterEntry::Slot { key: k } => {
+                                    if let Some(o) = deref_object(&obj) {
+                                        if o.borrow().props.get(&k).is_some() {
+                                            let cell = prop_ref_cell(&o, &k);
+                                            // A typed property's cell keeps
+                                            // enforcing its type through `$v`.
+                                            let cid = o.borrow().class_id as usize;
+                                            if let Some((decl, hint)) = prop_type_decl(&self.classes, cid, &display) {
+                                                self.register_typed_ref(&cell, &o, decl, &display, hint);
+                                            }
+                                            break Some((cell, display));
+                                        }
+                                    }
+                                }
+                                PropIterEntry::Hook { name, view } => {
+                                    let by_ref = self
+                                        .prop_hook_in(view, &name)
+                                        .is_some_and(|f| f.by_ref);
+                                    if !by_ref {
+                                        // A by-value get hook has no addressable
+                                        // storage to alias (PHP 8.4 wording).
+                                        let decl = deref_object(&obj)
+                                            .and_then(|o| prop_info(&self.classes, o.borrow().class_id as usize, &name))
+                                            .map(|pi| pi.declaring_class)
+                                            .unwrap_or(view);
+                                        return Err(PhpError::Error(format!(
+                                            "Cannot create reference to property {}::${}",
+                                            String::from_utf8_lossy(&self.classes[decl].name),
+                                            String::from_utf8_lossy(&name),
+                                        )));
+                                    }
+                                    let v = self.run_iter_get_hook(&obj, &name, view, false)?;
+                                    let cell = match v {
+                                        Zval::Ref(rc) => rc,
+                                        other => php_types::zcell(other),
+                                    };
+                                    break Some((cell, display));
+                                }
+                            }
+                        };
+                        match bound {
+                            None => self.frames[top].ip = *end as usize,
+                            Some((cell, keyname)) => {
+                                if let Some(ks) = key {
+                                    store_slot(&mut self.frames[top].slots[*ks as usize], Zval::Str(PhpStr::new(keyname.to_vec())));
+                                }
+                                self.frames[top].slots[*value as usize] = Zval::Ref(cell);
+                            }
+                        }
+                        continue;
+                    }
+                    let next = {
+                        let it = self.frames[top].iters.last_mut().expect("IterNextRef without iterator");
+                        let IterState::ByRef { source, keys, pos } = it else {
+                            unreachable!("IterNextRef on a by-value iterator");
+                        };
+                        if *pos >= keys.len() {
+                            None
+                        } else {
+                            let k = keys[*pos].clone();
+                            let src = *source;
+                            *pos += 1;
+                            Some((src, k))
+                        }
+                    };
+                    match next {
+                        None => self.frames[top].ip = *end as usize,
+                        Some((src, k)) => {
+                            let cell = elem_cell(&mut self.frames[top].slots[src as usize], &k);
+                            if let Some(ks) = key {
+                                store_slot(&mut self.frames[top].slots[*ks as usize], key_to_zval(&k));
+                            }
+                            // Direct overwrite, *not* `store_slot`: on later
+                            // iterations the value slot is itself a `Zval::Ref` to
+                            // the previous element, and writing through it would
+                            // corrupt that element (D-R13).
+                            self.frames[top].slots[*value as usize] = Zval::Ref(cell);
+                        }
+                    }
+                }
+                Op::IterPop => {
+                    // The iterator (and the object it holds, e.g. `foreach (new A
+                    // as $v)`) is dropped here; note what it releases.
+                    if let Some(it) = self.frames[top].iters.pop() {
+                        self.gc_note_iter(&it);
+                    }
+                }
+                Op::DeclareFn { func } => {
+                    // A conditional `function` statement was reached: register it in
+                    // the runtime table so it is callable by name from here on.
+                    let m = self.frames[top].module;
+                    let idx = *func as usize;
+                    let name = m.functions[idx].name.clone();
+                    if self.is_name_callable(&name) {
+                        return Err(PhpError::Error(format!(
+                            "Cannot redeclare function {}()",
+                            String::from_utf8_lossy(&name)
+                        )));
+                    }
+                    self.linked_functions.insert(name.to_ascii_lowercase(), (m, idx));
+                }
+                Op::DeclareTrait { idx } => {
+                    // A conditional trait declaration executed: register the
+                    // lowered trait into the seed image so later units can
+                    // `use` it (only the branch that RAN registers its variant).
+                    // E-73.H1: Redeclaration of the same trait FQN in different
+                    // branches is a Fatal, matching Zend (Cannot redeclare trait T).
+                    let module = self.frames[top].module;
+                    if let Some((key, lt)) = module.conditional_traits.get(*idx as usize) {
+                        if self.seed_traits.iter().any(|(k, _)| k == key) {
+                            // Trait already declared (first-wins redecl) — FATAL
+                            let file: Box<[u8]> = Box::from(self.frame_file(top));
+                            let line = self.cur_line(top);
+                            return Err(PhpError::FatalAt {
+                                msg: format!("Cannot redeclare trait {}",
+                                    String::from_utf8_lossy(key)),
+                                file,
+                                line,
+                                trace: String::from_utf8_lossy(&self.capture_trace().1).into_owned(),
+                            });
+                        }
+                        self.seed_traits.push((key.clone(), lt.clone()));
+                    }
+                }
+                Op::DeclareClass { class } => {
+                    // A conditional class/interface/enum statement was reached:
+                    // register its name in the runtime class index so it resolves by
+                    // name (and `class_exists` reports it) from here on. The op's id
+                    // was already relocated to the global table, so it indexes
+                    // `self.classes` directly. A name already in use is the PHP fatal.
+                    let cid = class;
+                    let cc = self.classes[*cid];
+                    let key = cc.name.to_ascii_lowercase();
+                    if let Some(&old) = self.class_index.get(&key) {
+                        // Zend's non-throwable E_COMPILE_ERROR
+                        // (zend_class_redeclaration_error), located at the
+                        // executing DECLARE (the op's own id may have been
+                        // remapped onto the registered class, so `cc`'s
+                        // file/line can be the OLD site — the faulting frame
+                        // position is the faithful one).
+                        let top = self.frames.len() - 1;
+                        let file: Box<[u8]> = Box::from(self.frame_file(top));
+                        let line = self.cur_line(top);
+                        return Err(self.class_redeclaration_fatal(old, file, line));
+                    }
+                    self.class_index.insert(key, *cid);
+                    self.serializable_link_check(*cid)?;
+                }
+                Op::DeclareDeferred { idx } => {
+                    // A late-bound declaration statement was reached (its
+                    // supertype was unresolvable when the unit was lowered):
+                    // bind it now — re-lower the snippet against the current
+                    // class image, or throw PHP's `… "X" not found` Error.
+                    self.run_deferred(*idx as usize, false)?;
+                }
+                Op::NewAnonDeferred { idx } => {
+                    // Late-bound anonymous class: bind and instantiate at the
+                    // expression's execution point, constructor arguments
+                    // re-evaluated in this frame's bridged scope.
+                    let v = self.run_deferred(*idx as usize, true)?;
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(v);
+                }
+                Op::Call { func, argc } => {
+                    let m = self.frames[top].module;
+                    let callee = &m.functions[*func as usize];
+                    // Pop argc args (pushed left-to-right) and bind them to the
+                    // callee's leading slots. The caller's `ip` is already past
+                    // the Call, so it resumes correctly once the callee returns.
+                    let n = *argc as usize;
+                    if callee.simple_call && n == callee.n_params as usize {
+                        // S-105 leva H-D (forma 2): simple-call ad arità esatta
+                        // — gli argomenti passano DIRETTAMENTE dalla pila del
+                        // chiamante ai primi slot del callee, in ordine inverso
+                        // di pop: nessun contenitore, nessuna alloc (canale
+                        // 1 alloc × 32 B/chiamata inchiodato da hd-free-hist).
+                        // Semantica = braccio fast di bind_params. Ordine
+                        // (0..n).rev() vs push-order di bind_params: equivalente
+                        // perché nessun operando è last-ref al decay — PROVATO
+                        // per nome in S-185 (az.B rev., s185-criterio-mc2.md
+                        // p.8; supera il declassamento S-106-D-9/KS-MA-107-1):
+                        // `decay_arg` clona il referente PRIMA del drop del
+                        // wrapper Ref (count ≥ 2), muore solo la cella RefCell.
+                        #[cfg(feature = "mem-census")]
+                        php_types::memcensus::arity_note(n);
+                        // L-CR1 (S-181, wp181-harness/s181-criterio-cr1.md):
+                        // (a) il frame nasce DENTRO `frames` (push dei buffer
+                        // del pool) e gli argomenti passano per split_at_mut —
+                        // nessun Frame per valore attraverso `enter_callee`,
+                        // il cui ramo simple_call è solo trace + push
+                        // (replicato qui al byte; `decay_arg` non esegue
+                        // codice utente ⇒ l'ordine push/pop non è osservabile);
+                        // (b) arità ESATTA per costruzione (argc == n_params ≥
+                        // required) ⇒ il `CheckArity` in testa al corpo non
+                        // può fallire: si entra a ip=1.
+                        if log::log_enabled!(target: "phpr::call", log::Level::Trace) {
+                            log::trace!(
+                                target: "phpr::call",
+                                "enter {}() (depth {})",
+                                String::from_utf8_lossy(&callee.name),
+                                self.frames.len() + 1
+                            );
+                        }
+                        let (slots, stack) = self.frame_pool.take();
+                        self.frames.push(super::Frame::with_buffers(callee, m, slots, stack));
+                        let (caller, entered) = self.frames.split_at_mut(top + 1);
+                        let cf = &mut entered[0];
+                        cf.argc = n as u32;
+                        for i in (0..n).rev() {
+                            let a = caller[top].stack.pop().expect("call argument");
+                            cf.slots[i] = decay_arg(a);
+                        }
+                        if matches!(callee.ops.first(), Some(Op::CheckArity { .. })) {
+                            cf.ip = 1;
+                        }
+                    } else {
+                        let mut args = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            args.push(self.frames[top].stack.pop().expect("call argument"));
+                        }
+                        args.reverse();
+                        let mut frame = self.pooled_frame(callee, m);
+                        bind_params(&mut frame, args);
+                        self.enter_callee(frame)?;
+                    }
+                }
+                Op::CallArgs { func } => {
+                    // Spread call `f(...$arr)` (PAR): integer keys bind positionally
+                    // (variadic/defaults compose via the binder), string keys as
+                    // named arguments (PHP 8.1).
+                    let argsval = self.frames[top].stack.pop().expect("CallArgs array");
+                    let (args, named) = split_args_from_array_value(argsval);
+                    let m = self.frames[top].module;
+                    let callee = &m.functions[*func as usize];
+                    let frame = if named.is_empty() {
+                        let mut frame = self.pooled_frame(callee, m);
+                        bind_params(&mut frame, args);
+                        frame
+                    } else {
+                        let qn = String::from_utf8_lossy(&callee.name).into_owned();
+                        build_named_frame(callee, m, &qn, args, named)?
+                    };
+                    self.enter_callee(frame)?;
+                }
+                Op::CallNamed { func, positional, names } => {
+                    // Named function call bound at run time (unknown/overwrite/
+                    // variadic/by-ref): pop named values (source order), then the
+                    // positional values, and bind via `build_named_frame`.
+                    let named_vals = self.pop_keys(top, names.len() as u32);
+                    let named: Vec<(Box<[u8]>, Zval)> =
+                        names.iter().cloned().zip(named_vals).collect();
+                    let pos = self.pop_keys(top, *positional);
+                    let m = self.frames[top].module;
+                    let callee = &m.functions[*func as usize];
+                    let qn = String::from_utf8_lossy(&callee.name).into_owned();
+                    let frame = build_named_frame(callee, m, &qn, pos, named)?;
+                    self.enter_callee(frame)?;
+                }
+                Op::CallSpread { func, spreads, names } => {
+                    // Pop explicit named values (source order), then one value per
+                    // leading component (a positional value or a spread source).
+                    let named_vals = self.pop_keys(top, names.len() as u32);
+                    let comp_vals = self.pop_keys(top, spreads.len() as u32);
+                    let mut positional: Vec<Zval> = Vec::new();
+                    let mut named: Vec<(Box<[u8]>, Zval)> = Vec::new();
+                    let mut seen_named = false;
+                    for (&is_spread, val) in spreads.iter().zip(comp_vals) {
+                        if is_spread {
+                            // Integer keys are positional, string keys named; a
+                            // positional after a named (within the unpacking) is an
+                            // error, a non-iterable a TypeError.
+                            for (k, v) in self.spread_pairs(val)? {
+                                match k {
+                                    Key::Int(_) => {
+                                        if seen_named {
+                                            return Err(PhpError::Error("Cannot use positional argument after named argument during unpacking".to_string()));
+                                        }
+                                        positional.push(v);
+                                    }
+                                    Key::Str(s) => {
+                                        named.push((s.as_bytes().to_vec().into_boxed_slice(), v));
+                                        seen_named = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            if seen_named {
+                                return Err(PhpError::Error("Cannot use positional argument after named argument".to_string()));
+                            }
+                            positional.push(val);
+                        }
+                    }
+                    // Explicit named args always come last, so no positional can
+                    // follow — no need to track `seen_named` past here.
+                    for (label, v) in names.iter().cloned().zip(named_vals) {
+                        named.push((label, v));
+                    }
+                    let m = self.frames[top].module;
+                    let callee = &m.functions[*func as usize];
+                    let qn = String::from_utf8_lossy(&callee.name).into_owned();
+                    let frame = build_named_frame(callee, m, &qn, positional, named)?;
+                    self.enter_callee(frame)?;
+                }
+                Op::CallBuiltin { name, argc } => {
+                    // S-148 (census): estensione dinamica del builtin nel
+                    // tag `hostcall` della partizione galloc.
+                    #[cfg(feature = "mem-census")]
+                    let _s148 = php_types::memcensus::s148_scope(
+                        php_types::memcensus::S148_HOSTCALL,
+                    );
+                    // S-149 tranche-4 (census): partizione di hostcall.n per
+                    // NOME (stesso perimetro del tag, criterio p.1).
+                    #[cfg(feature = "mem-census")]
+                    let _s149 = php_types::memcensus::s149_name_scope(&name[..]);
+                    let f = match self.registry.get(&name[..]) {
+                        Some(Builtin::Value(f)) => *f,
+                        // The compiler only emits CallBuiltin for value builtins.
+                        _ => return Err(undefined_builtin(&name)),
+                    };
+                    // L-HD2 forma-2 (S-125): per arità <=4 gli argomenti passano
+                    // per POP DIRETTI in un array esatto sullo stack nativo —
+                    // niente split_off (coppia malloc+free per chiamata, canale
+                    // H-D), niente slot di riempimento, niente iteratore; il
+                    // contratto di visibilità è quello storico (gli argomenti
+                    // vivono fuori dal frame durante la chiamata). Oltre 4
+                    // resta il Vec. Corpo (rami freddi inclusi) in
+                    // `value_builtin_call`, fuori dal dispatcher.
+                    let result = match *argc {
+                        0 => self.value_builtin_call(top, f, name, &mut [])?,
+                        1 => {
+                            let a0 = self.frames[top].stack.pop().expect("builtin args");
+                            self.value_builtin_call(top, f, name, &mut [a0])?
+                        }
+                        2 => {
+                            let a1 = self.frames[top].stack.pop().expect("builtin args");
+                            let a0 = self.frames[top].stack.pop().expect("builtin args");
+                            self.value_builtin_call(top, f, name, &mut [a0, a1])?
+                        }
+                        3 => {
+                            let a2 = self.frames[top].stack.pop().expect("builtin args");
+                            let a1 = self.frames[top].stack.pop().expect("builtin args");
+                            let a0 = self.frames[top].stack.pop().expect("builtin args");
+                            self.value_builtin_call(top, f, name, &mut [a0, a1, a2])?
+                        }
+                        4 => {
+                            let a3 = self.frames[top].stack.pop().expect("builtin args");
+                            let a2 = self.frames[top].stack.pop().expect("builtin args");
+                            let a1 = self.frames[top].stack.pop().expect("builtin args");
+                            let a0 = self.frames[top].stack.pop().expect("builtin args");
+                            self.value_builtin_call(top, f, name, &mut [a0, a1, a2, a3])?
+                        }
+                        _ => {
+                            let mut args = self.pop_keys(top, *argc);
+                            self.value_builtin_call(top, f, name, &mut args)?
+                        }
+                    };
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallBuiltinSpread { name, spreads } => {
+                    // A registry builtin runs via its Value fn; a VM host
+                    // builtin (`json_encode(...$args)`, Elastica's stringify)
+                    // takes the flattened args through dispatch_host_builtin.
+                    let f = match self.registry.get(&name[..]) {
+                        Some(Builtin::Value(f)) => Some(*f),
+                        _ if host_builtin_canonical(&name).is_some() => None,
+                        _ => return Err(undefined_builtin(&name)),
+                    };
+                    let comp_vals = self.pop_keys(top, spreads.len() as u32);
+                    // Flatten components to positional values; int-keyed unpacks are
+                    // positional, string-keyed are named (rejected for a builtin).
+                    let mut args: Vec<Zval> = Vec::new();
+                    let mut seen_named = false;
+                    for (&is_spread, val) in spreads.iter().zip(comp_vals) {
+                        if is_spread {
+                            for (k, v) in self.spread_pairs(val)? {
+                                match k {
+                                    Key::Int(_) => {
+                                        if seen_named {
+                                            return Err(PhpError::Error("Cannot use positional argument after named argument during unpacking".to_string()));
+                                        }
+                                        args.push(v);
+                                    }
+                                    Key::Str(_) => seen_named = true,
+                                }
+                            }
+                        } else {
+                            if seen_named {
+                                return Err(PhpError::Error("Cannot use positional argument after named argument".to_string()));
+                            }
+                            args.push(val);
+                        }
+                    }
+                    if seen_named {
+                        return Err(PhpError::Error(format!(
+                            "{}() does not accept unknown named parameters",
+                            String::from_utf8_lossy(&name)
+                        )));
+                    }
+                    let result = match f {
+                        Some(f) => {
+                            let line = self.cur_line(top);
+                            self.run_value_builtin(f, &args, line)?
+                        }
+                        None => self.dispatch_host_builtin(&name, args)?,
+                    };
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallHostBuiltin { name, argc } => {
+                    // S-148 (census): estensione dinamica del builtin nel
+                    // tag `hostcall` della partizione galloc.
+                    #[cfg(feature = "mem-census")]
+                    let _s148 = php_types::memcensus::s148_scope(
+                        php_types::memcensus::S148_HOSTCALL,
+                    );
+                    // S-149 tranche-4 (census): partizione di hostcall.n per
+                    // NOME (stesso perimetro del tag, criterio p.1).
+                    #[cfg(feature = "mem-census")]
+                    let _s149 = php_types::memcensus::s149_name_scope(&name[..]);
+                    // An evaluator-only host builtin (Session B): it may invoke a
+                    // user callable via `call_callable` (a nested `run_loop`).
+                    // HD2-hostcall (S-156): per arità ≤4 gli argomenti passano
+                    // per POP DIRETTI in un array nativo (ordine sorgente ==
+                    // split_off di pop_keys) e i nomi convertiti dispacciano
+                    // sulla slice — niente args-Vec (canale H-D, 1 alloc ×
+                    // 16-64 B/chiamata). Un nome NON convertito ricostruisce il
+                    // Vec dagli stessi valori (1 alloc, identico a prima, più
+                    // DUE match persi: qui e delega). Il contratto di visibilità
+                    // è quello storico di pop_keys: gli argomenti vivono fuori
+                    // dal frame durante la chiamata (anche nei run_loop
+                    // annidati del builtin).
+                    // Flush this builtin's own diagnostics at its call line, like
+                    // `run_value_builtin` does for registry builtins — otherwise a
+                    // warning it pushes (e.g. header()'s "headers already sent")
+                    // renders at a later, wrong line.
+                    let line = self.cur_line(top);
+                    let result = if *argc <= 4 {
+                        let n = *argc as usize;
+                        let mut buf = [Zval::Null, Zval::Null, Zval::Null, Zval::Null];
+                        for slot in buf[..n].iter_mut().rev() {
+                            *slot = self.frames[top].stack.pop().expect("host builtin args");
+                        }
+                        self.flush_diags(line)?;
+                        match self.dispatch_host_builtin_slice(&name, &mut buf[..n]) {
+                            Some(result) => result?,
+                            None => {
+                                let mut args = Vec::with_capacity(n);
+                                for slot in &mut buf[..n] {
+                                    args.push(std::mem::replace(slot, Zval::Null));
+                                }
+                                self.dispatch_host_builtin(&name, args)?
+                            }
+                        }
+                    } else {
+                        let args = self.pop_keys(top, *argc);
+                        self.flush_diags(line)?;
+                        self.dispatch_host_builtin(&name, args)?
+                    };
+                    self.flush_diags(line)?;
+                    // `pcntl_async_signals(true)`: host-builtin returns are the
+                    // async delivery points (a self-directed `posix_kill` is
+                    // observed here, before the next PHP statement).
+                    if self.async_signals
+                        && PENDING_SIGNALS.load(std::sync::atomic::Ordering::Relaxed) != 0
+                    {
+                        self.dispatch_pending_signals()?;
+                    }
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallHostBuiltinRef { name, slot, argc } => {
+                    // A by-reference-first host builtin (`usort`, Session C): its
+                    // array argument lives in `slot` of the caller frame and is
+                    // written back in place; the callback may run a nested `run_loop`.
+                    let rest = self.pop_keys(top, *argc);
+                    let result = self.dispatch_host_builtin_ref(&name, *slot, rest)?;
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallHostBuiltinOut { name, out_slot, out_index, out_slot2, out_index2, argc } => {
+                    // A host builtin with a by-reference output parameter
+                    // (`preg_match`/`preg_match_all`'s `&$matches`): dispatch with all
+                    // args by value, then write the produced out-value into `out_slot`.
+                    // `exec` additionally writes `&$result_code` into `out_slot2`.
+                    let _ = out_index2;
+                    let mut args = self.pop_keys(top, *argc);
+                    // `exec` *appends* to a pre-existing `&$output` array, so it
+                    // needs that argument's current value (the compiler pushed a
+                    // placeholder `null` there). Read it straight from the slot —
+                    // no VarRead op, so an undefined variable warns nothing. Other
+                    // out-param builtins ignore this argument.
+                    if name[..] == *b"exec" {
+                        if let Some(slot) = out_slot {
+                            if let Some(a) = args.get_mut(*out_index as usize) {
+                                *a = self.frames[top].slots[*slot as usize].deref_clone();
+                            }
+                        }
+                    }
+                    // Flush any diagnostic this builtin pushes at its call line
+                    // (like `CallHostBuiltin` does) so e.g. stream_socket_client's
+                    // connect Warning renders at the call, not the next statement.
+                    let line = self.cur_line(top);
+                    self.flush_diags(line)?;
+                    let (result, out_val, out_val2) =
+                        self.dispatch_host_builtin_out(&name, args, *out_index as usize)?;
+                    self.flush_diags(line)?;
+                    let top = self.frames.len() - 1;
+                    if let Some(slot) = out_slot {
+                        match &mut self.frames[top].slots[*slot as usize] {
+                            Zval::Ref(rc) => *rc.borrow_mut() = out_val,
+                            cell => *cell = out_val,
+                        }
+                    }
+                    if let (Some(slot), Some(v2)) = (out_slot2, out_val2) {
+                        match &mut self.frames[top].slots[*slot as usize] {
+                            Zval::Ref(rc) => *rc.borrow_mut() = v2,
+                            cell => *cell = v2,
+                        }
+                    }
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallHostBuiltinScanf { name, argc, out_slots } => {
+                    // `sscanf`/`fscanf` with variadic by-reference out-params: dispatch
+                    // the two fixed value args, then assign each conversion into its
+                    // slot. With no out slots the parsed array is returned instead.
+                    let args = self.pop_keys(top, *argc);
+                    let scanned = self.dispatch_host_builtin_scanf(&name, args)?;
+                    let top = self.frames.len() - 1;
+                    let result = match scanned {
+                        // `fscanf` at EOF: `false`, no assignments.
+                        None => Zval::Bool(false),
+                        Some(results) if out_slots.is_empty() => {
+                            let mut arr = PhpArray::new();
+                            for v in results {
+                                let _ = arr.append(v.unwrap_or(Zval::Null));
+                            }
+                            Zval::Array(Rc::new(arr))
+                        }
+                        Some(results) => {
+                            // Iterate over results (matching `eval::scanf_finish`): out
+                            // vars beyond the result count are left unchanged.
+                            let mut count = 0i64;
+                            for (i, slot) in results.iter().enumerate() {
+                                let Some(out) = out_slots.get(i) else { break };
+                                let val = match slot {
+                                    Some(v) => {
+                                        count += 1;
+                                        v.clone()
+                                    }
+                                    None => Zval::Null,
+                                };
+                                if let Some(s) = out {
+                                    match &mut self.frames[top].slots[*s as usize] {
+                                        Zval::Ref(rc) => *rc.borrow_mut() = val,
+                                        cell => *cell = val,
+                                    }
+                                }
+                            }
+                            Zval::Long(count)
+                        }
+                    };
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallArrayMultisort { arg_slots, argc } => {
+                    // All arguments by value; the sorted arrays are written back
+                    // into their captured variable slots.
+                    let args = self.pop_keys(top, *argc);
+                    let line = self.cur_line(top);
+                    self.flush_diags(line)?;
+                    let (result, sorted) = self.ho_array_multisort(args)?;
+                    let top = self.frames.len() - 1;
+                    for (i, arr) in sorted.into_iter().enumerate() {
+                        if let (Some(slot), Some(arr)) =
+                            (arg_slots.get(i).copied().flatten(), arr)
+                        {
+                            match &mut self.frames[top].slots[slot as usize] {
+                                Zval::Ref(rc) => *rc.borrow_mut() = arr,
+                                cell => *cell = arr,
+                            }
+                        }
+                    }
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallBuiltinRef { name, slot, argc } => {
+                    let f = match self.registry.get(&name[..]) {
+                        Some(Builtin::RefFirst(f)) => *f,
+                        _ => return Err(undefined_builtin(&name)),
+                    };
+                    let rest = self.pop_keys(top, *argc);
+                    // Mirror `eval`'s ref-builtin rendering (E1): flush, run, append
+                    // the builtin's output, then flush its own warnings.
+                    // A by-value object argument reads through an initialized
+                    // proxy (an uninitialized wrapper keeps its raw view —
+                    // array_splice's internal to-array, convert_to_array).
+                    let rest: Vec<Zval> = rest
+                        .into_iter()
+                        .map(|a| if self.is_lazy_value(&a) { self.proxy_view(a) } else { a })
+                        .collect();
+                    let line = self.cur_line(top);
+                    self.flush_diags(line)?;
+                    // Precompute __toString for a natural-sort's Stringable
+                    // elements so the pure comparator can order them (empty for
+                    // every other ref builtin).
+                    let stringify = if ref_builtin_string_coerces(&name) {
+                        let roots = ref_stringify_roots(&self.frames[top].slots[*slot as usize].clone());
+                        self.compute_stringify(&roots, false)?
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                    let mut produced = Vec::new();
+                    let result = builtin_ref_call(f, &mut self.frames[top].slots[*slot as usize], &rest, &mut produced, &mut self.diags, &stringify);
+                    self.write_output(&produced)?;
+                    self.flush_diags(line)?;
+                    let result = result?;
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallBuiltinRefSpread { name, slot, spreads } => {
+                    // By-ref-first builtin whose by-value rest includes a spread
+                    // (`array_push($a, ...$b)`): flatten the components (int-keyed
+                    // pairs are positional; a string key is PHP's unknown-named
+                    // error, as builtins accept none), then run like CallBuiltinRef.
+                    let f = match self.registry.get(&name[..]) {
+                        Some(Builtin::RefFirst(f)) => *f,
+                        _ => return Err(undefined_builtin(&name)),
+                    };
+                    let comp_vals = self.pop_keys(top, spreads.len() as u32);
+                    let mut rest: Vec<Zval> = Vec::new();
+                    for (&is_spread, val) in spreads.iter().zip(comp_vals) {
+                        if is_spread {
+                            for (k, v) in self.spread_pairs(val)? {
+                                match k {
+                                    Key::Int(_) => rest.push(v),
+                                    Key::Str(_) => {
+                                        return Err(PhpError::Error(format!(
+                                            "{}() does not accept unknown named parameters",
+                                            String::from_utf8_lossy(&name)
+                                        )))
+                                    }
+                                }
+                            }
+                        } else {
+                            rest.push(val);
+                        }
+                    }
+                    // A by-value object argument reads through an initialized
+                    // proxy (an uninitialized wrapper keeps its raw view —
+                    // array_splice's internal to-array, convert_to_array).
+                    let rest: Vec<Zval> = rest
+                        .into_iter()
+                        .map(|a| if self.is_lazy_value(&a) { self.proxy_view(a) } else { a })
+                        .collect();
+                    let line = self.cur_line(top);
+                    self.flush_diags(line)?;
+                    let stringify = if ref_builtin_string_coerces(&name) {
+                        let roots = ref_stringify_roots(&self.frames[top].slots[*slot as usize].clone());
+                        self.compute_stringify(&roots, false)?
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                    let mut produced = Vec::new();
+                    let result = builtin_ref_call(f, &mut self.frames[top].slots[*slot as usize], &rest, &mut produced, &mut self.diags, &stringify);
+                    self.write_output(&produced)?;
+                    self.flush_diags(line)?;
+                    let result = result?;
+                    self.frames[top].stack.push(result);
+                }
+                Op::CallBuiltinRefCell { name, argc } => {
+                    // By-ref-first builtin on a non-variable place (`array_pop($o->q)`):
+                    // the target is a `Zval::Ref` cell (from `MakeRef`) beneath the
+                    // by-value rest args; mutate it in place, writing through to the
+                    // property / array element.
+                    let f = match self.registry.get(&name[..]) {
+                        Some(Builtin::RefFirst(f)) => *f,
+                        _ => return Err(undefined_builtin(&name)),
+                    };
+                    let rest = self.pop_keys(top, *argc);
+                    let cell = match self.frames[top].stack.pop().expect("CallBuiltinRefCell ref") {
+                        Zval::Ref(rc) => rc,
+                        other => php_types::zcell(other),
+                    };
+                    let line = self.cur_line(top);
+                    self.flush_diags(line)?;
+                    let stringify = if ref_builtin_string_coerces(&name) {
+                        let roots = ref_stringify_roots(&cell.borrow().clone());
+                        self.compute_stringify(&roots, false)?
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                    let mut produced = Vec::new();
+                    let result = {
+                        let mut leaf = cell.borrow_mut();
+                        builtin_ref_call(f, &mut leaf, &rest, &mut produced, &mut self.diags, &stringify)
+                    };
+                    self.write_output(&produced)?;
+                    self.flush_diags(line)?;
+                    let result = result?;
+                    self.frames[top].stack.push(result);
+                }
+                Op::Ret => {
+                    // L-RT2 (S-184, wp184-harness/s184-criterio-rt2.md): Ret FUSO della
+                    // funzione semplice. Forma 0 (`ret_shape == 0`: niente hint, non
+                    // by-ref), nessun flag (niente RET_*, INIT_PROPS, CLONE_INIT,
+                    // IN_DESTRUCTOR), nessuna `ret_cell`, più l'ammissione strutturale
+                    // di L-RT1 (this/iters/ext/dyn_vars assenti) e un chiamante sotto.
+                    // È la composizione dei rami che il cammino generale (sotto)
+                    // prenderebbe con questi stessi valori: ogni test qui è la
+                    // condizione che là rende il ramo saltato un no-op; il rilascio
+                    // (take, note GC, clear, truncate, put) è quello di L-RT1 nello
+                    // stesso ordine. Ogni altro frame passa dal cammino di prima.
+                    // L-MR1 (S-185, wp185-harness/s185-criterio-mc2.md): anche il
+                    // frame CON `$this` (metodo semplice, closure legata) è ammesso —
+                    // il cammino generale, con questi stessi valori, nota `$this`
+                    // dopo slots e stack (`gc_note_frame`) e lo rilascia con il
+                    // Frame (`drop(frame)` dopo gli svuotamenti): qui la nota è
+                    // `gc_note_this` (stesso braccio, stesso ordine) e il rilascio
+                    // è il `truncate`.
+                    let fused = {
+                        let f = &self.frames[top];
+                        f.func.ret_shape == 0
+                            && f.flags.bits() == 0
+                            && f.ret_cell.is_none()
+                            && f.iters.is_empty()
+                            && f.ext.is_none()
+                            && f.dyn_vars.is_none()
+                            && top > 0
+                    };
+                    if fused {
+                        let f = &mut self.frames[top];
+                        let ret = f.stack.pop().unwrap_or(Zval::Null);
+                        let mut slots = std::mem::take(&mut f.slots);
+                        let mut stack = std::mem::take(&mut f.stack);
+                        for v in &slots {
+                            self.gc_note(v);
+                        }
+                        for v in &stack {
+                            self.gc_note(v);
+                        }
+                        if self.frames[top].this.is_some() {
+                            self.gc_note_this(top);
+                        }
+                        slots.clear();
+                        stack.clear();
+                        self.frames.truncate(top);
+                        self.frame_pool.put(slots, stack);
+                        // §3.35: dying locals destruct at `leave` (mod.rs `gc_sweep_after_ret`).
+                        self.gc_sweep_after_ret(top - 1)?;
+                        if self.frames.len() == baseline {
+                            return Ok(RunExit::Returned(ret));
+                        }
+                        self.frames[top - 1].stack.push(ret);
+                        continue;
+                    }
+                    // Ogni altro Ret (forma ≠ 0, flag, ret_cell, $this, foreach, ext,
+                    // $$, main) passa dal cammino generale, FUORI LINEA (`ret_slow`,
+                    // L-RT2 forma 2: il corpo del handler non resta duplicato dentro
+                    // `run_loop`; il disasm di forma 1 contava +547 istr / +245 sp_refs).
+                    if let Some(exit) = self.ret_slow(top, baseline)? {
+                        return Ok(exit);
+                    }
+                }
+                Op::Yield { has_key } => {
+                    // Suspend the running generator frame (GEN). Pop the yielded
+                    // value (and key), park the frame back under its handle id, and
+                    // hand the key/value to `resume_generator`. `ip` is already
+                    // past this op, so the resume continues after the `yield`.
+                    let value = self.frames[top].stack.pop().expect("Yield value");
+                    let key = if *has_key {
+                        GenKey::Keyed(self.frames[top].stack.pop().expect("Yield key"))
+                    } else {
+                        GenKey::Auto
+                    };
+                    let gid = self.frames[top].gen_id().expect("Yield outside a generator frame");
+                    debug_assert_eq!(top, baseline, "a generator yields at its own baseline");
+                    let frame = self.frames.pop().expect("generator frame to park");
+                    self.generators.insert(gid, frame);
+                    return Ok(RunExit::Yielded { key, value });
+                }
+                Op::YieldFrom => {
+                    // `yield from` (GEN-3): re-enters itself across resumes, driving
+                    // one delegated step per visit. First visit sets up the cursor
+                    // from the delegate on the stack; a re-visit pops the resume's
+                    // sent value (forwarded into a sub-generator, ignored by arrays).
+                    if self.frames[top].ext().is_none_or(|e| e.yield_from.is_none()) {
+                        let delegate = self.frames[top].stack.pop().expect("YieldFrom delegate");
+                        match delegate.deref_clone() {
+                            Zval::Array(_) => {
+                                let entries = snapshot_entries(&delegate);
+                                self.frames[top].ext_mut().yield_from =
+                                    Some(YieldFromState::Array { entries, pos: 0 });
+                            }
+                            Zval::Generator(rc) => {
+                                self.frames[top].ext_mut().yield_from =
+                                    Some(YieldFromState::Gen { rc: Rc::clone(&rc), opaque: false });
+                                self.ensure_started(&rc)?; // prime to its first yield
+                            }
+                            Zval::Object(_) if self.object_is_traversable(&delegate) => {
+                                // A Traversable delegate (Symfony Finder pipes
+                                // FilterIterators through `yield from`): resolve
+                                // IteratorAggregate to its Iterator, then drain
+                                // the protocol synchronously into entries.
+                                // Divergence: PHP interleaves the delegate's
+                                // steps with the consumer; phpr snapshots — the
+                                // outcome matches for finite side-effect-free
+                                // iterators (an infinite Iterator would hang
+                                // here instead of streaming).
+                                match self.traversable_entries(delegate.clone())? {
+                                    TraversableSource::Gen(rc) => {
+                                        self.frames[top].ext_mut().yield_from =
+                                            Some(YieldFromState::Gen { rc: Rc::clone(&rc), opaque: true });
+                                        self.ensure_started(&rc)?;
+                                    }
+                                    TraversableSource::Entries(entries) => {
+                                        self.frames[top].ext_mut().yield_from =
+                                            Some(YieldFromState::Array { entries, pos: 0 });
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(PhpError::Error(format!(
+                                    "Can use \"yield from\" only with arrays and Traversables, {} given",
+                                    other.type_name_for_error()
+                                )))
+                            }
+                        }
+                    } else {
+                        // Re-entry from a resume: the sent value is on the stack.
+                        let sent = self.frames[top].stack.pop().expect("YieldFrom sent");
+                        let sub = match self.frames[top].ext().and_then(|e| e.yield_from.as_ref()) {
+                            Some(YieldFromState::Gen { rc, .. }) => Some(Rc::clone(rc)),
+                            _ => None,
+                        };
+                        if let Some(rc) = sub {
+                            self.resume_generator(&rc, sent)?;
+                        }
+                    }
+                    // Take the next delegated `(key, value)`, or finish.
+                    let step = match self.frames[top].ext_mut().yield_from.as_mut().unwrap() {
+                        YieldFromState::Array { entries, pos } => {
+                            if *pos < entries.len() {
+                                let pair = entries[*pos].clone();
+                                *pos += 1;
+                                Some(pair)
+                            } else {
+                                None
+                            }
+                        }
+                        YieldFromState::Gen { rc, .. } => {
+                            let g = rc.borrow();
+                            if matches!(g.status, GenStatus::Done) {
+                                None
+                            } else {
+                                Some((g.cur_key.clone(), g.cur_val.clone()))
+                            }
+                        }
+                    };
+                    match step {
+                        Some((k, v)) => {
+                            // Re-enter this op on the next resume; park and re-yield
+                            // verbatim (the outer auto-key counter is untouched).
+                            self.frames[top].ip -= 1;
+                            let gid =
+                                self.frames[top].gen_id().expect("YieldFrom outside a generator");
+                            let frame = self.frames.pop().expect("generator frame to park");
+                            self.generators.insert(gid, frame);
+                            return Ok(RunExit::Yielded { key: GenKey::Verbatim(k), value: v });
+                        }
+                        None => {
+                            // Delegation done: leave the delegate's return value (NULL
+                            // for an array, the sub-generator's getReturn()) on the
+                            // stack as the `yield from` expression's value.
+                            let value = match self.frames[top].ext_mut().yield_from.take().unwrap() {
+                                YieldFromState::Array { .. } => Zval::Null,
+                                // An aggregate-wrapped generator's return stays
+                                // opaque (PHP: only a DIRECT generator delegate
+                                // propagates getReturn()).
+                                YieldFromState::Gen { opaque: true, .. } => Zval::Null,
+                                YieldFromState::Gen { rc, .. } => rc.borrow().ret.clone(),
+                            };
+                            self.frames[top].stack.push(value);
+                        }
+                    }
+                }
+                Op::Alloc { class } => {
+                    let class = self.rb(*class);
+                    self.check_new_ctor_access(self.frames[top].class, class)?;
+                    let obj = self.alloc_object(class)?;
+                    self.frames[top].stack.push(obj);
+                }
+                Op::AllocStatic => {
+                    let cid = self.frames[top].static_class.ok_or_else(|| {
+                        PhpError::Error("Cannot use \"static\" in the global scope".to_string())
+                    })?;
+                    self.check_new_ctor_access(self.frames[top].class, cid)?;
+                    let obj = self.alloc_object(cid)?;
+                    self.frames[top].stack.push(obj);
+                }
+                Op::AllocDynamic => {
+                    // `new $cls` (PAR): resolve the class reference at run time.
+                    let classval = self.frames[top].stack.pop().expect("AllocDynamic class");
+                    let cid = self.resolve_dynamic_class(&classval)?;
+                    self.check_new_ctor_access(self.frames[top].class, cid)?;
+                    let obj = self.alloc_object(cid)?;
+                    self.frames[top].stack.push(obj);
+                }
+                Op::StampThrowable => {
+                    // Stamp line/file/trace on a `new`-constructed Throwable, after
+                    // its property-init thunk ran (which would otherwise clobber
+                    // `trace`), leaving the object on the stack (EXC-3b/3c).
+                    if let Some(obj) = self.frames[top].stack.last().cloned() {
+                        self.stamp_throwable_location(&obj);
+                    }
+                }
+                Op::This => match &self.frames[top].this {
+                    Some(t) => {
+                        let v = t.clone();
+                        self.frames[top].stack.push(v);
+                    }
+                    None => {
+                        return Err(PhpError::Error(
+                            "Using $this when not in object context".to_string(),
+                        ))
+                    }
+                },
+                Op::Eval => {
+                    let code = self.frames[top].stack.pop().expect("eval code");
+                    let code_str = convert::to_zstr(&code, &mut self.diags);
+                    let mut src = b"<?php ".to_vec();
+                    src.extend_from_slice(code_str.as_bytes());
+                    let result = self.run_eval(&src)?;
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(result);
+                }
+                Op::Include { mode } => {
+                    let path_val = self.frames[top].stack.pop().expect("include path");
+                    let result = self.run_include(path_val, *mode)?;
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(result);
+                }
+                Op::Clone => {
+                    let src = self.frames[top].stack.pop().expect("Clone operand").deref_clone();
+                    let Zval::Object(o) = &src else {
+                        return Err(PhpError::TypeError(format!(
+                            "clone(): Argument #1 ($object) must be of type object, {} given",
+                            src.type_name_for_error()
+                        )));
+                    };
+                    // Opaque handle classes (GdImage) are uncloneable, like
+                    // their internal PHP counterparts.
+                    if crate::vm::is_opaque_handle_class(o.borrow().class_name.as_bytes()) {
+                        let msg = format!(
+                            "Trying to clone an uncloneable object of class {}",
+                            String::from_utf8_lossy(o.borrow().class_name.as_bytes())
+                        );
+                        if let Some(cid) = self.class_index.get(&b"error"[..]).copied() {
+                            let obj = self.synthesize_throwable(cid, &msg)?;
+                            return Err(PhpError::Thrown(obj));
+                        }
+                        return Err(PhpError::Error(msg));
+                    }
+                    // Cloning a lazy object initializes it first (PHP 8.4,
+                    // clone_initializes). An initialized proxy then clones as a
+                    // NEW initialized proxy wrapping a clone of its real
+                    // instance: the copy below runs on the instance and the
+                    // wrapper is rebuilt around it afterwards.
+                    if o.borrow().lazy.is_some() && o.borrow().proxy_instance.is_none() {
+                        self.realize_lazy(&src)?;
+                    }
+                    let proxy_wrapper: Option<(u32, php_types::ZStr, Rc<ObjectInfo>)> = {
+                        let b = o.borrow();
+                        if matches!(b.lazy, Some(LazyKind::Proxy)) && b.proxy_instance.is_some() {
+                            Some((b.class_id, b.class_name.clone(), Rc::clone(&b.info)))
+                        } else {
+                            None
+                        }
+                    };
+                    let src = if proxy_wrapper.is_some() {
+                        let inst = o.borrow().proxy_instance.clone().expect("initialized proxy");
+                        (*inst).clone()
+                    } else {
+                        src
+                    };
+                    let Zval::Object(o) = &src else { unreachable!("proxy instance is an object") };
+                    // Shallow copy: a fresh handle, properties cloned by value
+                    // (nested objects share their handle, arrays copy on write).
+                    let clone_rc = {
+                        let b = o.borrow();
+                        let mut props = b.props.clone();
+                        // Detach object-internal (unshared) property references so
+                        // the copy does not write back through them (bug27268/68262).
+                        props.separate_cloned_internal_refs();
+                        let obj = Object {
+                            class_id: b.class_id,
+                            class_name: b.class_name.clone(),
+                            props,
+                            id: self.next_obj_id(),
+                            info: Rc::clone(&b.info),
+                            // A clone keeps the source's readonly props
+                            // initialised; the clone-write grants come below
+                            // (if `__clone` runs) and typed-unset starts clean.
+                            rare: match b.readonly_init_slice() {
+                                [] => None,
+                                ro => Some(Box::new(php_types::ObjRare {
+                                    readonly_init: ro.to_vec(),
+                                    ..Default::default()
+                                })),
+                            },
+                            // A clone is a concrete copy; lazy state is not carried.
+                            lazy: None,
+                            proxy_instance: None,
+                            gc: php_types::GcMark::new(),
+                        };
+                        Rc::new(RefCell::new(obj))
+                    };
+                    self.created
+                        .insert(clone_rc.borrow().id, Rc::clone(&clone_rc));
+                    self.gc_track(&clone_rc);
+                    // A clone inherits typed references (typed_properties_081):
+                    // its property slots share the source's reference cells, so
+                    // the copy becomes an additional owner of each registered
+                    // typed source (the type outlives the original object).
+                    if !self.typed_refs.is_empty() {
+                        let src_ptr = Rc::as_ptr(o);
+                        let inherited: Vec<TypedRefSource> = self
+                            .typed_refs
+                            .iter()
+                            .filter(|t| {
+                                t.cell.strong_count() > 0 && std::ptr::eq(t.obj.as_ptr(), src_ptr)
+                            })
+                            .map(|t| TypedRefSource {
+                                cell: t.cell.clone(),
+                                obj: Rc::downgrade(&clone_rc),
+                                class_name: t.class_name.clone(),
+                                prop: t.prop.clone(),
+                                hint: t.hint.clone(),
+                            })
+                            .collect();
+                        self.typed_refs.extend(inherited);
+                    }
+                    let cid = clone_rc.borrow().class_id as usize;
+                    let clone_val = Zval::Object(clone_rc.clone());
+                    // A proxy clones to a fresh initialized-proxy wrapper around
+                    // the instance copy; `__clone` below still runs on the copy.
+                    let pushed = if let Some((wcid, wname, winfo)) = proxy_wrapper {
+                        let wrapper = Object {
+                            class_id: wcid,
+                            class_name: wname,
+                            props: Props::new(),
+                            id: self.next_obj_id(),
+                            info: winfo,
+                            rare: None,
+                            lazy: Some(LazyKind::Proxy),
+                            proxy_instance: Some(Box::new(clone_val.clone())),
+                            gc: php_types::GcMark::new(),
+                        };
+                        let wrc = Rc::new(RefCell::new(wrapper));
+                        self.created.insert(wrc.borrow().id, Rc::clone(&wrc));
+                        self.gc_track(&wrc);
+                        Zval::Object(wrc)
+                    } else {
+                        clone_val.clone()
+                    };
+                    self.frames[top].stack.push(pushed);
+                    // Run `__clone` on the copy if defined (return discarded), so it
+                    // can deep-copy what it needs (PHP OOP).
+                    if let Some((defc, midx)) = resolve_method_runtime(&self.classes, cid, b"__clone") {
+                        // PHP 8.3 amendment: while `__clone` runs, each readonly
+                        // property of the copy may be re-initialised once. Grant the
+                        // permission now; the `__clone` frame revokes it on return so
+                        // a manual `$o->__clone()` (no grant) still fatals on a write.
+                        let writable: Vec<Box<[u8]>> = clone_rc
+                            .borrow()
+                            .props
+                            .iter()
+                            .map(|(n, _)| n.to_vec().into_boxed_slice())
+                            .filter(|n| prop_readonly_decl(&self.classes, cid, n).is_some())
+                            .collect();
+                        clone_rc.borrow_mut().set_readonly_clone_writable(writable);
+                        let callee = &self.classes[defc].methods[midx].func;
+                        let m = self.class_mod(defc);
+                        let mut frame = self.pooled_frame(callee, m);
+                        frame.this = Some(clone_val);
+                        frame.class = Some(defc);
+                        frame.static_class = Some(cid);
+                        frame.ret_cell = Some(php_types::zcell(Zval::Null));
+                        frame.flags.set(FrameFlags::CLONE_INIT, true);
+                        self.frames.push(frame);
+                        continue;
+                    }
+                }
+                Op::PropGet { name, ic } => {
+                    scn!(PropGet: op);
+                    scn!(PropGet: Pop = 1);
+                    let obj = self.frames[top].stack.pop().expect("PropGet object");
+                    self.prop_get_entry(top, obj, name, ic)?;
+                }
+                Op::PropGetSlot { slot, name, ic } => {
+                    // S-173 L-SL2 fetta 3 P3 (criterio wp172-harness/s173-criterio.md
+                    // p.2): peephole runtime sul bigramma `$s OP= $o->x`
+                    // (questo op + BinarySTDst). Guardie IC VERBATIM dall'hit qui
+                    // sotto (scope_key, ic.get, class_id, lazy) + dominio del fast
+                    // path di BinarySTDst (prop Long, slot l Long, `long_arith_i64`
+                    // in dominio): il risultato va in place su dst Long — altrimenti
+                    // `reg_store_slot(Long(r))`, P2 verbatim — con `ip+2`: nessun
+                    // push/pop del Long, un dispatch in meno. OGNI miss cade al
+                    // sentiero storico sotto, da zero: il probe non tocca stato.
+                    #[cfg(not(any(feature = "zval-census", feature = "op-census")))]
+                    if let Some(Op::BinarySTDst { op: b2, l, dst }) = func.ops.get(ip + 1) {
+                        let sealed: Option<i64> = 'l: {
+                            let fr = &self.frames[top];
+                            let Zval::Object(o) = &fr.slots[*slot as usize] else {
+                                break 'l None;
+                            };
+                            let sk = crate::bytecode::PropIc::scope_key(fr.class);
+                            let Some((cid1, pslot)) = ic.get(sk) else {
+                                break 'l None;
+                            };
+                            let Zval::Long(lv) = &fr.slots[*l as usize] else {
+                                break 'l None;
+                            };
+                            let b = o.borrow();
+                            if b.class_id + 1 != cid1 || b.lazy.is_some() {
+                                break 'l None;
+                            }
+                            let Some(Zval::Long(y)) = b.props.get_slot(pslot) else {
+                                break 'l None;
+                            };
+                            long_arith_i64(*b2, *lv, *y)
+                        };
+                        if let Some(r) = sealed {
+                            if let Zval::Long(x) = &mut self.frames[top].slots[*dst as usize] {
+                                *x = r;
+                                // S-174 «sweep-in-op» B (criterio p.2): dal solo
+                                // sentiero in place, Sweep a ip+2 inerte ⇒ ip+3.
+                                if self.sweep_skip_next(top, func, ip + 2) {
+                                    self.frames[top].ip = ip + 3;
+                                    continue;
+                                }
+                            } else {
+                                self.reg_store_slot(top, *dst, Zval::Long(r))?;
+                            }
+                            self.frames[top].ip = ip + 2;
+                            continue;
+                        }
+                    }
+                    // S-107 lotto: LoadVar (parità warning via reg_load_slot)
+                    // + PropGet ESATTO — stesso metodo condiviso (IC-hit +
+                    // fallback), zero biforcazione.
+                    // S-113 H-P1a: probe IC col ricevitore in PRESTITO (forma
+                    // ThisPropGet, prior art WP-34) — l'hit non clona l'handle
+                    // dello slot; condizioni VERBATIM dall'hit di
+                    // prop_get_entry, OGNI miss cade nel sentiero storico
+                    // invariato (warning Undef, deref del Ref, fallback).
+                    let mut hit: Option<Zval> = None;
+                    if let Zval::Object(o) = &self.frames[top].slots[*slot as usize] {
+                        let sk = crate::bytecode::PropIc::scope_key(self.frames[top].class);
+                        if let Some((cid1, pslot)) = ic.get(sk) {
+                            let b = o.borrow();
+                            if b.class_id + 1 == cid1 && b.lazy.is_none() {
+                                if let Some(v) = b.props.get_slot(pslot) {
+                                    if !matches!(v, Zval::Undef) {
+                                        hit = Some(v.deref_clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(v) = hit {
+                        #[cfg(feature = "zval-census")]
+                        super::zvalcensus::note_prop_val(0, &v);
+                        scn!(PropGet: Push = 1);
+                        self.frames[top].stack.push(v);
+                        continue;
+                    }
+                    let obj = self.reg_load_slot(top, func, *slot);
+                    self.prop_get_entry(top, obj, name, ic)?;
+                }
+                Op::PropDimGetConst { slot, name, key, ic } => {
+                    // S-145 «FR1» (criterio s145-criterio-fr1.md): hit =
+                    // elemento letto through-borrow — l'`Rc<PhpArray>` della
+                    // prop NON viene clonato — e composito saltato (`ip+3`);
+                    // OGNI miss = braccio PropGetSlot verbatim, poi il
+                    // composito intatto che segue (fallback per costruzione:
+                    // magic, warning, string-offset, chiave assente, chiave
+                    // non-Long/Str). Condizioni IC VERBATIM da PropGetSlot;
+                    // guardie valore VERBATIM dal fast di FetchDim. Il
+                    // census propget_val NON vede questo hit (il valore
+                    // prop non è materializzato): dichiarato.
+                    let mut hit: Option<Zval> = None;
+                    if let Zval::Object(o) = &self.frames[top].slots[*slot as usize] {
+                        let sk = crate::bytecode::PropIc::scope_key(self.frames[top].class);
+                        if let Some((cid1, pslot)) = ic.get(sk) {
+                            let b = o.borrow();
+                            if b.class_id + 1 == cid1 && b.lazy.is_none() {
+                                if let Some(v) = b.props.get_slot(pslot) {
+                                    let read = |vv: &Zval| -> Option<Zval> {
+                                        let Zval::Array(a) = vv else { return None };
+                                        let kk = match &func.consts[*key as usize] {
+                                            crate::bytecode::Const::Int(i) => Key::Int(*i),
+                                            crate::bytecode::Const::Str(s) => Key::from_zstr(s),
+                                            _ => return None,
+                                        };
+                                        a.get(&kk).map(|e| e.deref_clone())
+                                    };
+                                    hit = match v {
+                                        Zval::Ref(cell) => read(&cell.borrow()),
+                                        other => read(other),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    if let Some(v) = hit {
+                        // ip PRIMA del flush: un handler che lancia deve
+                        // svolgersi dalla continuazione del triplo, come
+                        // nel FetchDim originale (trap #1: flush AT read).
+                        self.frames[top].ip = ip + 3;
+                        if self.diags_rendered < self.diags.len() {
+                            let line = self.cur_line(top);
+                            self.flush_diags(line)?;
+                        }
+                        let top = self.frames.len() - 1;
+                        self.frames[top].stack.push(v);
+                        continue;
+                    }
+                    let obj = self.reg_load_slot(top, func, *slot);
+                    self.prop_get_entry(top, obj, name, ic)?;
+                }
+                Op::PropGetSlotRecv { recv, slot, name, ic } => {
+                    // S-108 lotto-2 W9a: LoadSlot ESATTO (push silente del
+                    // ricevitore) poi PropGetSlot intero (parità warning +
+                    // prop_get_entry condivisa). La sospensione hook/__get
+                    // sta nell'ULTIMO helper: al ritorno del frame lo stream
+                    // riprende come nella sequenza non fusa, col ricevitore
+                    // già in pila.
+                    // L-A (S-114): peephole runtime sul bigramma
+                    // `$o->x = $o->y OP C` (questo op + BinaryTCPropSetPop).
+                    // Probe bipartito SOLO-borrow, condizioni replicate
+                    // verbatim da prop_get_entry (hit IC get) e
+                    // prop_set_entry (hit IC set): sul double-hit niente
+                    // clone del ricevitore, niente round-trip di pila,
+                    // niente lazy_prop_access (ri-implicato dalle guardie),
+                    // niente clone del value, un dispatch in meno (ip+2).
+                    // OGNI miss cade alla sequenza storica sotto, da zero:
+                    // il probe non tocca stato. Fuori dalle build census:
+                    // i contatori misurano il sentiero storico.
+                    #[cfg(not(any(feature = "zval-census", feature = "op-census")))]
+                    let fused = 'f: {
+                        let Some(Op::BinaryTCPropSetPop {
+                            op: b2,
+                            cidx,
+                            name: set_name,
+                            ic: set_ic,
+                        }) = func.ops.get(ip + 1)
+                        else {
+                            break 'f false;
+                        };
+                        if self.frames[top].flags.get(FrameFlags::INIT_PROPS) {
+                            break 'f false;
+                        }
+                        let sk = crate::bytecode::PropIc::scope_key(self.frames[top].class);
+                        let Zval::Object(o) = &self.frames[top].slots[*slot as usize] else {
+                            break 'f false;
+                        };
+                        let Some((cid1, gslot)) = ic.get(sk) else {
+                            break 'f false;
+                        };
+                        // S-172 L-SL2 «forma sigillata Long» fetta 2 = prop (criterio
+                        // wp172-harness/s172-criterio.md p.2a): sul double-hit con prop
+                        // letto Long, const Int e `long_arith_i64` (arm Long di
+                        // binary_fast, VERBATIM) in dominio, il risultato si scrive IN
+                        // PLACE sul payload del prop di destinazione se è già Long
+                        // (= replace_slot + gc_note di un Long, no-op), altrimenti per
+                        // write_property_at come nel sentiero fuso; nessun Zval
+                        // temporaneo (yv, cv, value, old). Guardie get/set-side
+                        // IDENTICHE al sentiero fuso storico qui sotto; ogni miss (tag,
+                        // overflow, Div/Mod/Pow, shift negativo) vi ricade e ricomputa
+                        // da zero: il probe non ha effetti.
+                        // S-173 L-SL2 fetta 3 P4 (criterio s173-criterio.md p.2): quando
+                        // recv == slot il ricevitore della scrittura È l'oggetto letto:
+                        // UN solo `borrow_mut` copre le guardie get-side (class_id, lazy)
+                        // e set-side (class_id, enum, slot presente e Long) del probe
+                        // sigillato qui sotto, la lettura di y e la scrittura in place di
+                        // r — le STESSE guardie, un RefCell in meno ×2 e un class_id in
+                        // meno. Copre SOLO il caso in place (dst già Long); ogni altro
+                        // esito (miss di dominio, dst non-Long/Ref/assente) cade al probe
+                        // sigillato sotto, che ricomputa da zero: nessun effetto.
+                        if *recv == *slot {
+                            if let crate::bytecode::Const::Int(k) = &func.consts[*cidx as usize] {
+                                if let Some((cid2, sslot)) = set_ic.get(sk) {
+                                    let mut bm = o.borrow_mut();
+                                    if bm.class_id + 1 == cid1
+                                        && bm.class_id + 1 == cid2
+                                        && bm.lazy.is_none()
+                                        && !bm.info.is_enum_case
+                                    {
+                                        if let Some(Zval::Long(y)) = bm.props.get_slot(gslot) {
+                                            if let Some(r) = long_arith_i64(*b2, *y, *k) {
+                                                if let Some(Zval::Long(x)) = bm.props.get_slot_mut(sslot) {
+                                                    *x = r;
+                                                    drop(bm);
+                                                    // S-174 «sweep-in-op» B (criterio p.2): scrittura in place
+                                                    // compiuta, nessun effetto pendente: Sweep a ip+2 inerte ⇒ ip+3.
+                                                    self.frames[top].ip = if self.sweep_skip_next(top, func, ip + 2) {
+                                                        ip + 3
+                                                    } else {
+                                                        ip + 2
+                                                    };
+                                                    break 'f true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let sealed: Option<i64> = 'l: {
+                            let crate::bytecode::Const::Int(k) = &func.consts[*cidx as usize] else {
+                                break 'l None;
+                            };
+                            let b = o.borrow();
+                            if b.class_id + 1 != cid1 || b.lazy.is_some() {
+                                break 'l None;
+                            }
+                            let Some(Zval::Long(y)) = b.props.get_slot(gslot) else {
+                                break 'l None;
+                            };
+                            long_arith_i64(*b2, *y, *k)
+                        };
+                        if let Some(r) = sealed {
+                            let Zval::Object(ro) = &self.frames[top].slots[*recv as usize] else {
+                                break 'f false;
+                            };
+                            let Some((cid2, sslot)) = set_ic.get(sk) else {
+                                break 'f false;
+                            };
+                            let in_place = {
+                                let rb = ro.borrow();
+                                if rb.class_id + 1 != cid2 || rb.lazy.is_some() || rb.info.is_enum_case {
+                                    break 'f false;
+                                }
+                                match rb.props.get_slot(sslot) {
+                                    Some(Zval::Long(_)) => true,
+                                    Some(Zval::Ref(_)) => {
+                                        if !self.typed_refs.is_empty() {
+                                            break 'f false;
+                                        }
+                                        false
+                                    }
+                                    Some(_) => false,
+                                    None => break 'f false,
+                                }
+                            };
+                            if in_place {
+                                if let Some(Zval::Long(x)) = ro.borrow_mut().props.get_slot_mut(sslot) {
+                                    *x = r;
+                                }
+                            } else if let Some(old) = write_property_at(
+                                &self.frames[top].slots[*recv as usize],
+                                set_name,
+                                Some(sslot),
+                                Zval::Long(r),
+                            )? {
+                                self.gc_note(&old);
+                            }
+                            // S-174 «sweep-in-op» B (criterio p.2): SOLO dal sentiero in
+                            // place (write_property_at può notare l'old): Sweep a ip+2
+                            // inerte ⇒ ip+3.
+                            self.frames[top].ip = if in_place && self.sweep_skip_next(top, func, ip + 2) {
+                                ip + 3
+                            } else {
+                                ip + 2
+                            };
+                            break 'f true;
+                        }
+                        let yv = {
+                            let b = o.borrow();
+                            if b.class_id + 1 != cid1 || b.lazy.is_some() {
+                                break 'f false;
+                            }
+                            match b.props.get_slot(gslot) {
+                                Some(v) if !matches!(v, Zval::Undef) => v.deref_clone(),
+                                _ => break 'f false,
+                            }
+                        };
+                        if matches!(yv, Zval::Undef | Zval::Ref(_)) {
+                            break 'f false;
+                        }
+                        let cv = func.consts[*cidx as usize].to_zval();
+                        let Some(value) = binary_fast(*b2, &yv, &cv) else {
+                            break 'f false;
+                        };
+                        let Zval::Object(ro) = &self.frames[top].slots[*recv as usize] else {
+                            break 'f false;
+                        };
+                        let Some((cid2, sslot)) = set_ic.get(sk) else {
+                            break 'f false;
+                        };
+                        {
+                            let rb = ro.borrow();
+                            if rb.class_id + 1 != cid2
+                                || rb.lazy.is_some()
+                                || rb.info.is_enum_case
+                                || !match rb.props.get_slot(sslot) {
+                                    Some(Zval::Ref(_)) => self.typed_refs.is_empty(),
+                                    Some(_) => true,
+                                    None => false,
+                                }
+                            {
+                                break 'f false;
+                            }
+                        }
+                        if let Some(old) = write_property_at(
+                            &self.frames[top].slots[*recv as usize],
+                            set_name,
+                            Some(sslot),
+                            value,
+                        )? {
+                            self.gc_note(&old);
+                        }
+                        self.frames[top].ip = ip + 2;
+                        true
+                    };
+                    #[cfg(any(feature = "zval-census", feature = "op-census"))]
+                    let fused = false;
+                    if !fused {
+                        let rv = read_slot(&self.frames[top].slots[*recv as usize]);
+                        self.frames[top].stack.push(rv);
+                        // S-113 H-P1b: stesso probe in prestito di P1a, DOPO il
+                        // push del recv (ordine di pila identico al sentiero
+                        // storico); ogni miss → reg_load_slot + prop_get_entry
+                        // invariati. Sotto L-A (S-114) questo ramo è il
+                        // solo-miss del peephole fuso.
+                        let mut hit: Option<Zval> = None;
+                        if let Zval::Object(o) = &self.frames[top].slots[*slot as usize] {
+                            let sk = crate::bytecode::PropIc::scope_key(self.frames[top].class);
+                            if let Some((cid1, pslot)) = ic.get(sk) {
+                                let b = o.borrow();
+                                if b.class_id + 1 == cid1 && b.lazy.is_none() {
+                                    if let Some(v) = b.props.get_slot(pslot) {
+                                        if !matches!(v, Zval::Undef) {
+                                            hit = Some(v.deref_clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(v) = hit {
+                            #[cfg(feature = "zval-census")]
+                            super::zvalcensus::note_prop_val(0, &v);
+                            scn!(PropGet: Push = 1);
+                            self.frames[top].stack.push(v);
+                            continue;
+                        }
+                        let obj = self.reg_load_slot(top, func, *slot);
+                        self.prop_get_entry(top, obj, name, ic)?;
+                    }
+                }
+                Op::ThisPropGet { name, ic } => {
+                    // Fused `$this->name` (WP-34): the IC hit borrows the
+                    // receiver in place — no This clone, no stack round-trip.
+                    // Everything else clones the receiver once and takes the
+                    // shared PropGet fallback, so the fused op stays
+                    // semantically identical to This+PropGet by construction.
+                    let sk = crate::bytecode::PropIc::scope_key(self.frames[top].class);
+                    let mut hit: Option<Zval> = None;
+                    if let Some(Zval::Object(o)) = &self.frames[top].this {
+                        if let Some((cid1, slot)) = ic.get(sk) {
+                            let b = o.borrow();
+                            if b.class_id + 1 == cid1 && b.lazy.is_none() {
+                                if let Some(v) = b.props.get_slot(slot) {
+                                    if !matches!(v, Zval::Undef) {
+                                        hit = Some(v.deref_clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(v) = hit {
+                        // S-101 census: specie del valore letto (P1); l'hit
+                        // fuso NON clona il ricevitore (prior art H-C1b).
+                        #[cfg(feature = "zval-census")]
+                        super::zvalcensus::note_prop_val(0, &v);
+                        self.frames[top].stack.push(v);
+                        continue;
+                    }
+                    let target = match &self.frames[top].this {
+                        Some(t) => t.deref_clone(),
+                        None => {
+                            return Err(PhpError::Error(
+                                "Using $this when not in object context".to_string(),
+                            ))
+                        }
+                    };
+                    // S-101 census: bump Rc del ricevitore (P2, solo fallback).
+                    #[cfg(feature = "zval-census")]
+                    super::zvalcensus::note_recv_clone_prop(&target);
+                    self.prop_get_fallback(top, target, name, ic)?;
+                }
+                Op::PropGetSilent { name } => {
+                    // Like PropGet but with no "Undefined property" warning and no
+                    // visibility error (the read context of `empty()` / `??`).
+                    let obj = self.frames[top].stack.pop().expect("PropGetSilent object");
+                    let cur = self.frames[top].class;
+                    // A silent read (`??`/`empty`) still initializes a lazy object
+                    // (PHP 8.4, fetch_coalesce_initializes) — unless a hook/`__get`
+                    // serves it; an initialized proxy forwards to its instance.
+                    let target = self.lazy_prop_access(obj.deref_clone(), &name, cur, Some(false), (MagicKind::Get, b"__get"))?;
+                    let mut key: Cow<[u8]> = Cow::Borrowed(&name[..]);
+                    if let Zval::Object(o) = &target {
+                        if let Some((defc, midx, oid)) =
+                            self.magic_applies(o, &name, cur, MagicKind::Get, b"__get")
+                        {
+                            self.push_magic_prop(defc, midx, oid, MagicKind::Get, target.clone(), &name, None, None, false);
+                            continue;
+                        }
+                        key = self.prop_storage_key(o.borrow().class_id as usize, &name, cur);
+                    }
+                    let mut sink = Diags::new();
+                    let v = read_property(&target, &key, &mut sink);
+                    self.frames[top].stack.push(v);
+                }
+                Op::PropGetDynamic => {
+                    // `$o->$n` / `$o->{expr}`: pop the property name (coerced to a
+                    // string) then read exactly like `Op::PropGet` (step 51).
+                    let nameval = self.frames[top].stack.pop().expect("PropGetDynamic name");
+                    let name = convert::to_zstr(&nameval, &mut self.diags).as_bytes().to_vec();
+                    let obj = self.frames[top].stack.pop().expect("PropGetDynamic object");
+                    let cur = self.frames[top].class;
+                    let target = self.lazy_prop_access(obj.deref_clone(), &name, cur, Some(false), (MagicKind::Get, b"__get"))?;
+                    let mut key: Cow<[u8]> = Cow::Borrowed(&name[..]);
+                    if let Zval::Object(o) = &target {
+                        let (oid, cid) = { let b = o.borrow(); (b.id, b.class_id as usize) };
+                        if !self.hook_guarded(oid, &name) {
+                            if let Some(func) = self.prop_hook(cid, &name, false) {
+                                self.push_hook(func, target.clone(), oid, &name, None);
+                                continue;
+                            }
+                        }
+                        if let Some((defc, midx, oid)) =
+                            self.magic_applies(o, &name, cur, MagicKind::Get, b"__get")
+                        {
+                            self.push_magic_prop(defc, midx, oid, MagicKind::Get, target.clone(), &name, None, None, false);
+                            continue;
+                        }
+                        key = match resolve_prop_access(&self.classes, o.borrow().class_id as usize, &name, cur) {
+                            PropAccess::Slot { key: k, .. } => Cow::Borrowed(k),
+                            PropAccess::Dynamic => Cow::Borrowed(&name[..]),
+                            PropAccess::Denied { decl, vis } => {
+                                return Err(prop_access_error(&self.classes, decl, &name, vis))
+                            }
+                        };
+                        if let Some(err) = self.uninit_typed_read(o, &key, &name) {
+                            return Err(err);
+                        }
+                    }
+                    let before_diags = self.diags.len();
+                    let v = read_property(&target, &key, &mut self.diags);
+                    let read_line = self.cur_line(top);
+                    self.mark_pending_diag_lines(before_diags, read_line);
+                    self.frames[top].stack.push(v);
+                }
+                Op::PropGetDynamicSilent => {
+                    // Like `Op::PropGetDynamic` but silent (the `??` read context).
+                    let nameval = self.frames[top].stack.pop().expect("PropGetDynamicSilent name");
+                    let name = convert::to_zstr(&nameval, &mut self.diags).as_bytes().to_vec();
+                    let obj = self.frames[top].stack.pop().expect("PropGetDynamicSilent object");
+                    let cur = self.frames[top].class;
+                    let target = self.lazy_prop_access(obj.deref_clone(), &name, cur, Some(false), (MagicKind::Get, b"__get"))?;
+                    let mut key: Cow<[u8]> = Cow::Borrowed(&name[..]);
+                    if let Zval::Object(o) = &target {
+                        if let Some((defc, midx, oid)) =
+                            self.magic_applies(o, &name, cur, MagicKind::Get, b"__get")
+                        {
+                            self.push_magic_prop(defc, midx, oid, MagicKind::Get, target.clone(), &name, None, None, false);
+                            continue;
+                        }
+                        key = self.prop_storage_key(o.borrow().class_id as usize, &name, cur);
+                    }
+                    let mut sink = Diags::new();
+                    let v = read_property(&target, &key, &mut sink);
+                    self.frames[top].stack.push(v);
+                }
+                Op::PropSet { name, ic } => {
+                    scn!(PropSet: op);
+                    scn!(PropSet: Pop = 2);
+                    let value = self.frames[top].stack.pop().expect("PropSet value");
+                    let obj = self.frames[top].stack.pop().expect("PropSet object");
+                    self.prop_set_entry::<false>(top, obj, value, name, ic)?;
+                }
+                Op::PropSetPop { name, ic } => {
+                    // S-107 lotto: PropSet ESATTO (stesso metodo, DISCARD
+                    // monomorfizzato dal const-generic) senza il push del
+                    // valore assegnato che il Pop scartava.
+                    let value = self.frames[top].stack.pop().expect("PropSetPop value");
+                    let obj = self.frames[top].stack.pop().expect("PropSetPop object");
+                    self.prop_set_entry::<true>(top, obj, value, name, ic)?;
+                }
+                Op::BinaryTCPropSetPop { op: b, cidx, name, ic } => {
+                    // S-108 lotto-2 W9b: BinaryTC ESATTO (funnel const-rhs,
+                    // flat — binary_value_ab non sospende, precedente
+                    // BinarySCSC) senza il push del risultato, poi l'entry
+                    // PropSet DISCARD condivisa come ULTIMO passo.
+                    let cv = func.consts[*cidx as usize].to_zval();
+                    let value = 'r: {
+                        if let Some(lv) = self.frames[top].stack.last() {
+                            if !matches!(lv, Zval::Undef | Zval::Ref(_)) {
+                                if let Some(v) = binary_fast(*b, lv, &cv) {
+                                    self.frames[top].stack.pop();
+                                    break 'r v;
+                                }
+                            }
+                        }
+                        let lhs = self.frames[top].stack.pop().expect("BinaryTCPropSetPop lhs");
+                        self.binary_value_ab(*b, lhs, cv)?
+                    };
+                    let obj = self.frames[top].stack.pop().expect("BinaryTCPropSetPop object");
+                    self.prop_set_entry::<true>(top, obj, value, name, ic)?;
+                }
+                Op::PropOpSet { name, op } => {
+                    let rhs = self.frames[top].stack.pop().expect("PropOpSet rhs");
+                    let obj = self.frames[top].stack.pop().expect("PropOpSet object");
+                    let cur = self.frames[top].class;
+                    // A compound read-modify-write initializes a lazy object (PHP
+                    // 8.4, fetch_op_initializes) — unless a hook serves it.
+                    let obj = self.lazy_prop_access(obj.deref_clone(), &name, cur, None, (MagicKind::Get, b"__get"))?;
+                    // ONE resolution decides visibility, storage key AND slot
+                    // (was check_prop_access + prop_storage_key = two walks,
+                    // then two more name-hashes in read/write_property).
+                    let mut slot_idx: Option<u32> = None;
+                    let key: Cow<[u8]> = match object_class_id(&obj) {
+                        Some(ocid) => match resolve_prop_access(&self.classes, ocid, &name, cur) {
+                            PropAccess::Slot { key: k, slot } => {
+                                slot_idx = slot;
+                                Cow::Borrowed(k)
+                            }
+                            PropAccess::Dynamic => Cow::Borrowed(&name[..]),
+                            PropAccess::Denied { decl, vis } => {
+                                return Err(prop_access_error(&self.classes, decl, &name, vis))
+                            }
+                        },
+                        None => Cow::Borrowed(&name[..]),
+                    };
+                    if let Some(err) = self.readonly_rmw_error(&obj, &key, &name) {
+                        return Err(err);
+                    }
+                    // PHP 8.4 asymmetric visibility: a compound assignment is a
+                    // write — denied from a scope the set visibility excludes.
+                    if let Some(ocid) = object_class_id(&obj) {
+                        if let Some(err) = asym_write_error(&self.classes, cur, ocid, &name, "modify") {
+                            return Err(err);
+                        }
+                    }
+                    if let Zval::Object(o) = &obj.deref_clone() {
+                        if let Some(err) = self.uninit_typed_read_at(o, &key, slot_idx, &name) {
+                            return Err(err);
+                        }
+                    }
+                    let old = read_property_at(&obj, &key, slot_idx, &mut self.diags);
+                    #[cfg(feature = "op-census")]
+                    if matches!(*op, crate::hir::BinOp::Concat) {
+                        crate::vm::census::census_concat_site(1, &old, &rhs);
+                    }
+                    let mut result = self.apply_binop_ovl(*op, &old, &rhs)?;
+                    // A `set` hook with no `get` hook (the backing read above is then
+                    // the property's own value) handles the write: dispatch it like
+                    // `$o->prop = result`, the compound's value being `result`.
+                    if let Zval::Object(o) = &obj.deref_clone() {
+                        let (oid, cid) = { let b = o.borrow(); (b.id, b.class_id as usize) };
+                        if !self.hook_guarded(oid, &name) && self.prop_hook(cid, &name, false).is_none() {
+                            if let Some(func) = self.prop_hook(cid, &name, true) {
+                                self.frames[top].stack.push(result.clone());
+                                self.push_hook(func, obj.deref_clone(), oid, &name, Some(result));
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(ocid) = object_class_id(&obj) {
+                        result = self.coerce_typed_prop_write(ocid, &name, result)?;
+                    }
+                    if let Some(dropped) = write_property_at(&obj, &key, slot_idx, result.clone())? {
+                        self.gc_note(&dropped);
+                    }
+                    self.frames[top].stack.push(result);
+                }
+                Op::PropIncDec { name, inc, pre, ic } => {
+                    let obj = self.frames[top].stack.pop().expect("PropIncDec object");
+                    let cur = self.frames[top].class;
+                    // V3 (S-119 treno-2): il ricevitore è POSSEDUTO (pop) —
+                    // il deref_clone serve solo a un Ref; altrimenti si muove.
+                    let obj_d = if matches!(obj, Zval::Ref(_)) { obj.deref_clone() } else { obj };
+                    // INLINE CACHE (WP-30): the RMW twin of the PropSet hit.
+                    // Fills only from a `plain_set_props` class (below), so a
+                    // class-id match re-implies every per-class check the slow
+                    // path performs (readonly-RMW, asym write, typed-uninit,
+                    // both hook probes, write coercion); the per-object state
+                    // (lazy, enum case, present non-Undef slot, Ref×typed_refs)
+                    // is re-checked here. An absent/Undef slot falls through
+                    // (undefined-prop warning, dynamic creation, `__get`).
+                    if let Zval::Object(o) = &obj_d {
+                        if let Some((cid1, slot)) = ic.get(crate::bytecode::PropIc::scope_key(cur)) {
+                            let hit = {
+                                let b = o.borrow();
+                                b.class_id + 1 == cid1
+                                    && b.lazy.is_none()
+                                    && !b.info.is_enum_case
+                                    && match b.props.get_slot(slot) {
+                                        None | Some(Zval::Undef) => false,
+                                        Some(Zval::Ref(_)) => self.typed_refs.is_empty(),
+                                        Some(_) => true,
+                                    }
+                            };
+                            if hit {
+                                let old = read_property_at(&obj_d, &name, Some(slot), &mut self.diags);
+                                let mut newv = old.clone();
+                                if *inc {
+                                    ops::increment(&mut newv, &mut self.diags)?;
+                                } else {
+                                    ops::decrement(&mut newv, &mut self.diags)?;
+                                }
+                                if let Some(dropped) =
+                                    write_property_at(&obj_d, &name, Some(slot), newv.clone())?
+                                {
+                                    self.gc_note(&dropped);
+                                }
+                                self.frames[top].stack.push(if *pre { newv } else { old });
+                                continue;
+                            }
+                        }
+                    }
+                    // `++`/`--` initializes a lazy object like a compound assign.
+                    let obj = self.lazy_prop_access(obj_d, &name, cur, None, (MagicKind::Get, b"__get"))?;
+                    // ONE resolution (see PropOpSet above).
+                    let mut slot_idx: Option<u32> = None;
+                    let key: Cow<[u8]> = match object_class_id(&obj) {
+                        Some(ocid) => match resolve_prop_access(&self.classes, ocid, &name, cur) {
+                            PropAccess::Slot { key: k, slot } => {
+                                slot_idx = slot;
+                                // Fill (WP-30): only a plain_set_props class —
+                                // scope-independent by construction (all props
+                                // public, symmetric, untyped, non-readonly,
+                                // hook-free); the slot proves it is declared.
+                                if let (Some(i), Zval::Object(o)) = (slot, &obj) {
+                                    let b = o.borrow();
+                                    if b.lazy.is_none()
+                                        && !b.info.is_enum_case
+                                        && self.classes[b.class_id as usize].plain_set_props
+                                    {
+                                        ic.fill(b.class_id, crate::bytecode::PropIc::scope_key(cur), i);
+                                    }
+                                }
+                                Cow::Borrowed(k)
+                            }
+                            PropAccess::Dynamic => Cow::Borrowed(&name[..]),
+                            PropAccess::Denied { decl, vis } => {
+                                return Err(prop_access_error(&self.classes, decl, &name, vis))
+                            }
+                        },
+                        None => Cow::Borrowed(&name[..]),
+                    };
+                    if let Some(err) = self.readonly_rmw_error(&obj, &key, &name) {
+                        return Err(err);
+                    }
+                    // PHP 8.4 asymmetric visibility: `++`/`--` is a write —
+                    // denied from a scope the set visibility excludes.
+                    if let Some(ocid) = object_class_id(&obj) {
+                        if let Some(err) = asym_write_error(&self.classes, cur, ocid, &name, "modify") {
+                            return Err(err);
+                        }
+                    }
+                    if let Zval::Object(o) = &obj.deref_clone() {
+                        if let Some(err) = self.uninit_typed_read_at(o, &key, slot_idx, &name) {
+                            return Err(err);
+                        }
+                    }
+                    let old = read_property_at(&obj, &key, slot_idx, &mut self.diags);
+                    let mut newv = old.clone();
+                    if *inc {
+                        ops::increment(&mut newv, &mut self.diags)?;
+                    } else {
+                        ops::decrement(&mut newv, &mut self.diags)?;
+                    }
+                    // A `set` hook (no `get` hook) handles the write; the inc/dec
+                    // expression still yields the pre/post value.
+                    if let Zval::Object(o) = &obj.deref_clone() {
+                        let (oid, cid) = { let b = o.borrow(); (b.id, b.class_id as usize) };
+                        if !self.hook_guarded(oid, &name) && self.prop_hook(cid, &name, false).is_none() {
+                            if let Some(func) = self.prop_hook(cid, &name, true) {
+                                self.frames[top].stack.push(if *pre { newv.clone() } else { old });
+                                self.push_hook(func, obj.deref_clone(), oid, &name, Some(newv));
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(ocid) = object_class_id(&obj) {
+                        newv = self.coerce_typed_prop_write(ocid, &name, newv)?;
+                    }
+                    if let Some(dropped) = write_property_at(&obj, &key, slot_idx, newv.clone())? {
+                        self.gc_note(&dropped);
+                    }
+                    self.frames[top].stack.push(if *pre { newv } else { old });
+                }
+                Op::PropIssetDyn => {
+                    // Dynamic-name twin of `PropIsset`: pop the name, then fall
+                    // into the same hook/`__isset`/visibility dispatch.
+                    let name_v = self.frames[top].stack.pop().expect("PropIssetDyn name");
+                    let name: Box<[u8]> =
+                        convert::to_zstr_cast(&name_v, &mut self.diags).as_bytes().to_vec().into();
+                    let obj = self.frames[top].stack.pop().expect("PropIssetDyn object");
+                    let cur = self.frames[top].class;
+                    let target = self.lazy_prop_access(obj.deref_clone(), &name, cur, Some(false), (MagicKind::Isset, b"__isset"))?;
+                    let set = if let Zval::Object(o) = &target {
+                        let (oid, cid) = { let b = o.borrow(); (b.id, b.class_id as usize) };
+                        if !self.hook_guarded(oid, &name) {
+                            if let Some(func) = self.prop_hook(cid, &name, false) {
+                                self.push_hook(func, target.clone(), oid, &name, None);
+                                self.frames.last_mut().unwrap().flags.set(FrameFlags::RET_ISSET, true);
+                                continue;
+                            }
+                        }
+                        if let Some((defc, midx, oid)) =
+                            self.magic_applies(o, &name, cur, MagicKind::Isset, b"__isset")
+                        {
+                            self.push_magic_prop(defc, midx, oid, MagicKind::Isset, target.clone(), &name, None, None, true);
+                            continue;
+                        }
+                        let ocid = o.borrow().class_id as usize;
+                        // Resolve like any property access: the accessing
+                        // scope's OWN private wins over a subclass's same-name
+                        // redeclaration (prop_vis_decl saw only the most-derived
+                        // declaration, so `isset($this->data)` inside the parent
+                        // read the child's slot and answered false).
+                        match resolve_prop_access(&self.classes, ocid, &name, cur) {
+                            PropAccess::Denied { .. } => false,
+                            PropAccess::Slot { key, slot } => prop_isset_at(&target, &key, slot),
+                            PropAccess::Dynamic => prop_isset(&target, &name),
+                        }
+                    } else {
+                        prop_isset(&target, &name)
+                    };
+                    self.frames[top].stack.push(Zval::Bool(set));
+                }
+                Op::PropIssetFetchGate { name } => {
+                    // The `??`/`??=` fetch gate: PropIsset semantics, plus the
+                    // BP_VAR_IS fallback — no `__isset` but an applicable
+                    // `__get` answers true (the follow-up PropGet routes to it).
+                    let obj = self.frames[top].stack.pop().expect("PropIssetFetchGate object");
+                    let cur = self.frames[top].class;
+                    let target = self.lazy_prop_access(obj.deref_clone(), &name, cur, Some(false), (MagicKind::Isset, b"__isset"))?;
+                    let set = if let Zval::Object(o) = &target {
+                        let (oid, cid) = { let b = o.borrow(); (b.id, b.class_id as usize) };
+                        if !self.hook_guarded(oid, &name) {
+                            if let Some(func) = self.prop_hook(cid, &name, false) {
+                                self.push_hook(func, target.clone(), oid, &name, None);
+                                self.frames.last_mut().unwrap().flags.set(FrameFlags::RET_ISSET, true);
+                                continue;
+                            }
+                        }
+                        if let Some((defc, midx, oid)) =
+                            self.magic_applies(o, &name, cur, MagicKind::Isset, b"__isset")
+                        {
+                            self.push_magic_prop(defc, midx, oid, MagicKind::Isset, target.clone(), &name, None, None, true);
+                            continue;
+                        }
+                        let ocid = o.borrow().class_id as usize;
+                        let declared = match resolve_prop_access(&self.classes, ocid, &name, cur) {
+                            PropAccess::Denied { .. } => false,
+                            PropAccess::Slot { key, slot } => prop_isset_at(&target, &key, slot),
+                            PropAccess::Dynamic => prop_isset(&target, &name),
+                        };
+                        declared
+                            || self
+                                .magic_applies(o, &name, cur, MagicKind::Get, b"__get")
+                                .is_some()
+                    } else {
+                        prop_isset(&target, &name)
+                    };
+                    self.frames[top].stack.push(Zval::Bool(set));
+                }
+                Op::PropIsset { name, ic } => {
+                    let obj = self.frames[top].stack.pop().expect("PropIsset object");
+                    let cur = self.frames[top].class;
+                    // V4 (S-119 treno-2): stessa guardia-Ref di V3.
+                    let recv = if matches!(obj, Zval::Ref(_)) { obj.deref_clone() } else { obj };
+                    // INLINE CACHE (WP-29): mirror of the PropGet IC — a
+                    // present non-`Undef` PUBLIC slot on the cached class
+                    // answers with zero hashing; anything else falls through.
+                    if let Zval::Object(o) = &recv {
+                        if let Some((cid1, slot)) = ic.get(crate::bytecode::PropIc::scope_key(cur)) {
+                            let b = o.borrow();
+                            if b.class_id + 1 == cid1 && b.lazy.is_none() {
+                                if let Some(v) = b.props.get_slot(slot) {
+                                    if !matches!(v, Zval::Undef) {
+                                        let set = !matches!(v.deref_clone(), Zval::Null | Zval::Undef);
+                                        drop(b);
+                                        self.frames[top].stack.push(Zval::Bool(set));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // FAST PATH (WP-25): mirror of the PropGet fast path — a
+                    // present slot on a non-lazy instance of a hook-free
+                    // all-public class answers directly. `Undef` still falls
+                    // through (a typed-unset slot dispatches `__isset`), as
+                    // does a miss.
+                    if let Zval::Object(o) = &recv {
+                        let b = o.borrow();
+                        if b.lazy.is_none() {
+                            let ci = &self.classes[b.class_id as usize];
+                            if ci.all_props_public
+                                && !ci.has_prop_hooks
+                                && !scope_private_overrides(&self.classes, b.class_id as usize, &name, cur)
+                            {
+                                if let Some(v) = b.props.get(&name) {
+                                    if !matches!(v, Zval::Undef) {
+                                        // IC fill from the fast path too (see
+                                        // PropGet).
+                                        if let Some(pi) = ci.prop_info.get(&name[..]) {
+                                            if let Some(i) = pi.slot {
+                                                ic.fill(b.class_id, crate::bytecode::PropIc::scope_key(cur), i);
+                                            }
+                                        }
+                                        let set = !matches!(v.deref_clone(), Zval::Null | Zval::Undef);
+                                        drop(b);
+                                        self.frames[top].stack.push(Zval::Bool(set));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // `isset()` initializes a lazy object (PHP 8.4,
+                    // isset_initializes) — unless a get hook/`__isset` serves it.
+                    let target = self.lazy_prop_access(recv, &name, cur, Some(false), (MagicKind::Isset, b"__isset"))?;
+                    let set = if let Zval::Object(o) = &target {
+                        // `isset($o->hooked)` runs the `get` hook and tests its result
+                        // for being non-null (step 50). Hooks precede `__isset`.
+                        let (oid, cid) = { let b = o.borrow(); (b.id, b.class_id as usize) };
+                        if !self.hook_guarded(oid, &name) {
+                            if let Some(func) = self.prop_hook(cid, &name, false) {
+                                self.push_hook(func, target.clone(), oid, &name, None);
+                                self.frames.last_mut().unwrap().flags.set(FrameFlags::RET_ISSET, true);
+                                continue;
+                            }
+                        }
+                        if let Some((defc, midx, oid)) =
+                            self.magic_applies(o, &name, cur, MagicKind::Isset, b"__isset")
+                        {
+                            // __isset's return (coerced to bool via ret_bool) is the
+                            // result.
+                            self.push_magic_prop(defc, midx, oid, MagicKind::Isset, target.clone(), &name, None, None, true);
+                            continue;
+                        }
+                        // No magic: an inaccessible declared property reads as not-set.
+                        let ocid = o.borrow().class_id as usize;
+                        // Resolve like any property access: the accessing
+                        // scope's OWN private wins over a subclass's same-name
+                        // redeclaration (prop_vis_decl saw only the most-derived
+                        // declaration, so `isset($this->data)` inside the parent
+                        // read the child's slot and answered false).
+                        match resolve_prop_access(&self.classes, ocid, &name, cur) {
+                            PropAccess::Denied { .. } => false,
+                            PropAccess::Slot { key, slot } => {
+                                // IC fill (WP-35): any visibility, scope in
+                                // the key; gated on `!hook_guarded` exactly
+                                // like the PropGet fill (reaching Slot with
+                                // the guard off means the hook probes came up
+                                // empty this execution).
+                                if let Some(i) = slot {
+                                    if !self.hook_guarded(oid, &name) {
+                                        ic.fill(ocid as u32, crate::bytecode::PropIc::scope_key(cur), i);
+                                    }
+                                }
+                                prop_isset_at(&target, &key, slot)
+                            }
+                            PropAccess::Dynamic => prop_isset(&target, &name),
+                        }
+                    } else {
+                        prop_isset(&target, &name)
+                    };
+                    self.frames[top].stack.push(Zval::Bool(set));
+                }
+                Op::PropUnset { name } => {
+                    let obj = self.frames[top].stack.pop().expect("PropUnset object");
+                    let cur = self.frames[top].class;
+                    // `unset()` initializes a lazy object (PHP 8.4,
+                    // unset_undefined_initializes) — unless `__unset`/a hook error
+                    // serves it (hooked props fatal below without initializing).
+                    let target = self.lazy_prop_access(obj.deref_clone(), &name, cur, None, (MagicKind::Unset, b"__unset"))?;
+                    let mut key: Cow<[u8]> = Cow::Borrowed(&name[..]);
+                    if let Zval::Object(o) = &target {
+                        // An enum case property is readonly — it cannot be unset.
+                        if o.borrow().info.is_enum_case {
+                            let ob = o.borrow();
+                            let cls = String::from_utf8_lossy(ob.class_name.as_bytes()).into_owned();
+                            let prop = String::from_utf8_lossy(&name).into_owned();
+                            return Err(PhpError::Error(format!(
+                                "Cannot unset readonly property {cls}::${prop}"
+                            )));
+                        }
+                        // A hooked property has no plain backing to unset (step 50).
+                        // A prelude-declared hook models a native virtual prop
+                        // (XSLTProcessor::$maxTemplateDepth): Zend's internal
+                        // handler omits the "hooked property" wording there.
+                        let hcid = o.borrow().class_id as usize;
+                        if let Some(h) = self
+                            .prop_hook(hcid, &name, false)
+                            .or_else(|| self.prop_hook(hcid, &name, true))
+                        {
+                            let native = h.file.as_ref() == b"prelude";
+                            let ob = o.borrow();
+                            let cls = String::from_utf8_lossy(ob.class_name.as_bytes()).into_owned();
+                            let prop = String::from_utf8_lossy(&name).into_owned();
+                            return Err(PhpError::Error(if native {
+                                format!("Cannot unset {cls}::${prop}")
+                            } else {
+                                format!("Cannot unset hooked property {cls}::${prop}")
+                            }));
+                        }
+                        if let Some((defc, midx, oid)) =
+                            self.magic_applies(o, &name, cur, MagicKind::Unset, b"__unset")
+                        {
+                            let discard = php_types::zcell(Zval::Null);
+                            self.push_magic_prop(defc, midx, oid, MagicKind::Unset, target.clone(), &name, None, Some(discard), false);
+                            continue;
+                        }
+                        check_prop_access(&self.classes, cur, o.borrow().class_id as usize, &name)?;
+                        // `unset` takes the readonly *write* path (after the
+                        // visibility check, so a private/protected one reports the
+                        // access error first, matching PHP): an initialised
+                        // property (or an uninitialised one from outside its
+                        // set-visibility scope) fatals with the write-error
+                        // shapes, "unset" for "modify". An uninitialised IN-scope
+                        // unset is permitted — the lazy-ghost pattern (Symfony
+                        // LazyClosure's ctor unsets `$this->service` so `__get`
+                        // serves it later) — and falls through to the typed-unset
+                        // marking below. During `__clone`, `unset` returns the
+                        // property to the re-assignable uninitialised state (8.3).
+                        let ocid = o.borrow().class_id as usize;
+                        key = self.prop_storage_key(ocid, &name, cur);
+                        // PHP 8.4 asymmetric visibility: `unset` from a scope the
+                        // set visibility excludes is denied ("Cannot unset ...");
+                        // an explicitly-unset slot dispatched `__unset` above.
+                        if let Some(err) = asym_write_error(&self.classes, cur, ocid, &name, "unset") {
+                            return Err(err);
+                        }
+                        if let Some(decl) = prop_readonly_decl(&self.classes, ocid, &name) {
+                            if o.borrow().readonly_clone_writable(&key) {
+                                o.borrow_mut().clear_readonly_init(&key);
+                            } else {
+                                let inited = o.borrow().is_readonly_init(&key);
+                                let set_vis = prop_info(&self.classes, ocid, &name)
+                                    .and_then(|pi| pi.set_visibility);
+                                if let Some(err) =
+                                    readonly_write_error(&self.classes, cur, decl, &name, inited, set_vis)
+                                {
+                                    let PhpError::Error(m) = err else { return Err(err) };
+                                    return Err(PhpError::Error(
+                                        m.replacen("Cannot modify", "Cannot unset", 1),
+                                    ));
+                                }
+                            }
+                        }
+                        // `unset` deletes the property's typed-reference source:
+                        // a still-live alias becomes an ordinary reference
+                        // (init_handles_ref_source_types).
+                        if !self.typed_refs.is_empty() {
+                            let op_ptr = Rc::as_ptr(o);
+                            let disp = php_types::prop_display_name(&key).to_vec();
+                            self.typed_refs.retain(|t| {
+                                !(std::ptr::eq(t.obj.as_ptr(), op_ptr) && t.prop.as_ref() == &disp[..])
+                            });
+                        }
+                        // A declared TYPED property keeps its `Undef` slot on
+                        // unset (var_dump/reflection still render it
+                        // `uninitialized`, and the lazy/readonly bookkeeping
+                        // sees the slot), but is MARKED explicitly-unset:
+                        // Zend clears the IS_PROP_UNINIT flag, which is what
+                        // lets a later read dispatch `__get` (symfony
+                        // Constraint's lazy groups) while a never-initialized
+                        // read keeps the before-init fatal.
+                        let ob = o.borrow();
+                        let typed = ob.info.type_of(&key).is_some()
+                            || ob.info.type_of(&name).is_some();
+                        drop(ob);
+                        if typed {
+                            let displaced = {
+                                let mut ob = o.borrow_mut();
+                                let d = ob.props.replace(&key, Zval::Undef);
+                                ob.mark_typed_unset(&key);
+                                d
+                            };
+                            // The displaced value is a reference drop (WP-46):
+                            // note it like an assignment's displaced value.
+                            if let Some(d) = displaced {
+                                self.gc_note(&d);
+                            }
+                            continue;
+                        }
+                    }
+                    if let Some(d) = prop_unset(&target, &key) {
+                        self.gc_note(&d);
+                    }
+                }
+                Op::MethodCall { method, argc, ic, deref } => {
+                    // L-MC1b (S-165): fast path borrow-IC k≤2 in forma
+                    // OUTLINE — corpo e ammissione in `methodcall_fast`
+                    // (#[inline(never)]): l'arbitrato
+                    // s165-arbitrato-guardie.md ha mostrato che la variante
+                    // inline (mc1r5) pagava un prezzo di LAYOUT su run_loop
+                    // (missload/arrload persistenti a R=5); qui il loop paga
+                    // solo l'ammissione d'arità e una call. L-MCk (S-166):
+                    // cade il cap argc≤2 — il gate vero (simple_call ad
+                    // arità ESATTA + IC-hit + recv Object) vive già dentro
+                    // `methodcall_fast`; criterio s166-criterio-mck.md.
+                    let n = *argc as usize;
+                    if self.methodcall_fast(top, n, ic, *deref)? {
+                        continue;
+                    }
+                    let args = self.pop_keys(top, *argc); // source order
+                    let recv = self.frames[top].stack.pop().expect("MethodCall receiver");
+                    // V5 (S-119 treno-2): il frame vuole l'handle POSSEDUTO —
+                    // recv lo è già (pop); il clone serve solo a un Ref.
+                    let this = if matches!(recv, Zval::Ref(_)) { recv.deref_clone() } else { recv };
+                    self.method_call(top, this, &method, args, Some(&ic), *deref)?;
+                }
+                Op::ThisMethodCall { method, ic } => {
+                    // Fused zero-argument `$this->m()` (WP-36): the IC hit
+                    // reads the receiver in place and enters the callee like
+                    // the hit inside `dispatch_instance_call`, line for line.
+                    // Skipping the `method_call` shunts on the hit is sound:
+                    // an Object receiver is never a Generator/Closure zval,
+                    // the ArgPlace scan is vacuous at argc 0, and a Fiber
+                    // subclass can never be IN this cache (`method_call`
+                    // diverts Fiber receivers before the fill site, and this
+                    // op is the cell's only writer). Everything else clones
+                    // the receiver once and takes the shared funnel, so the
+                    // fused op stays semantically identical to
+                    // This+MethodCall by construction.
+                    let mut hit = None;
+                    if let Some(Zval::Object(o)) = &self.frames[top].this {
+                        let cid = o.borrow().class_id as usize;
+                        if let Some((defc, midx)) = ic.get(cid) {
+                            hit = Some((defc, midx, cid, Zval::Object(Rc::clone(o))));
+                        }
+                    }
+                    if let Some((defc, midx, cid, this)) = hit {
+                        let callee = &self.classes[defc].methods[midx].func;
+                        let m = self.class_mod(defc);
+                        let mut frame = self.pooled_frame(callee, m);
+                        // Value context by construction: copy a `&m()` return
+                        // via the Ret epilogue (WP-53, replaces `DerefTop`).
+                        if callee.by_ref && !callee.is_generator {
+                            frame.flags.set(FrameFlags::RET_DEREF, true);
+                        }
+                        bind_params(&mut frame, Vec::new());
+                        frame.this = Some(this);
+                        frame.class = Some(defc);
+                        frame.static_class = Some(cid); // LSB = receiver's class
+                        self.enter_callee(frame)?;
+                        continue;
+                    }
+                    let this = match &self.frames[top].this {
+                        Some(t) => t.deref_clone(),
+                        None => {
+                            return Err(PhpError::Error(
+                                "Using $this when not in object context".to_string(),
+                            ))
+                        }
+                    };
+                    self.method_call(top, this, &method, Vec::new(), Some(&ic), true)?;
+                }
+                Op::MethodCallArgs { method, deref } => {
+                    // Spread `$obj->m(...$a)` (Session A): the arguments are the
+                    // values of a runtime array (the receiver sits beneath it);
+                    // string keys bind as named arguments (PHP 8.1).
+                    let argsval = self.frames[top].stack.pop().expect("MethodCallArgs array");
+                    let (args, named) = split_args_from_array_value(argsval);
+                    let recv = self.frames[top].stack.pop().expect("MethodCallArgs receiver");
+                    let this = recv.deref_clone();
+                    if named.is_empty() {
+                        self.method_call(top, this, &method, args, None, *deref)?;
+                    } else {
+                        self.dispatch_instance_call_named(top, this, &method, args, named, *deref)?;
+                    }
+                }
+                Op::MethodCallDynamic { argc } => {
+                    // `$obj->$m(args)`: the method name sits on top, the positional
+                    // args beneath it, the receiver at the bottom (step 51).
+                    let nameval = self.frames[top].stack.pop().expect("MethodCallDynamic name");
+                    let method = convert::to_zstr(&nameval, &mut self.diags).as_bytes().to_vec();
+                    let args = self.pop_keys(top, *argc);
+                    let recv = self.frames[top].stack.pop().expect("MethodCallDynamic receiver");
+                    let this = recv.deref_clone();
+                    // Always value context: `$x =& $o->$m()` is a compile error.
+                    self.method_call(top, this, &method, args, None, true)?;
+                }
+                Op::MethodCallDynamicArgs => {
+                    // Spread `$obj->$m(...$a)`: name on top, args array beneath it;
+                    // string keys bind as named arguments (PHP 8.1).
+                    let nameval = self.frames[top].stack.pop().expect("MethodCallDynamicArgs name");
+                    let method = convert::to_zstr(&nameval, &mut self.diags).as_bytes().to_vec();
+                    let argsval = self.frames[top].stack.pop().expect("MethodCallDynamicArgs array");
+                    let (args, named) = split_args_from_array_value(argsval);
+                    let recv = self.frames[top].stack.pop().expect("MethodCallDynamicArgs receiver");
+                    let this = recv.deref_clone();
+                    // Always value context (see `MethodCallDynamic`).
+                    if named.is_empty() {
+                        self.method_call(top, this, &method, args, None, true)?;
+                    } else {
+                        self.dispatch_instance_call_named(top, this, &method, args, named, true)?;
+                    }
+                }
+                Op::MethodCallNamed { method, positional, names, deref } => {
+                    // Named `$obj->m(p…, n: v, …)` (Session A): pop the named values
+                    // (source order), then the positional values, then the receiver.
+                    let named_vals = self.pop_keys(top, names.len() as u32);
+                    let named: Vec<(Box<[u8]>, Zval)> =
+                        names.iter().cloned().zip(named_vals).collect();
+                    let pos = self.pop_keys(top, *positional);
+                    let recv = self.frames[top].stack.pop().expect("MethodCallNamed receiver");
+                    let this = recv.deref_clone();
+                    self.dispatch_instance_call_named(top, this, &method, pos, named, *deref)?;
+                }
+                Op::InvokeMethod { class, method_idx, argc } => {
+                    let class = self.rb(*class);
+                    let args = self.pop_keys(top, *argc);
+                    let recv = self.frames[top].stack.pop().expect("InvokeMethod receiver");
+                    let this = recv.deref_clone();
+                    let lsb = object_class_id(&this).unwrap_or(class);
+                    let callee = &self.classes[class].methods[*method_idx as usize].func;
+                    let m = self.class_mod(class);
+                    let mut frame = self.pooled_frame(callee, m);
+                    bind_params(&mut frame, args);
+                    frame.this = Some(this);
+                    frame.class = Some(class);
+                    frame.static_class = Some(lsb);
+                    self.enter_callee(frame)?;
+                }
+                Op::InstanceOf { class } => {
+                    let class = &self.rb(*class);
+                    let v = self.frames[top].stack.pop().expect("InstanceOf operand");
+                    let result = match v.deref_clone() {
+                        Zval::Object(o) => {
+                            self.instance_of(o.borrow().class_id as usize, *class)
+                        }
+                        // A generator has no ClassId but is-a Iterator/Traversable
+                        // (now real prelude interfaces); nothing else among the
+                        // value types satisfies these.
+                        Zval::Generator(_) => {
+                            let n = &self.classes[*class].name;
+                            n.eq_ignore_ascii_case(b"Iterator")
+                                || n.eq_ignore_ascii_case(b"Traversable")
+                        }
+                        _ => false,
+                    };
+                    self.frames[top].stack.push(Zval::Bool(result));
+                }
+                Op::InstanceOfStatic => {
+                    let v = self.frames[top].stack.pop().expect("InstanceOfStatic operand");
+                    let target = self.frames[top].static_class.ok_or_else(|| {
+                        PhpError::Error("Cannot use \"static\" in the global scope".to_string())
+                    })?;
+                    let result = match v.deref_clone() {
+                        Zval::Object(o) => {
+                            self.instance_of(o.borrow().class_id as usize, target)
+                        }
+                        _ => false,
+                    };
+                    self.frames[top].stack.push(Zval::Bool(result));
+                }
+                Op::InstanceOfDynamic => {
+                    // `$x instanceof $cls` (PAR): an unknown class name (or a
+                    // non-object operand) yields false — PHP does not error here.
+                    let classval = self.frames[top].stack.pop().expect("InstanceOfDynamic class");
+                    let operand = self.frames[top].stack.pop().expect("InstanceOfDynamic operand");
+                    let result = match (object_class_id(&operand), self.class_id_from_value(&classval))
+                    {
+                        (Some(ocid), Some(tcid)) => self.instance_of(ocid, tcid),
+                        // `Closure`/`Generator` have no `ClassId`; match by the
+                        // operand's value type against the (string) class name
+                        // (`$c instanceof Closure`, `$g instanceof Iterator`).
+                        _ => match classval.deref_clone() {
+                            Zval::Str(s) => {
+                                let raw = s.as_bytes();
+                                let lc = raw.strip_prefix(b"\\").unwrap_or(raw).to_ascii_lowercase();
+                                match operand.deref_clone() {
+                                    Zval::Closure(_) => lc == b"closure",
+                                    Zval::Generator(_) => {
+                                        matches!(&lc[..], b"generator" | b"iterator" | b"traversable")
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            _ => false,
+                        },
+                    };
+                    self.frames[top].stack.push(Zval::Bool(result));
+                }
+                Op::InstanceOfBuiltin(_iface) => {
+                    // Generator/Iterator/Traversable have no ClassId; a generator
+                    // value satisfies all three, nothing else among the value
+                    // types does (objects against these names already test false).
+                    let v = self.frames[top].stack.pop().expect("InstanceOfBuiltin operand");
+                    let result = matches!(v.deref_clone(), Zval::Generator(_));
+                    self.frames[top].stack.push(Zval::Bool(result));
+                }
+                Op::StaticCall { target, method, forwarding, argc, ic } => {
+                    let mut args = self.pop_keys(top, *argc);
+                    let start = self.target_class_id(*target, top)?;
+                    // `Fiber::suspend` / `Fiber::getCurrent` are native static
+                    // dispatch (GEN-4), handled before normal method resolution.
+                    if self.fiber_class_id == Some(start) {
+                        if method.eq_ignore_ascii_case(b"suspend") {
+                            let (id, baseline) = match self.fiber_stack.last() {
+                                Some(c) => (c.id, c.baseline),
+                                None => {
+                                    return Err(PhpError::Error(
+                                        "Cannot suspend outside of a fiber".to_string(),
+                                    ))
+                                }
+                            };
+                            // Decay a reference pushed by a dynamic call (SEND_VAR_EX);
+                            // a deferred place argument reads by value (native callee).
+                            if args.iter().any(|a| matches!(a, Zval::ArgPlace(_))) {
+                                self.materialize_arg_places(top, &mut args, None)?;
+                            }
+                            let value = args.into_iter().next().map(decay_arg).unwrap_or(Zval::Null);
+                            // Park the whole fiber segment; it is restored by resume.
+                            let parked = self.frames.split_off(baseline);
+                            self.fibers.get_mut(&id).expect("running fiber state").parked = parked;
+                            return Ok(RunExit::Suspended { value });
+                        }
+                        if method.eq_ignore_ascii_case(b"getcurrent") {
+                            let cur = self
+                                .fiber_stack
+                                .last()
+                                .map(|c| c.obj.clone())
+                                .unwrap_or(Zval::Null);
+                            self.frames[top].stack.push(cur);
+                            continue;
+                        }
+                    }
+                    self.dispatch_static_call(top, start, &method, *forwarding, args, Vec::new(), Some(&ic))?;
+                }
+                Op::HookCall { target, prop, set, argc } => {
+                    // PHP 8.4 `parent::$prop::get()` / `parent::$prop::set($v)`.
+                    let args = self.pop_keys(top, *argc);
+                    let recv = self.frames[top].this.clone().ok_or_else(|| {
+                        PhpError::Error(format!(
+                            "Cannot call ::${}::{} outside object context",
+                            String::from_utf8_lossy(&prop),
+                            if *set { "set" } else { "get" },
+                        ))
+                    })?;
+                    let oid = object_id(&recv);
+                    let start = self.target_class_id(*target, top)?;
+                    // A user `get`/`set` hook on the named class runs as a frame.
+                    // Extra arguments are ignored — it is an ordinary user function.
+                    if let Some(func) = self.prop_hook(start, &prop, *set) {
+                        let set_value =
+                            if *set { Some(args.into_iter().next().unwrap_or(Zval::Null)) } else { None };
+                        if *set {
+                            // A user set hook discards its body return; the call yields NULL.
+                            self.frames[top].stack.push(Zval::Null);
+                        }
+                        self.push_parent_hook(func, recv, oid, &prop, start, set_value);
+                        continue;
+                    }
+                    // No user hook: the *implicit* hook reaches the backing store
+                    // directly. The property must be declared on the named class.
+                    if prop_info(&self.classes, start, &prop).is_none() {
+                        return Err(PhpError::Error(format!(
+                            "Undefined property {}::${}",
+                            String::from_utf8_lossy(&self.classes[start].name),
+                            String::from_utf8_lossy(&prop),
+                        )));
+                    }
+                    // The implicit hook is an internal function with fixed arity.
+                    let expected = if *set { 1usize } else { 0 };
+                    if args.len() != expected {
+                        return Err(PhpError::Error(format!(
+                            "{}::${}::{}() expects exactly {} argument{}, {} given",
+                            String::from_utf8_lossy(&self.classes[start].name),
+                            String::from_utf8_lossy(&prop),
+                            if *set { "set" } else { "get" },
+                            expected,
+                            if expected == 1 { "" } else { "s" },
+                            args.len(),
+                        )));
+                    }
+                    let ocid = object_class_id(&recv).unwrap_or(start);
+                    let key = self.prop_storage_key(ocid, &prop, Some(start));
+                    if *set {
+                        let v = args.into_iter().next().unwrap_or(Zval::Null);
+                        write_property(&recv, &key, v.clone())?;
+                        self.frames[top].stack.push(v);
+                    } else {
+                        if let Zval::Object(o) = &recv {
+                            if let Some(err) = self.uninit_typed_read(o, &key, &prop) {
+                                return Err(err);
+                            }
+                        }
+                        let before_diags = self.diags.len();
+                        let v = read_property(&recv, &key, &mut self.diags);
+                        let read_line = self.cur_line(top);
+                        self.mark_pending_diag_lines(before_diags, read_line);
+                        self.frames[top].stack.push(v);
+                    }
+                }
+                Op::ClosureStatic { method, argc } => {
+                    // `Closure::bind(...)` / `Closure::fromCallable(...)` (step 19-6).
+                    let args = self.pop_keys(top, *argc); // source order
+                    let result = self.closure_static_method(&method, args)?;
+                    self.frames[top].stack.push(result);
+                }
+                Op::StaticCallArgs { target, method, forwarding } => {
+                    // Spread / named `C::m(...$a)` / `C::m(name: …)`: args from a
+                    // runtime array — integer keys positional, string keys named.
+                    let argsval = self.frames[top].stack.pop().expect("StaticCallArgs array");
+                    let (args, named) = split_args_from_array_value(argsval);
+                    let start = self.target_class_id(*target, top)?;
+                    self.dispatch_static_call(top, start, &method, *forwarding, args, named, None)?;
+                }
+                Op::StaticCallDynamic { method, argc } => {
+                    // `$cls::m()` (PAR): args are on top, the class reference beneath.
+                    let args = self.pop_keys(top, *argc);
+                    let classval =
+                        self.frames[top].stack.pop().expect("StaticCallDynamic class");
+                    let start = self.resolve_dynamic_class(&classval)?;
+                    // A dynamic class is non-forwarding, like a named class.
+                    self.dispatch_static_call(top, start, &method, false, args, Vec::new(), None)?;
+                }
+                Op::StaticCallDynamicArgs { method } => {
+                    // Spread `$cls::m(...$a)` (Session A): args array on top, the
+                    // class reference beneath; string keys bind as named (PHP 8.1).
+                    let argsval = self.frames[top].stack.pop().expect("StaticCallDynamicArgs array");
+                    let (args, named) = split_args_from_array_value(argsval);
+                    let classval =
+                        self.frames[top].stack.pop().expect("StaticCallDynamicArgs class");
+                    let start = self.resolve_dynamic_class(&classval)?;
+                    self.dispatch_static_call(top, start, &method, false, args, named, None)?;
+                }
+                Op::StaticCallDynamicMethod { argc } => {
+                    // `$cls::$m()`: method name on top, then args, then the class ref.
+                    let mval = self.frames[top].stack.pop().expect("StaticCallDynamicMethod name");
+                    let args = self.pop_keys(top, *argc);
+                    let classval =
+                        self.frames[top].stack.pop().expect("StaticCallDynamicMethod class");
+                    // PHP validates the class before the method name: `$a::$b()` with
+                    // both invalid reports the class error first.
+                    let start = self.resolve_dynamic_class(&classval)?;
+                    let method = dyn_method_name(&mval)?;
+                    // A dynamic class is non-forwarding, like a named static call.
+                    self.dispatch_static_call(top, start, &method, false, args, Vec::new(), None)?;
+                }
+                Op::StaticCallDynamicMethodArgs => {
+                    // `$cls::$m(...)` with named/spread args: method name on top,
+                    // args array beneath (string keys = named), class ref below.
+                    let mval =
+                        self.frames[top].stack.pop().expect("StaticCallDynamicMethodArgs name");
+                    let argsval =
+                        self.frames[top].stack.pop().expect("StaticCallDynamicMethodArgs array");
+                    let (args, named) = split_args_from_array_value(argsval);
+                    let classval =
+                        self.frames[top].stack.pop().expect("StaticCallDynamicMethodArgs class");
+                    // PHP validates the class before the method name.
+                    let start = self.resolve_dynamic_class(&classval)?;
+                    let method = dyn_method_name(&mval)?;
+                    self.dispatch_static_call(top, start, &method, false, args, named, None)?;
+                }
+                Op::StaticCallTargetDynamicMethodArgs { target, forwarding } => {
+                    // `self::$m(...)` / `Class::$m(...)` with named/spread args.
+                    let mval = self.frames[top]
+                        .stack
+                        .pop()
+                        .expect("StaticCallTargetDynamicMethodArgs name");
+                    let method = dyn_method_name(&mval)?;
+                    let argsval = self.frames[top]
+                        .stack
+                        .pop()
+                        .expect("StaticCallTargetDynamicMethodArgs array");
+                    let (args, named) = split_args_from_array_value(argsval);
+                    let start = self.target_class_id(*target, top)?;
+                    self.dispatch_static_call(top, start, &method, *forwarding, args, named, None)?;
+                }
+                Op::StaticCallTargetDynamicMethod { target, forwarding, argc } => {
+                    // `self::$m()` / `Class::$m()`: method name on top, then args; the
+                    // class is a compile-time target, forwarding preserved.
+                    let mval = self.frames[top]
+                        .stack
+                        .pop()
+                        .expect("StaticCallTargetDynamicMethod name");
+                    let method = dyn_method_name(&mval)?;
+                    let args = self.pop_keys(top, *argc);
+                    let start = self.target_class_id(*target, top)?;
+                    self.dispatch_static_call(top, start, &method, *forwarding, args, Vec::new(), None)?;
+                }
+                Op::ClassConstDynamic => {
+                    // `C::{$expr}`: class beneath, runtime constant name on top.
+                    let nv = self.frames[top].stack.pop().expect("ClassConstDynamic name");
+                    let name = convert::to_zstr_cast(&nv, &mut self.diags).as_bytes().to_vec();
+                    let classval =
+                        self.frames[top].stack.pop().expect("ClassConstDynamic class");
+                    let cid = self.resolve_dynamic_class(&classval)?;
+                    // NB: the magic `::class` is compile-time only — a dynamic
+                    // `C::{'class'}` is an Undefined constant in PHP.
+                    if let Some((decl, idx)) = find_const_runtime(&self.classes, cid, &name) {
+                        let thunk: &'m Func = &self.classes[decl].consts[idx].func;
+                        let v = self.run_value_thunk(thunk, Some(decl))?;
+                        self.frames[top].stack.push(v);
+                    } else if let Some(ci) = self.enum_case_idx(cid, &name) {
+                        let case = self.enum_case(cid, ci as u32);
+                        self.frames[top].stack.push(Zval::Object(case));
+                    } else {
+                        return Err(PhpError::Error(format!(
+                            "Undefined constant {}::{}",
+                            String::from_utf8_lossy(&self.classes[cid].name),
+                            String::from_utf8_lossy(&name)
+                        )));
+                    }
+                }
+                Op::ClassConst { class, idx } => {
+                    let class = &self.rb(*class);
+                    // Run the constant's value thunk as a frame in its declaring
+                    // class's context; its `Ret` leaves the value on the caller's
+                    // stack.
+                    if self.classes[*class].consts.get(*idx as usize).is_none() {
+                        return Err(PhpError::Error(format!(
+                            "VM: ClassConst out of range: {}::consts[{}] (len {}) in {} ({}) line {}",
+                            String::from_utf8_lossy(&self.classes[*class].name),
+                            idx,
+                            self.classes[*class].consts.len(),
+                            String::from_utf8_lossy(&self.frames[top].func.name),
+                            String::from_utf8_lossy(&self.frames[top].func.file),
+                            self.cur_line(top)
+                        )));
+                    }
+                    let thunk = &self.classes[*class].consts[*idx as usize].func;
+                    let mut frame = Frame::new(thunk, self.class_mod(*class));
+                    frame.class = Some(*class);
+                    frame.static_class = Some(*class);
+                    self.frames.push(frame);
+                }
+                Op::ClassConstDyn { name } => {
+                    let start = self.frames[top].static_class.ok_or_else(|| {
+                        PhpError::Error("Cannot use \"static\" in the global scope".to_string())
+                    })?;
+                    let Some((decl, idx)) = find_const_runtime(&self.classes, start, &name) else {
+                        // An enum case is not a `consts` thunk: materialize its
+                        // interned singleton (the runtime mirror of Op::EnumCase).
+                        if let Some(ci) = self.classes[start]
+                            .enum_cases
+                            .iter()
+                            .position(|c| c.name.as_ref() == name.as_ref())
+                        {
+                            let obj = self.enum_case(start, ci as u32);
+                            self.frames[top].stack.push(Zval::Object(obj));
+                            continue;
+                        }
+                        return Err(PhpError::Error(format!(
+                            "Undefined constant {}::{}",
+                            String::from_utf8_lossy(&self.classes[start].name),
+                            String::from_utf8_lossy(&name)
+                        )));
+                    };
+                    let thunk = &self.classes[decl].consts[idx].func;
+                    let mut frame = Frame::new(thunk, self.class_mod(decl));
+                    frame.class = Some(decl);
+                    frame.static_class = Some(decl);
+                    self.frames.push(frame);
+                }
+                Op::ClassConstFromValue { name } => {
+                    let classval =
+                        self.frames[top].stack.pop().expect("ClassConstFromValue class");
+                    if name.eq_ignore_ascii_case(b"class") {
+                        // `$x::class`: an object yields its class name; a string (or
+                        // any non-object) is a TypeError in PHP 8.
+                        match classval.deref_clone() {
+                            Zval::Object(o) => {
+                                let cls = self.classes[o.borrow().class_id as usize].name.to_vec();
+                                self.frames[top].stack.push(Zval::Str(PhpStr::new(cls)));
+                            }
+                            // Engine objects held as dedicated variants still
+                            // answer `$v::class` with their class name.
+                            Zval::Closure(_) => {
+                                self.frames[top].stack.push(Zval::Str(PhpStr::new(b"Closure".to_vec())));
+                            }
+                            Zval::Generator(_) => {
+                                self.frames[top]
+                                    .stack
+                                    .push(Zval::Str(PhpStr::new(b"Generator".to_vec())));
+                            }
+                            other => {
+                                return Err(PhpError::TypeError(format!(
+                                    "Cannot use \"::class\" on {}",
+                                    other.type_name_for_error()
+                                )))
+                            }
+                        }
+                    } else {
+                        let cid = self.resolve_dynamic_class(&classval)?;
+                        let Some((decl, idx)) = find_const_runtime(&self.classes, cid, &name) else {
+                            // An enum case is not a `consts` thunk: materialize its
+                            // interned singleton (the runtime mirror of Op::EnumCase).
+                            if let Some(ci) = self.classes[cid]
+                                .enum_cases
+                                .iter()
+                                .position(|c| c.name.as_ref() == name.as_ref())
+                            {
+                                let obj = self.enum_case(cid, ci as u32);
+                                self.frames[top].stack.push(Zval::Object(obj));
+                                continue;
+                            }
+                            return Err(PhpError::Error(format!(
+                                "Undefined constant {}::{}",
+                                String::from_utf8_lossy(&self.classes[cid].name),
+                                String::from_utf8_lossy(&name)
+                            )));
+                        };
+                        let thunk = &self.classes[decl].consts[idx].func;
+                        let mut frame = Frame::new(thunk, self.class_mod(decl));
+                        frame.class = Some(decl);
+                        frame.static_class = Some(decl);
+                        self.frames.push(frame);
+                    }
+                }
+                Op::ClassNameStatic => {
+                    let start = self.frames[top].static_class.ok_or_else(|| {
+                        PhpError::Error("Cannot use \"static\" in the global scope".to_string())
+                    })?;
+                    let name = self.classes[start].name.to_vec();
+                    self.frames[top].stack.push(Zval::Str(PhpStr::new(name)));
+                }
+                Op::ClassNameScope { parent } => {
+                    // `self::class` / `parent::class` in a closure body: the scope
+                    // class follows any `Closure::bind` rebinding.
+                    let target =
+                        if *parent { ClassTarget::ParentScope } else { ClassTarget::SelfScope };
+                    let cid = self.target_class_id(target, top)?;
+                    let name = self.classes[cid].name.to_vec();
+                    self.frames[top].stack.push(Zval::Str(PhpStr::new(name)));
+                }
+                Op::EnumCase { class, case } => {
+                    let class = &self.rb(*class);
+                    let obj = self.enum_case(*class, *case);
+                    self.frames[top].stack.push(Zval::Object(obj));
+                }
+                Op::InvokeCtor { argc } => {
+                    let mut args = self.pop_keys(top, *argc);
+                    let recv = self.frames[top].stack.pop().expect("InvokeCtor receiver");
+                    let this = recv.deref_clone();
+                    let cid = object_class_id(&this).expect("InvokeCtor on a non-object");
+                    match resolve_method_runtime(&self.classes, cid, b"__construct") {
+                        Some((defc, midx)) => {
+                            // Deferred place arguments (SEND_VAR_EX) resolve against
+                            // the now-known constructor's by-ref mask.
+                            if args.iter().any(|a| matches!(a, Zval::ArgPlace(_))) {
+                                let cls = self.classes[defc];
+                                let ctor = &cls.methods[midx].func;
+                                self.materialize_arg_places(top, &mut args, Some(ctor))?;
+                                let line = self.cur_line(top);
+                                self.flush_diags(line)?;
+                            }
+                            let callee = &self.classes[defc].methods[midx].func;
+                            let mut frame = Frame::new(callee, self.class_mod(defc));
+                            bind_params(&mut frame, args);
+                            frame.this = Some(this);
+                            frame.class = Some(defc);
+                            frame.static_class = Some(cid);
+                            // Coerce the arguments against the constructor's declared
+                            // parameter types using the CALL SITE's strict mode, like
+                            // `InvokeMethod` — a `new $cls(...)` (dynamic class) must
+                            // weak-coerce just as `new C(...)` does (ORM hydrators
+                            // instantiate DTOs dynamically: NewOperatorTest).
+                            self.enter_callee(frame)?;
+                        }
+                        // No constructor: leave NULL so the surrounding `Pop` keeps
+                        // the operand stack balanced (the instance is kept by `Dup`).
+                        None => self.frames[top].stack.push(Zval::Null),
+                    }
+                }
+                Op::InvokeCtorArgs => {
+                    // Spread / named `new C(...$a)` / `new C(name: …)` of a class (or
+                    // constructor) resolved only at run time: arguments come from a
+                    // runtime array — integer keys positional, string keys **named**
+                    // (a spread of a string-keyed array binds by name too, PHP 8.1).
+                    let argsval = self.frames[top].stack.pop().expect("InvokeCtorArgs array");
+                    let (args, named) = split_args_from_array_value(argsval);
+                    let recv = self.frames[top].stack.pop().expect("InvokeCtorArgs receiver");
+                    let this = recv.deref_clone();
+                    let cid = object_class_id(&this).expect("InvokeCtorArgs on a non-object");
+                    match resolve_method_runtime(&self.classes, cid, b"__construct") {
+                        Some((defc, midx)) => {
+                            let callee = &self.classes[defc].methods[midx].func;
+                            let mut frame = if named.is_empty() {
+                                let mut frame = Frame::new(callee, self.class_mod(defc));
+                                bind_params(&mut frame, args);
+                                frame
+                            } else {
+                                let qn = format!(
+                                    "{}::__construct",
+                                    String::from_utf8_lossy(&self.classes[defc].name)
+                                );
+                                build_named_frame(callee, self.class_mod(defc), &qn, args, named)?
+                            };
+                            frame.this = Some(this);
+                            frame.class = Some(defc);
+                            frame.static_class = Some(cid);
+                            // Coerce arguments with the call site's strict mode (see
+                            // Op::InvokeCtor); the dynamic ctor path bypassed this.
+                            self.enter_callee(frame)?;
+                        }
+                        // A named argument has no constructor to bind against: the
+                        // catchable "Unknown named parameter" (positional arguments
+                        // to a ctor-less class are silently discarded, as in PHP).
+                        None if !named.is_empty() => return Err(unknown_named_param(&named)),
+                        None => self.frames[top].stack.push(Zval::Null),
+                    }
+                }
+                Op::InitProps => {
+                    let recv = self.frames[top].stack.pop().expect("InitProps receiver");
+                    let cid = object_class_id(&recv).expect("InitProps on a non-object");
+                    // L-OL1-F1 «stampo»: a complete template already seeded the
+                    // evaluated defaults at alloc — skip the thunk entirely.
+                    match &self.classes[cid].prop_init {
+                        Some(_) if self.classes[cid].props_template.0.get().is_some() => {
+                            self.frames[top].stack.push(Zval::Null)
+                        }
+                        Some(func) => {
+                            let mut frame = Frame::new(func, self.class_mod(cid));
+                            frame.this = Some(recv.deref_clone());
+                            frame.class = Some(cid);
+                            frame.static_class = Some(cid);
+                            frame.flags.set(FrameFlags::INIT_PROPS, true); // privileged default writes
+                            self.frames.push(frame);
+                        }
+                        // No non-constant defaults: nothing to do, balance the stack.
+                        None => self.frames[top].stack.push(Zval::Null),
+                    }
+                }
+                Op::StaticPropGet { target, name } => {
+                    let cell = match self.ensure_static(*target, &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue, // init thunk scheduled; re-run after it
+                    };
+                    let v = cell.borrow().deref_clone();
+                    self.frames[top].stack.push(v);
+                }
+                Op::StaticPropSet { target, name } => {
+                    let cell = match self.ensure_static(*target, &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let value = self.frames[top].stack.pop().expect("StaticPropSet value");
+                    *cell.borrow_mut() = value.clone();
+                    self.frames[top].stack.push(value);
+                }
+                Op::StaticPropRef { target, name } => {
+                    // `$x = &Class::$sp`: the property's storage cell itself,
+                    // wrapped as a reference value — the alias is live both ways.
+                    let cell = match self.ensure_static(*target, &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    self.frames[top].stack.push(Zval::Ref(cell));
+                }
+                Op::StaticPropOpSet { target, name, op } => {
+                    let cell = match self.ensure_static(*target, &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let rhs = self.frames[top].stack.pop().expect("StaticPropOpSet rhs");
+                    let old = cell.borrow().deref_clone();
+                    #[cfg(feature = "op-census")]
+                    if matches!(*op, crate::hir::BinOp::Concat) {
+                        crate::vm::census::census_concat_site(2, &old, &rhs);
+                    }
+                    let result = self.apply_binop_ovl(*op, &old, &rhs)?;
+                    *cell.borrow_mut() = result.clone();
+                    self.frames[top].stack.push(result);
+                }
+                Op::StaticPropIncDec { target, name, inc, pre } => {
+                    let cell = match self.ensure_static(*target, &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let old = cell.borrow().deref_clone();
+                    let mut newv = old.clone();
+                    if *inc {
+                        ops::increment(&mut newv, &mut self.diags)?;
+                    } else {
+                        ops::decrement(&mut newv, &mut self.diags)?;
+                    }
+                    *cell.borrow_mut() = newv.clone();
+                    self.frames[top].stack.push(if *pre { newv } else { old });
+                }
+                Op::StaticPropGetDynName => {
+                    // [classRef, name]: peek both so a scheduled init thunk can
+                    // re-run this op with its operands intact (PAR).
+                    let n = self.frames[top].stack.len();
+                    let nameval = self.frames[top].stack[n - 1].clone();
+                    let name: Box<[u8]> =
+                        convert::to_zstr_cast(&nameval, &mut self.diags).as_bytes().to_vec().into();
+                    let classval = self.frames[top].stack[n - 2].clone();
+                    let cid = self.resolve_dynamic_class(&classval)?;
+                    let cell = match self.ensure_static(ClassTarget::Class(cid), &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    self.frames[top].stack.pop(); // name
+                    self.frames[top].stack.pop(); // class
+                    let v = cell.borrow().deref_clone();
+                    self.frames[top].stack.push(v);
+                }
+                Op::StaticPropSetDynName => {
+                    let n = self.frames[top].stack.len();
+                    let nameval = self.frames[top].stack[n - 1].clone();
+                    let name: Box<[u8]> =
+                        convert::to_zstr_cast(&nameval, &mut self.diags).as_bytes().to_vec().into();
+                    let classval = self.frames[top].stack[n - 2].clone();
+                    let cid = self.resolve_dynamic_class(&classval)?;
+                    let cell = match self.ensure_static(ClassTarget::Class(cid), &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    self.frames[top].stack.pop(); // name
+                    self.frames[top].stack.pop(); // class
+                    let value = self.frames[top].stack.pop().expect("StaticPropSetDynName value");
+                    *cell.borrow_mut() = value.clone();
+                    self.frames[top].stack.push(value);
+                }
+                Op::StaticPropGetDynamic { name } => {
+                    // The class reference is on top; peek it so a scheduled init
+                    // thunk can re-run this op without losing it (PAR).
+                    let classval = self.frames[top].stack.last().expect("class ref").clone();
+                    let cid = self.resolve_dynamic_class(&classval)?;
+                    let cell = match self.ensure_static(ClassTarget::Class(cid), &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    self.frames[top].stack.pop(); // remove the class reference
+                    let v = cell.borrow().deref_clone();
+                    self.frames[top].stack.push(v);
+                }
+                Op::StaticPropSetDynamic { name } => {
+                    let classval = self.frames[top].stack.last().expect("class ref").clone();
+                    let cid = self.resolve_dynamic_class(&classval)?;
+                    let cell = match self.ensure_static(ClassTarget::Class(cid), &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    self.frames[top].stack.pop(); // class
+                    let value = self.frames[top].stack.pop().expect("StaticPropSetDynamic value");
+                    *cell.borrow_mut() = value.clone();
+                    self.frames[top].stack.push(value);
+                }
+                Op::StaticPropOpSetDynamic { name, op } => {
+                    let classval = self.frames[top].stack.last().expect("class ref").clone();
+                    let cid = self.resolve_dynamic_class(&classval)?;
+                    let cell = match self.ensure_static(ClassTarget::Class(cid), &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    self.frames[top].stack.pop(); // class
+                    let rhs = self.frames[top].stack.pop().expect("StaticPropOpSetDynamic rhs");
+                    let old = cell.borrow().deref_clone();
+                    #[cfg(feature = "op-census")]
+                    if matches!(*op, crate::hir::BinOp::Concat) {
+                        crate::vm::census::census_concat_site(3, &old, &rhs);
+                    }
+                    let result = self.apply_binop_ovl(*op, &old, &rhs)?;
+                    *cell.borrow_mut() = result.clone();
+                    self.frames[top].stack.push(result);
+                }
+                Op::StaticPropIncDecDynamic { name, inc, pre } => {
+                    // `$cls::$p++` (PAR): peek the class ref so a scheduled init
+                    // thunk can re-run this op; pop it once the cell is ready.
+                    let classval = self.frames[top].stack.last().expect("class ref").clone();
+                    let cid = self.resolve_dynamic_class(&classval)?;
+                    let cell = match self.ensure_static(ClassTarget::Class(cid), &name, top, ip)? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    self.frames[top].stack.pop(); // class
+                    let old = cell.borrow().deref_clone();
+                    let mut newv = old.clone();
+                    if *inc {
+                        ops::increment(&mut newv, &mut self.diags)?;
+                    } else {
+                        ops::decrement(&mut newv, &mut self.diags)?;
+                    }
+                    *cell.borrow_mut() = newv.clone();
+                    self.frames[top].stack.push(if *pre { newv } else { old });
+                }
+                Op::FieldAssign { base, steps, ic } => {
+                    let value = self.frames[top].stack.pop().expect("FieldAssign value");
+                    let keys = self.pop_field_keys(top, &steps);
+                    // S-136 FD1 (criterio s136-criterio-dimwrite.md): fast
+                    // path dim-write su prop al hit IC; MISS restituisce
+                    // keys+value al cammino pieno INVARIATO.
+                    let keys = match self.field_assign_fast(*base, top, &steps, keys, value.clone(), ic)? {
+                        None => {
+                            self.frames[top].stack.push(value);
+                            continue;
+                        }
+                        Some((keys, _)) => keys,
+                    };
+                    // L-OL1-F4 (S-129): su base-oggetto piana di classe senza
+                    // hook il trio byref/indirect/lazy è no-op per costruzione.
+                    if self.field_prelude_skip(*base, top, &steps) {
+                        self.field_set(*base, top, &steps, keys, value.clone())?;
+                        // FD1 fill: solo dal ramo F4 a esito Ok (fatti provati).
+                        self.field_assign_fill(*base, top, &steps, ic);
+                        self.frames[top].stack.push(value);
+                        continue;
+                    }
+                    // A path starting at a `&get` hooked property writes through
+                    // the reference the hook returns (one hook run, no set hook).
+                    if let Some(root) = self.byref_hook_root(*base, top, &steps)? {
+                        self.field_set_in_root(root, top, &steps[1..], keys, value.clone(), false, false)?;
+                        self.frames[top].stack.push(value);
+                        continue;
+                    }
+                    self.reject_indirect_hook(*base, top, &steps)?;
+                    // A lazy base initializes/forwards first; the walk then roots
+                    // at the realized object (PHP 8.4).
+                    if let Some(root) = self.field_lazy_root(*base, top, &steps, &keys, true)? {
+                        self.field_set_in_root(php_types::zcell_prop(root), top, &steps, keys, value.clone(), false, false)?;
+                        self.frames[top].stack.push(value);
+                        continue;
+                    }
+                    self.field_set(*base, top, &steps, keys, value.clone())?;
+                    self.frames[top].stack.push(value);
+                }
+                Op::FieldAssignOp { base, steps, op, ic } => {
+                    let rhs = self.frames[top].stack.pop().expect("FieldAssignOp rhs");
+                    let keys = self.pop_field_keys(top, &steps);
+                    // S-138 FD1-ext RMW (criterio s138-criterio-rmw.md): fast
+                    // path a IC-hit; MISS restituisce keys al pieno INVARIATO.
+                    let keys = match self.field_rmw_fast(
+                        *base, top, &steps, keys, RmwArg::Bin(*op, &rhs), ic,
+                    )? {
+                        RmwFastOut::Hit(push) => {
+                            #[cfg(feature = "ic-stats")]
+                            crate::vm::census::ic_stats::HIT_ASSIGNOP
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.frames[top].stack.push(push);
+                            continue;
+                        }
+                        RmwFastOut::Miss(keys) => keys,
+                    };
+                    if let Some(root) = self.byref_hook_root(*base, top, &steps)? {
+                        let old = {
+                            let fs = FieldScope { classes: &self.classes, scope: self.frames[top].class };
+                            field_get(&Zval::Ref(Rc::clone(&root)), &steps[1..], &mut keys.clone().into_iter(), fs)
+                                .unwrap_or(Zval::Null)
+                        };
+                        #[cfg(feature = "op-census")]
+                        if matches!(*op, crate::hir::BinOp::Concat) {
+                            crate::vm::census::census_concat_site(4, &old, &rhs);
+                        }
+                        let result = self.apply_binop_ovl(*op, &old, &rhs)?;
+                        self.field_set_in_root(root, top, &steps[1..], keys, result.clone(), false, true)?;
+                        self.frames[top].stack.push(result);
+                        continue;
+                    }
+                    self.reject_indirect_hook(*base, top, &steps)?;
+                    if let Some(root) = self.field_lazy_root(*base, top, &steps, &keys, true)? {
+                        let old = {
+                            let fs = FieldScope { classes: &self.classes, scope: self.frames[top].class };
+                            field_get(&root, &steps, &mut keys.clone().into_iter(), fs).unwrap_or(Zval::Null)
+                        };
+                        #[cfg(feature = "op-census")]
+                        if matches!(*op, crate::hir::BinOp::Concat) {
+                            crate::vm::census::census_concat_site(4, &old, &rhs);
+                        }
+                        let result = self.apply_binop_ovl(*op, &old, &rhs)?;
+                        self.field_set_in_root(php_types::zcell_prop(root), top, &steps, keys, result.clone(), false, true)?;
+                        self.frames[top].stack.push(result);
+                        continue;
+                    }
+                    let old = self.field_value(*base, top, &steps, keys.clone()).unwrap_or(Zval::Null);
+                    #[cfg(feature = "op-census")]
+                    if matches!(*op, crate::hir::BinOp::Concat) {
+                        crate::vm::census::census_concat_site(4, &old, &rhs);
+                    }
+                    let result = self.apply_binop_ovl(*op, &old, &rhs)?;
+                    self.field_set_op(*base, top, &steps, keys, result.clone())?;
+                    // FD1-ext fill: ramo piano a esito Ok, stessi fatti F4.
+                    if self.field_prelude_skip(*base, top, &steps) {
+                        self.field_assign_fill(*base, top, &steps, ic);
+                        #[cfg(feature = "ic-stats")]
+                        crate::vm::census::ic_stats::FILL_ASSIGNOP
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.frames[top].stack.push(result);
+                }
+                Op::FieldIncDec { base, steps, inc, pre, ic } => {
+                    let keys = self.pop_field_keys(top, &steps);
+                    // S-138 FD1-ext RMW: fast path a IC-hit (come FieldAssignOp).
+                    let keys = match self.field_rmw_fast(
+                        *base, top, &steps, keys, RmwArg::IncDec { inc: *inc, pre: *pre }, ic,
+                    )? {
+                        RmwFastOut::Hit(push) => {
+                            #[cfg(feature = "ic-stats")]
+                            crate::vm::census::ic_stats::HIT_INCDEC
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.frames[top].stack.push(push);
+                            continue;
+                        }
+                        RmwFastOut::Miss(keys) => keys,
+                    };
+                    if let Some(root) = self.byref_hook_root(*base, top, &steps)? {
+                        let old = {
+                            let fs = FieldScope { classes: &self.classes, scope: self.frames[top].class };
+                            field_get(&Zval::Ref(Rc::clone(&root)), &steps[1..], &mut keys.clone().into_iter(), fs)
+                                .unwrap_or(Zval::Null)
+                        };
+                        let mut newv = old.clone();
+                        if *inc {
+                            ops::increment(&mut newv, &mut self.diags)?;
+                        } else {
+                            ops::decrement(&mut newv, &mut self.diags)?;
+                        }
+                        self.field_set_in_root(root, top, &steps[1..], keys, newv.clone(), false, true)?;
+                        self.frames[top].stack.push(if *pre { newv } else { old });
+                        continue;
+                    }
+                    self.reject_indirect_hook(*base, top, &steps)?;
+                    if let Some(root) = self.field_lazy_root(*base, top, &steps, &keys, true)? {
+                        let old = {
+                            let fs = FieldScope { classes: &self.classes, scope: self.frames[top].class };
+                            field_get(&root, &steps, &mut keys.clone().into_iter(), fs).unwrap_or(Zval::Null)
+                        };
+                        let mut newv = old.clone();
+                        if *inc {
+                            ops::increment(&mut newv, &mut self.diags)?;
+                        } else {
+                            ops::decrement(&mut newv, &mut self.diags)?;
+                        }
+                        self.field_set_in_root(php_types::zcell_prop(root), top, &steps, keys, newv.clone(), false, true)?;
+                        self.frames[top].stack.push(if *pre { newv } else { old });
+                        continue;
+                    }
+                    let old = self.field_value(*base, top, &steps, keys.clone()).unwrap_or(Zval::Null);
+                    let mut newv = old.clone();
+                    if *inc {
+                        ops::increment(&mut newv, &mut self.diags)?;
+                    } else {
+                        ops::decrement(&mut newv, &mut self.diags)?;
+                    }
+                    self.field_set_op(*base, top, &steps, keys, newv.clone())?;
+                    // FD1-ext fill: ramo piano a esito Ok, stessi fatti F4.
+                    if self.field_prelude_skip(*base, top, &steps) {
+                        self.field_assign_fill(*base, top, &steps, ic);
+                        #[cfg(feature = "ic-stats")]
+                        crate::vm::census::ic_stats::FILL_INCDEC
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.frames[top].stack.push(if *pre { newv } else { old });
+                }
+                Op::FieldIsset { base, steps } => {
+                    let keys = self.pop_field_keys(top, &steps);
+                    // Magic protocol at ANY property step along the path
+                    // (`isset($o->magic['k'])`, gh18038 / bug40833; and a magic
+                    // leaf one hop in: `isset($block->block_type->uses_context)`,
+                    // WP_Block_Type) — see field_magic_probe.
+                    if let Some(set) = self.field_magic_probe(*base, top, &steps, &keys, false)? {
+                        self.frames[top].stack.push(Zval::Bool(set));
+                        continue;
+                    }
+                    // A final Index on an ArrayAccess object is the protocol:
+                    // `isset($this->coll[0])` = offsetExists (no offsetGet),
+                    // mirroring Op::IssetPath's single-step arm.
+                    if let Some((recv, key)) = self.field_aa_leaf(*base, top, &steps, &keys) {
+                        let r = self.call_method_sync(recv, b"offsetExists", vec![key])?;
+                        let set = convert::is_true_silent(&r.deref_clone());
+                        self.frames[top].stack.push(Zval::Bool(set));
+                        continue;
+                    }
+                    // Nested Index run on an ArrayAccess property
+                    // (`isset($this->data['a']['b'])`): BP_VAR_IS walk.
+                    if let Some(res) =
+                        self.field_aa_walk(*base, top, &steps, &keys, super::IsMode::Exists)?
+                    {
+                        let set = match res {
+                            super::DimIsLeaf::Missing => false,
+                            super::DimIsLeaf::Aa(recv, key) => {
+                                let r =
+                                    self.call_method_sync(recv, b"offsetExists", vec![key])?;
+                                convert::is_true_silent(&r.deref_clone())
+                            }
+                            super::DimIsLeaf::Verdict(set) => set,
+                        };
+                        self.frames[top].stack.push(Zval::Bool(set));
+                        continue;
+                    }
+                    // A lazy base initializes and the walk roots at the realized
+                    // object (isset through a wrapper reads the instance).
+                    if let Some(root) = self.field_lazy_root(*base, top, &steps, &keys, false)? {
+                        let fs = FieldScope { classes: &self.classes, scope: self.frames[top].class };
+                        let set = matches!(
+                            field_get(&root, &steps, &mut keys.into_iter(), fs),
+                            Some(v) if !matches!(v, Zval::Null | Zval::Undef)
+                        );
+                        self.frames[top].stack.push(Zval::Bool(set));
+                        continue;
+                    }
+                    let set = matches!(
+                        self.field_value(*base, top, &steps, keys),
+                        Some(v) if !matches!(v, Zval::Null | Zval::Undef)
+                    );
+                    self.frames[top].stack.push(Zval::Bool(set));
+                }
+                Op::FieldEmpty { base, steps } => {
+                    let keys = self.pop_field_keys(top, &steps);
+                    // Magic protocol at any property step (the empty() twin of
+                    // FieldIsset's probe): `__isset` gates, `__get` supplies the
+                    // value whose truthiness decides.
+                    if let Some(empty) = self.field_magic_probe(*base, top, &steps, &keys, true)? {
+                        self.frames[top].stack.push(Zval::Bool(empty));
+                        continue;
+                    }
+                    // ArrayAccess leaf: !offsetExists short-circuits to empty,
+                    // else !truthy(offsetGet) — mirrors Op::EmptyPath.
+                    if let Some((recv, key)) = self.field_aa_leaf(*base, top, &steps, &keys) {
+                        let exists =
+                            self.call_method_sync(recv.clone(), b"offsetExists", vec![key.clone()])?;
+                        let empty = if convert::is_true_silent(&exists.deref_clone()) {
+                            let v = self.call_method_sync(recv, b"offsetGet", vec![key])?;
+                            !convert::is_true_silent(&v.deref_clone())
+                        } else {
+                            true
+                        };
+                        self.frames[top].stack.push(Zval::Bool(empty));
+                        continue;
+                    }
+                    // Nested Index run on an ArrayAccess property: same
+                    // BP_VAR_IS walk as Op::FieldIsset above.
+                    if let Some(res) =
+                        self.field_aa_walk(*base, top, &steps, &keys, super::IsMode::Truthy)?
+                    {
+                        let empty = match res {
+                            super::DimIsLeaf::Missing => true,
+                            super::DimIsLeaf::Aa(recv, key) => {
+                                let exists = self.call_method_sync(
+                                    recv.clone(),
+                                    b"offsetExists",
+                                    vec![key.clone()],
+                                )?;
+                                if convert::is_true_silent(&exists.deref_clone()) {
+                                    let v =
+                                        self.call_method_sync(recv, b"offsetGet", vec![key])?;
+                                    !convert::is_true_silent(&v.deref_clone())
+                                } else {
+                                    true
+                                }
+                            }
+                            super::DimIsLeaf::Verdict(truthy) => !truthy,
+                        };
+                        self.frames[top].stack.push(Zval::Bool(empty));
+                        continue;
+                    }
+                    // empty == !isset || !truthy(value): an unreachable/null leaf is
+                    // empty; otherwise test the value's boolean.
+                    let empty = match self.field_value(*base, top, &steps, keys) {
+                        Some(v) if !matches!(v, Zval::Null | Zval::Undef) => {
+                            !convert::to_bool(&v, &mut self.diags)
+                        }
+                        _ => true,
+                    };
+                    self.frames[top].stack.push(Zval::Bool(empty));
+                }
+                Op::FieldUnset { base, steps } => {
+                    let keys = self.pop_field_keys(top, &steps);
+                    // `unset($o->magic)` reached through the path walker (a
+                    // dynamic name): `__unset` dispatches like Op::PropUnset —
+                    // on the initialized-proxy instance, or the uninitialized
+                    // wrapper without initializing (gh18038-010).
+                    let magic_done: bool = 'magic_unset: {
+                        // The magic leaf may sit at the END of a longer path
+                        // (`unset($this->list_table->undeclared)`, WP-18): read
+                        // the prefix like Zend (its `__get`s included), then
+                        // dispatch `__unset` on the leaf name.
+                        let Some((last, prefix)) = steps.split_last() else {
+                            break 'magic_unset false;
+                        };
+                        let prefix_keys: usize = prefix
+                            .iter()
+                            .filter(|s| matches!(s, FieldStep::PropDyn | FieldStep::Index))
+                            .count();
+                        let name: Vec<u8> = match last {
+                            FieldStep::Prop(n) => n.to_vec(),
+                            FieldStep::PropDyn => {
+                                let Some(k) = keys.get(prefix_keys) else {
+                                    break 'magic_unset false;
+                                };
+                                convert::to_zstr_cast(k, &mut self.diags).as_bytes().to_vec()
+                            }
+                            _ => break 'magic_unset false,
+                        };
+                        let base_val = if prefix.is_empty() {
+                            match base {
+                                FieldBase::Local(s) => {
+                                    self.frames[top].slots.get(*s as usize).map(|v| v.deref_clone())
+                                }
+                                FieldBase::Global(s) => {
+                                    self.frames[0].slots.get(*s as usize).map(|v| v.deref_clone())
+                                }
+                                FieldBase::Superglobal(i) => {
+                                    self.superglobals.get(*i as usize).map(|v| v.deref_clone())
+                                }
+                                FieldBase::This => self.frames[top].this.as_ref().map(|v| v.deref_clone()),
+                            }
+                        } else {
+                            self.field_value(*base, top, prefix, keys[..prefix_keys].to_vec())
+                        };
+                        let Some(mut v) = base_val else {
+                            break 'magic_unset false;
+                        };
+                        for _ in 0..64 {
+                            let next = self.proxy_redirect(v.clone());
+                            let same = match (deref_object(&v), deref_object(&next)) {
+                                (Some(a), Some(b)) => Rc::ptr_eq(&a, &b),
+                                _ => true,
+                            };
+                            v = next;
+                            if same {
+                                break;
+                            }
+                        }
+                        let Some(o) = deref_object(&v) else { break 'magic_unset false };
+                        let cur = self.frames[top].class;
+                        if self.magic_applies(&o, &name, cur, MagicKind::Unset, b"__unset").is_none() {
+                            break 'magic_unset false;
+                        }
+                        // BORROW-OK: shared read pre-call (no walk started, `__unset` not entered).
+                        let oid = o.borrow().id;
+                        let gkey = (oid, MagicKind::Unset, name.clone());
+                        let ins = self.magic_guard.insert(gkey.clone());
+                        let r = self.call_method_sync(v.clone(), b"__unset", vec![Zval::Str(PhpStr::new(name))]);
+                        if ins {
+                            self.magic_guard.remove(&gkey);
+                        }
+                        r?;
+                        true
+                    };
+                    if magic_done {
+                        continue;
+                    }
+                    // ArrayAccess leaf: `unset($this->coll[0])` = offsetUnset.
+                    if let Some((recv, key)) = self.field_aa_leaf(*base, top, &steps, &keys) {
+                        self.call_method_sync(recv, b"offsetUnset", vec![key])?;
+                        continue;
+                    }
+                    // Single-property paths mirror Op::PropUnset's declared-slot
+                    // rules: the typed-reference source dies, a TYPED slot
+                    // returns to uninitialized (typed_properties_002's
+                    // `unset($obj->$a)`), a plain one is removed.
+                    let single_name: Option<Box<[u8]>> = match &steps[..] {
+                        [FieldStep::Prop(n)] => Some(n.clone()),
+                        [FieldStep::PropDyn] => match keys.first().cloned() {
+                            Some(k) => Some(self.dyn_prop_name_value(&k)?),
+                            None => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(n) = single_name {
+                        let target = match base {
+                            FieldBase::Local(s) => self.frames[top].slots.get(*s as usize).map(|v| v.deref_clone()),
+                            FieldBase::Global(s) => self.frames[0].slots.get(*s as usize).map(|v| v.deref_clone()),
+                            FieldBase::Superglobal(i) => self.superglobals.get(*i as usize).map(|v| v.deref_clone()),
+                            FieldBase::This => self.frames[top].this.as_ref().map(|v| v.deref_clone()),
+                        };
+                        let target = target.map(|v| self.proxy_view(v));
+                        if let Some(o) = target.as_ref().and_then(deref_object) {
+                            let cur = self.frames[top].class;
+                            // BORROW-OK: shared read on a fresh handle (no walk in flight).
+                            let ocid = o.borrow().class_id as usize;
+                            let key = self.prop_storage_key(ocid, &n, cur);
+                            if !self.typed_refs.is_empty() {
+                                let op_ptr = Rc::as_ptr(&o);
+                                let disp = php_types::prop_display_name(&key).to_vec();
+                                self.typed_refs.retain(|t| {
+                                    !(std::ptr::eq(t.obj.as_ptr(), op_ptr) && t.prop.as_ref() == &disp[..])
+                                });
+                            }
+                            if prop_type_decl(&self.classes, ocid, &n).is_some() {
+                                // BORROW-OK: scoped mut on the same fresh handle, op level.
+                                let displaced = o.borrow_mut().props.replace(&key, Zval::Undef);
+                                if let Some(d) = displaced {
+                                    self.gc_note(&d);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // A lazy base initializes; the removal runs on the realized
+                    // object (a guarded `unset($this->$name)` inside `__unset`).
+                    if let Some(mut root) = self.field_lazy_root(*base, top, &steps, &keys, false)? {
+                        let mut aa = None;
+                        {
+                            let fs = FieldScope { classes: &self.classes, scope: self.frames[top].class };
+                            field_unset(&mut root, &steps, &mut keys.into_iter(), fs, &mut aa)?;
+                        }
+                        self.drain_unset_aa(aa, top)?;
+                        continue;
+                    }
+                    self.field_remove(*base, top, &steps, keys)?;
+                }
+                Op::Fatal(i) => {
+                    let msg = match &self.frames[top].func.consts[*i as usize] {
+                        crate::bytecode::Const::Str(b) => String::from_utf8_lossy(b.as_bytes()).into_owned(),
+                        _ => "VM: unsupported construct".to_string(),
+                    };
+                    return Err(PhpError::Error(msg));
+                }
+                Op::EmitNotice(i) => {
+                    if let crate::bytecode::Const::Str(b) = &self.frames[top].func.consts[*i as usize] {
+                        let msg = String::from_utf8_lossy(b.as_bytes()).into_owned();
+                        self.diags.push(Diag::Notice(msg));
+                        // Flush at the emitting op's line — deferring to the next
+                        // flush point would stamp a later statement's line on it.
+                        let line = self.cur_line(top);
+                        self.flush_diags(line)?;
+                    }
+                }
+                Op::Exit { has_arg } => {
+                    let code = if *has_arg {
+                        let v = self.frames[top].stack.pop().expect("Exit status");
+                        self.exit_status(v, top)?
+                    } else {
+                        0
+                    };
+                    return Err(PhpError::Exit(code));
+                }
+                Op::SuppressBegin => {
+                    // Deliver everything queued BEFORE the `@` with normal
+                    // semantics first, so the mark cleanly separates the
+                    // suppressed region from the statement's earlier diagnostics.
+                    let line = self.cur_line(top);
+                    self.flush_diags(line)?;
+                    self.suppress_marks.push(self.diags.len());
+                    // Zend's BEGIN_SILENCE: save EG(error_reporting) and mask it
+                    // down to the fatal-only bits (never silence fatals). The
+                    // masked value is what error_reporting() reads inside the
+                    // region — PHPUnit's handler declines diagnostics on it.
+                    self.silence_saved.push(self.error_level);
+                    if self.error_level & !4437 != 0 {
+                        self.error_level &= 4437;
+                    }
+                    self.suppress_depth += 1;
+                }
+                Op::SuppressEnd => {
+                    // Deliver the region's queued diagnostics while the level is
+                    // still masked: Zend calls the user error handler even under
+                    // `@`; only the default render is swallowed (gated by the
+                    // masked error_reporting). The default-handler path still
+                    // records error_get_last (monolog's StreamHandler appends
+                    // error_get_last()['message'] after an @fopen).
+                    let line = self.cur_line(top);
+                    self.flush_diags(line)?;
+                    // Zend's END_SILENCE: restore only if the current level is
+                    // still fatal-only and the saved one was not — an
+                    // error_reporting($x) inside the region survives it
+                    // (bug27731).
+                    if let Some(saved) = self.silence_saved.pop() {
+                        if self.error_level & !4437 == 0 && saved & !4437 != 0 {
+                            self.error_level = saved;
+                        }
+                    }
+                    self.suppress_depth = self.suppress_depth.saturating_sub(1);
+                    if let Some(saved) = self.suppress_marks.pop() {
+                        self.diags.truncate(saved);
+                        self.diags_rendered = self.diags_rendered.min(saved);
+                    }
+                }
+                Op::MatchError(slot) => {
+                    let subj = read_slot(&self.frames[top].slots[*slot as usize]);
+                    return Err(PhpError::Error(format!(
+                        "Unhandled match case {}",
+                        match_case_repr(&subj)
+                    )));
+                }
+                Op::Sweep { main } => {
+                    scn!(Sweep: op);
+                    // A destructor body's statement sweeps no-op — see
+                    // Frame::in_destructor (handle-id release order).
+                    if !self.frames[top].flags.get(FrameFlags::IN_DESTRUCTOR) {
+                        // WP-39 empty-buffer fast path: nothing was noted since
+                        // the last sweep (cursor at the end ⇒ no pending
+                        // candidate slots — the sweep tail drains and resets
+                        // the buffer), no light demotions for a main sweep to
+                        // re-seed, and the cycle collector's pressure trigger
+                        // is under threshold ⇒ the sweep body would only
+                        // walk/clear empty buffers. gc-census (media): 53M
+                        // statement sweeps, ~6M with a non-empty buffer — the
+                        // rest take this path.
+                        // WP-50: the skip bound must match the trigger's
+                        // effective bound `max(threshold, purge_floor)`
+                        // (vm/mod.rs sweep tail) — with the WP-49 trigger-time
+                        // tombstone purge the raw buffer sits in the band
+                        // [threshold, floor) most of the time, and a body
+                        // entry there does nothing at all: no candidates (the
+                        // note buffer is empty here), no purge, no collect.
+                        // Full census: 1.014,7M light entries, ~805M of them
+                        // band-only.
+                        // S-174 «sweep-in-op» (criterio wp174-harness/s174-criterio.md
+                        // p.2): il predicato qui sopra vive in `sweep_idle` — UN
+                        // solo testo, condiviso con gli op che lo interrogano
+                        // sullo Sweep SEGUENTE (`sweep_skip_next`) dopo i loro
+                        // effetti. Qui, sotto `!IN_DESTRUCTOR`, vale il solo
+                        // fast-path WP-39/WP-50.
+                        let noop = self.sweep_idle(top, *main);
+                        #[cfg(feature = "gc-census")]
+                        if noop
+                            && self.gc_enabled
+                            && self.gc_cycle_roots.len() + self.gc_ctr_roots.len()
+                                >= self.gc_cycle_threshold
+                        {
+                            super::gc_census::sweep_band_skipped();
+                        }
+                        if !noop {
+                            self.gc_sweep(top, ip, *main)?;
+                        }
+                    }
+                }
+                Op::Nop => {}
+            }
+        }
+    }
+
+    /// L-MC1b (S-165): corpo OUTLINE del fast path borrow-IC k≤2 di
+    /// `Op::MethodCall` — l'IC-hit legge il ricevitore IN PLACE (pattern
+    /// ThisMethodCall, WP-36) e gli argomenti passano DIRETTAMENTE dalla
+    /// pila del chiamante ai primi slot del callee (H-D forma 2, S-105).
+    /// Ammissione: recv Object DIRETTO in pila (non-Ref), IC hit, callee
+    /// simple_call ad arità esatta. Un ArgPlace si materializza QUI con la
+    /// catena del funnel (simple_call ⇒ maschera by-ref tutta falsa ⇒
+    /// R-fetch), in ordine sorgente, flush alla riga della CALL. Soundness
+    /// IC = ThisMethodCall: un Fiber non è mai NEL cache (`method_call`
+    /// devia prima del fill site di `dispatch_instance_call`, suo unico
+    /// scrittore); Generator/Closure non sono `Zval::Object`. L'ordine di
+    /// pop (0..n).rev(): caveat last-ref di H-D CHIUSO (prova S-185 az.B).
+    /// `#[inline(never)]`: il corpo resta FUORI da run_loop (cura del
+    /// prezzo di layout, arbitrato s165-arbitrato-guardie.md). `Ok(true)` =
+    /// chiamata dispatchata (frame entrato); `Ok(false)` = non ammessa, il
+    /// chiamante prosegue sul funnel generico invariato.
+    /// Criterio: wp165-harness/s165-criterio-mc1.md.
+    #[inline(never)]
+    fn methodcall_fast(
+        &mut self,
+        top: usize,
+        n: usize,
+        ic: &crate::bytecode::MethodIc,
+        deref: bool,
+    ) -> Result<bool, PhpError> {
+        let mut fast = None;
+        {
+            let stack = &self.frames[top].stack;
+            if let Some(ridx) = stack.len().checked_sub(n + 1) {
+                if let Zval::Object(o) = &stack[ridx] {
+                    let cid = o.borrow().class_id as usize;
+                    if let Some((defc, midx)) = ic.get(cid) {
+                        let callee = &self.classes[defc].methods[midx].func;
+                        if callee.simple_call && callee.n_params as usize == n {
+                            fast = Some((defc, midx, cid));
+                        }
+                    }
+                }
+            }
+        }
+        let Some((defc, midx, cid)) = fast else { return Ok(false) };
+        let callee = &self.classes[defc].methods[midx].func;
+        let m = self.class_mod(defc);
+        // L-MC2 (S-185, wp185-harness/s185-criterio-mc2.md): forma di L-CR1 (a)
+        // — il frame nasce DENTRO `frames` (push dei buffer del pool), gli
+        // argomenti e il ricevitore passano per split_at_mut, nessun Frame per
+        // valore attraverso `enter_callee` (il cui ramo simple_call è solo
+        // trace + push, replicato qui al byte). Ordine pop/decay/recv NON
+        // osservabile, PROVATO per nome (S-185 az.B, s185-criterio-mc2.md p.8):
+        // `decay_arg` clona il referente PRIMA di lasciar morire il wrapper
+        // Ref, quindi ogni payload Rc (Object/Array/Closure/Generator/Resource)
+        // ha count ≥ 2 al drop — muore solo la cella RefCell, senza id né
+        // codice utente. Un `ArgPlace` resta sul cammino storico (sotto): la
+        // sua lettura può avvisare o fallire, e lo fa col SOLO chiamante in pila.
+        let has_place = {
+            let st = &self.frames[top].stack;
+            st[st.len() - n..].iter().any(|a| matches!(a, Zval::ArgPlace(_)))
+        };
+        if !has_place {
+            if log::log_enabled!(target: "phpr::call", log::Level::Trace) {
+                log::trace!(
+                    target: "phpr::call",
+                    "enter {}() (depth {})",
+                    String::from_utf8_lossy(&callee.name),
+                    self.frames.len() + 1
+                );
+            }
+            #[cfg(feature = "mem-census")]
+            php_types::memcensus::arity_note(n);
+            let (slots, stack) = self.frame_pool.take();
+            self.frames.push(super::Frame::with_buffers(callee, m, slots, stack));
+            let (caller, entered) = self.frames.split_at_mut(top + 1);
+            let cf = &mut entered[0];
+            if deref && callee.by_ref && !callee.is_generator {
+                cf.flags.set(FrameFlags::RET_DEREF, true);
+            }
+            cf.argc = n as u32;
+            for i in (0..n).rev() {
+                let a = caller[top].stack.pop().expect("MethodCall argument");
+                cf.slots[i] = decay_arg(a);
+            }
+            cf.this = Some(caller[top].stack.pop().expect("MethodCall receiver"));
+            cf.class = Some(defc);
+            cf.static_class = Some(cid); // LSB = classe del ricevitore
+            if matches!(callee.ops.first(), Some(Op::CheckArity { .. })) {
+                cf.ip = 1;
+            }
+            return Ok(true);
+        }
+        let mut frame = self.pooled_frame(callee, m);
+        // Copia value-context di un ritorno `&m()` (WP-53).
+        if deref && callee.by_ref && !callee.is_generator {
+            frame.flags.set(FrameFlags::RET_DEREF, true);
+        }
+        #[cfg(feature = "mem-census")]
+        php_types::memcensus::arity_note(n);
+        frame.argc = n as u32;
+        let mut has_place = false;
+        for i in (0..n).rev() {
+            let a = self.frames[top].stack.pop().expect("MethodCall argument");
+            has_place |= matches!(a, Zval::ArgPlace(_));
+            frame.slots[i] = a;
+        }
+        let recv = self.frames[top].stack.pop().expect("MethodCall receiver");
+        if has_place {
+            for i in 0..n {
+                let a = std::mem::replace(&mut frame.slots[i], Zval::Undef);
+                frame.slots[i] = if let Zval::ArgPlace(p) = a {
+                    let base = match p.base {
+                        ArgPlaceBase::Local(s) => FieldBase::Local(s),
+                        ArgPlaceBase::Global(s) => FieldBase::Global(s),
+                        ArgPlaceBase::Superglobal(x) => FieldBase::Superglobal(x),
+                        ArgPlaceBase::This => FieldBase::This,
+                    };
+                    self.arg_place_read(top, base, &p)?
+                } else {
+                    a
+                };
+            }
+            // R-fetch warnings alla riga della CALL (specchio di `method_call`).
+            let line = self.cur_line(top);
+            self.flush_diags(line)?;
+        }
+        for i in 0..n {
+            let a = std::mem::replace(&mut frame.slots[i], Zval::Undef);
+            frame.slots[i] = decay_arg(a);
+        }
+        frame.this = Some(recv);
+        frame.class = Some(defc);
+        frame.static_class = Some(cid); // LSB = classe del ricevitore
+        // L-CR1 (S-181) (b): arità esatta per ammissione ⇒ il `CheckArity`
+        // in testa al corpo non può fallire (argc == n_params ≥ required):
+        // ingresso a ip=1.
+        if matches!(callee.ops.first(), Some(Op::CheckArity { .. })) {
+            frame.ip = 1;
+        }
+        self.enter_callee(frame)?;
+        Ok(true)
+    }
+
+    /// `Op::Ret`, cammino GENERALE (L-RT2 forma 2, S-184): il corpo storico del
+    /// handler, spostato fuori da `run_loop` al byte (solo i `return` cambiano
+    /// forma: `Some(exit)` = la corsa delimitata è finita, `None` = valore
+    /// spinto sul chiamante, si prosegue). Il fast path fuso resta inline nel
+    /// handler; qui passano forma ≠ 0, flag, `ret_cell`, `$this`, foreach,
+    /// `ext`, `$$` e il ritorno di `main`.
+    #[inline(never)]
+    fn ret_slow(&mut self, top: usize, baseline: usize) -> Result<Option<RunExit>, PhpError> {
+        let mut ret = self.frames[top].stack.pop().unwrap_or(Zval::Null);
+        let func = self.frames[top].func;
+        // WP-53 (Fase 2.1): `ret_shape` folds the hint/by_ref/
+        // generator declaration facts into one precomputed byte —
+        // the common shape-0 function skips the whole prologue on
+        // a single load+branch (was: `ret_hint.clone()` + three
+        // scattered field reads at every one of 62,6M returns).
+        let shape = func.ret_shape;
+        if shape != 0 {
+            // Coerce the returned value to a scalar return hint
+            // (weak, or checked under strict_types) — step 14. A
+            // by-reference function returns an alias, so its
+            // return type stays unenforced, and a generator's
+            // declared type describes the returned *generator*
+            // (both excluded from RS_HINT at construction); the
+            // init-thunk / magic path (`ret_cell`) carries no hint.
+            if shape & Func::RS_HINT != 0 && self.frames[top].ret_cell.is_none() {
+                let hint = func.ret_hint.as_ref().expect("RS_HINT implies ret_hint");
+                // The function's own unit governs its return check.
+                let strict = self.frames[top].module.strict;
+                match self.coerce_or_check_hint(ret, hint, strict) {
+                    Ok(c) => ret = c,
+                    Err(given) => return Err(self.return_type_error(func, hint, &given)),
+                }
+            }
+            // A by-ref function that returned a plain value (the
+            // in-body notice already fired) still hands the caller
+            // a *reference* in Zend — so `$t = &f()` binds it
+            // silently instead of raising a second notice.
+            if shape & Func::RS_WRAP != 0 && !matches!(ret, Zval::Ref(_)) {
+                ret = Zval::Ref(php_types::zcell(ret));
+            }
+        }
+        let ret_cell = self.frames[top].ret_cell.take();
+        // ONE load of the packed flag byte covers the four
+        // Ret-shaping bits and CLONE_INIT (WP-53; flags are not
+        // mutated between here and the frame pop).
+        let fl = self.frames[top].flags.bits();
+        // L-CR1 (S-181) (c): la guardia magic esiste solo con
+        // `ext`: niente Vec vuoto costruito e iterato a ogni Ret.
+        let guard = self
+            .frames[top]
+            .ext_opt_mut()
+            .map(|e| std::mem::take(&mut e.guard_release));
+        // A `clone`-driven `__clone` is finishing: revoke any remaining
+        // readonly re-init permission on the copy (PHP 8.3), so writes
+        // after the clone — or via a manual `__clone()` — fatal again.
+        if fl & FrameFlags::CLONE_INIT != 0 {
+            if let Some(Zval::Object(o)) = self.frames[top].this.clone() {
+                o.borrow_mut().clear_readonly_clone_writable();
+            }
+        }
+        // L-OL1-F1 «stampo»: a prop-init thunk finishing REGULARLY
+        // (every INIT_PROPS frame runs on a fresh, pre-ctor
+        // instance) snapshots the class's complete default table;
+        // later allocations clone it and skip this thunk. An
+        // unwinding thunk never reaches Ret, so a failed
+        // evaluation is retried at the next `new`, like Zend.
+        if fl & FrameFlags::INIT_PROPS != 0 {
+            if let (Some(cid), Some(Zval::Object(o))) =
+                (self.frames[top].class, self.frames[top].this.as_ref())
+            {
+                let cc = self.classes[cid];
+                if cc.props_template.0.get().is_none() {
+                    let _ = cc.props_template.0.set(o.borrow().props.clone());
+                }
+            }
+        }
+        // L-RT1 (S-183, wp182-harness/s183-criterio-rt1.md): Ret IN PLACE
+        // ad AMMISSIONE — un frame senza `$this`, iteratori, `ext` e
+        // variabili dinamiche (ogni funzione semplice) rilascia SOLO
+        // slots e stack: le note GC nello STESSO ordine di
+        // `gc_note_frame` (slots poi stack), lo svuotamento nello STESSO
+        // ordine di `recycle_frame` (slots poi stack, front-to-back), e il
+        // Frame residuo (campi Copy/None/vuoti: nessun Rc) muore con
+        // `truncate` invece di viaggiare per valore attraverso `pop` +
+        // `recycle_frame`. Ogni altro frame (main, metodi, foreach, ext)
+        // passa dal cammino di prima, INVARIATO.
+        let in_place = self.frames.len() > 1 && {
+            let f = &self.frames[top];
+            f.this.is_none() && f.iters.is_empty() && f.ext.is_none() && f.dyn_vars.is_none()
+        };
+        if in_place {
+            let mut slots = std::mem::take(&mut self.frames[top].slots);
+            let mut stack = std::mem::take(&mut self.frames[top].stack);
+            for v in &slots {
+                self.gc_note(v);
+            }
+            for v in &stack {
+                self.gc_note(v);
+            }
+            slots.clear();
+            stack.clear();
+            self.frames.truncate(top);
+            self.frame_pool.put(slots, stack);
+        } else {
+            let dead = self.frames.pop().expect("Ret pops the active frame");
+            if self.frames.is_empty() && !self.final_flush {
+                // The script `main` is returning: park its frame — the
+                // slots ARE the global variables, and Zend keeps them
+                // alive through the shutdown-function phase. Object
+                // destruction is unaffected (survivors are driven from
+                // `created`, not from this frame's drop).
+                self.retired_main = Some(dead);
+            } else {
+                // The returning frame's locals, leftover operands and `$this`
+                // release their references now: note any tracked objects so
+                // the next sweep reconsiders them (drives destruction of an
+                // object whose last reference was a returning function's local).
+                self.gc_note_frame(&dead);
+                self.recycle_frame(dead);
+            }
+        }
+        // §3.35: dying locals destruct at `leave` (mod.rs `gc_sweep_after_ret`);
+        // a destructor frame's own return keeps the scheduled-sweep protocol
+        // (the Sweep op that pushed it re-runs when it returns).
+        if top > 0 && fl & FrameFlags::IN_DESTRUCTOR == 0 {
+            self.gc_sweep_after_ret(top - 1)?;
+        }
+        if let Some(guard) = guard {
+            for key in guard {
+                self.magic_guard.remove(&key);
+            }
+        }
+        if let Some(cell) = ret_cell {
+            // Init thunk / discarded magic return: store into the cell;
+            // the caller already has (or re-reads) its own value.
+            *cell.borrow_mut() = ret;
+        } else {
+            // Priority order preserved from the original if-chain
+            // (isset > bool > stringify > deref); the common
+            // flag-free return takes the first branch on the byte
+            // already loaded above.
+            const RET_SHAPING: u8 = FrameFlags::RET_ISSET
+                | FrameFlags::RET_BOOL
+                | FrameFlags::RET_STRINGIFY
+                | FrameFlags::RET_DEREF;
+            let v = if fl & RET_SHAPING == 0 {
+                ret
+            } else if fl & FrameFlags::RET_ISSET != 0 {
+                Zval::Bool(!matches!(ret.deref_clone(), Zval::Null))
+            } else if fl & FrameFlags::RET_BOOL != 0 {
+                Zval::Bool(convert::to_bool(&ret, &mut self.diags))
+            } else if fl & FrameFlags::RET_STRINGIFY != 0 {
+                Zval::Str(convert::to_zstr(&ret, &mut self.diags))
+            } else {
+                ret.deref_clone()
+            };
+            // The frame that owned this bounded run has returned: hand
+            // the value back to whoever started it (the host, for the
+            // top-level run; `resume_generator`, for a generator body).
+            if self.frames.len() == baseline {
+                return Ok(Some(RunExit::Returned(v)));
+            }
+            self.frames
+                .last_mut()
+                .expect("a non-baseline Ret has a caller")
+                .stack
+                .push(v);
+        }
+        Ok(None)
+    }
+
+    /// Navigate a place (base + `steps`; `keys` already popped, source order) to
+    /// its leaf, promote it to a shared cell, and return that cell — the body of
+    /// [`Op::MakeRef`], shared with the dynamic-dispatch binder's by-reference
+    /// materialization of a deferred [`Zval::ArgPlace`] (SEND_VAR_EX).
+    pub(super) fn make_ref_cell(
+        &mut self,
+        top: usize,
+        base: FieldBase,
+        steps: &[FieldStep],
+        keys: Vec<Zval>,
+    ) -> Result<Rc<RefCell<Zval>>, PhpError> {
+            // First key retained past the cell walk (a dynamic-name
+            // typed-ref registration needs it after keys are consumed).
+            let keys_first_backup = keys.first().cloned();
+            // EXCEPTION checked FIRST (it must pre-empt hook/lazy
+            // machinery): a ref fetch under the wrapper's own
+            // suppressed `__get` guard stays on the wrapper's raw
+            // storage without initializing (gh20854's
+            // `return $this->x;` in the wrapper's `&__get`).
+            let guarded_ref_fetch = 'grf: {
+                let n: Box<[u8]> = match &steps[..] {
+                    [FieldStep::Prop(n)] => n.clone(),
+                    [FieldStep::PropDyn] => match keys.first().cloned() {
+                        Some(k) => self.dyn_prop_name_value(&k)?,
+                        None => break 'grf false,
+                    },
+                    _ => break 'grf false,
+                };
+                let target = match base {
+                    FieldBase::Local(s) => self.frames[top].slots.get(s as usize).map(|v| v.deref_clone()),
+                    FieldBase::Global(s) => self.frames[0].slots.get(s as usize).map(|v| v.deref_clone()),
+                    FieldBase::Superglobal(i) => self.superglobals.get(i as usize).map(|v| v.deref_clone()),
+                    FieldBase::This => self.frames[top].this.as_ref().map(|v| v.deref_clone()),
+                };
+                let Some(o) = target.and_then(|v| deref_object(&v)) else { break 'grf false };
+                let (uninit, oid, cid) = {
+                    let b = o.borrow();
+                    (b.lazy.is_some() && b.proxy_instance.is_none(), b.id, b.class_id as usize)
+                };
+                uninit
+                    && self.magic_guard.contains(&(oid, MagicKind::Get, n.to_vec()))
+                    && resolve_method_runtime(&self.classes, cid, b"__get").is_some()
+            };
+            // A `&get` hook makes the property addressable: the reference
+            // the hook returns is the path's root (PHP 8.4).
+            if !guarded_ref_fetch {
+                if let Some(root) = self.byref_hook_root(base, top, &steps)? {
+                    let cell = if steps.len() == 1 {
+                        root
+                    } else {
+                        let fs = FieldScope { classes: &self.classes, scope: self.frames[top].class };
+                        let mut root_val = Zval::Ref(root);
+                        field_cell(&mut root_val, &steps[1..], &mut keys.into_iter(), fs)?
+                    };
+                    return Ok(cell);
+                }
+            }
+            // A property whose set visibility excludes this scope hands
+            // out a reference to a *copy* (PHP 8.4 asymmetric visibility).
+            if let Some(cell) = self.asym_set_ref_copy(base, top, &steps)? {
+                return Ok(cell);
+            }
+            // Taking a reference *to* a hooked property is indirect modification.
+            self.reject_indirect_hook(base, top, &steps)?;
+            // A reference fetch of a lazy object's property initializes it
+            // first (PHP 8.4, fetch_ref_initializes) — a skipped/raw-set
+            // property does not — and a forwarding proxy binds the
+            // *instance*'s cell, so the walk roots there (unless the
+            // guarded-ref-fetch exception above applies).
+            let lazy_root = if guarded_ref_fetch {
+                None
+            } else {
+                self.field_lazy_root(base, top, &steps, &keys, false)?
+            };
+            // `&$o->magic` consults `__get` (gh21478-proxy-get-ref-
+            // forward, gh20875_proxy_get_no_init): the magic result
+            // binds as a fresh cell — an uninitialized proxy dispatches
+            // on the wrapper WITHOUT initializing. Under an ACTIVE
+            // guard the fetch degrades to an undefined READ (warning,
+            // detached NULL cell — nothing materializes).
+            let makeref_magic: Option<Rc<RefCell<Zval>>> = 'makeref_magic: {
+                let n: Box<[u8]> = match &steps[..] {
+                    [FieldStep::Prop(n)] => n.clone(),
+                    [FieldStep::PropDyn] => {
+                        let Some(k) = keys.first().cloned() else { break 'makeref_magic None };
+                        self.dyn_prop_name_value(&k)?
+                    }
+                    _ => break 'makeref_magic None,
+                };
+                let target = match base {
+                    FieldBase::Local(s) => self.frames[top].slots.get(s as usize).map(|v| v.deref_clone()),
+                    FieldBase::Global(s) => self.frames[0].slots.get(s as usize).map(|v| v.deref_clone()),
+                    FieldBase::Superglobal(i) => self.superglobals.get(i as usize).map(|v| v.deref_clone()),
+                    FieldBase::This => self.frames[top].this.as_ref().map(|v| v.deref_clone()),
+                };
+                let Some(o) = target.and_then(|v| deref_object(&v)) else { break 'makeref_magic None };
+                let cur = self.frames[top].class;
+                let oid = o.borrow().id;
+                // For a forwarding wrapper the guard may be held on the
+                // instance's handle — honor both before dispatching.
+                let inst = deref_object(&self.proxy_view(Zval::Object(Rc::clone(&o))));
+                let inst_guard = inst
+                    .as_ref()
+                    .is_some_and(|io| self.magic_guard.contains(&(io.borrow().id, MagicKind::Get, n.to_vec())));
+                if !inst_guard && self.magic_applies(&o, &n, cur, MagicKind::Get, b"__get").is_some() {
+                    let gkey = (oid, MagicKind::Get, n.to_vec());
+                    let ins = self.magic_guard.insert(gkey.clone());
+                    let r = self.call_method_sync(
+                        Zval::Object(Rc::clone(&o)),
+                        b"__get",
+                        vec![Zval::Str(PhpStr::new(n.to_vec()))],
+                    );
+                    if ins {
+                        self.magic_guard.remove(&gkey);
+                    }
+                    let v = r?;
+                    break 'makeref_magic Some(php_types::zcell_prop(v.deref_clone()));
+                }
+                // `__get` guard-suppressed on a forwarding PROXY WRAPPER
+                // with an absent slot: Zend's ptr-fetch falls back to a
+                // READ — undefined-property warning naming the INSTANCE
+                // class, detached NULL cell, nothing materializes. (A
+                // plain object instead materializes with the creation
+                // deprecation — gh20854.)
+                let is_wrapper = {
+                    let b = o.borrow();
+                    b.lazy.is_some() && b.proxy_instance.is_some()
+                };
+                if is_wrapper {
+                    let cid_o = o.borrow().class_id as usize;
+                    let has_get = resolve_method_runtime(&self.classes, cid_o, b"__get").is_some();
+                    let undeclared = matches!(
+                        resolve_prop_access(&self.classes, cid_o, &n, cur),
+                        PropAccess::Dynamic
+                    );
+                    let absent_on_inst = inst
+                        .as_ref()
+                        .is_some_and(|io| !io.borrow().props.contains(n.as_ref()));
+                    let guarded = inst_guard
+                        || self.magic_guard.contains(&(oid, MagicKind::Get, n.to_vec()));
+                    if has_get && undeclared && absent_on_inst && guarded {
+                        let icid = inst
+                            .as_ref()
+                            .map(|io| io.borrow().class_id as usize)
+                            .unwrap_or(cid_o);
+                        let before_diags = self.diags.len();
+                        self.diags.push(Diag::Warning(format!(
+                            "Undefined property: {}::${}",
+                            String::from_utf8_lossy(&self.classes[icid].name),
+                            String::from_utf8_lossy(&n),
+                        )));
+                        let read_line = self.cur_line(top);
+                        self.mark_pending_diag_lines(before_diags, read_line);
+                        break 'makeref_magic Some(php_types::zcell_prop(Zval::Null));
+                    }
+                }
+                None
+            };
+            if let Some(cell) = makeref_magic {
+                return Ok(cell);
+            }
+            // `&$o->undeclared` MATERIALIZES the property: on a class not
+            // allowing dynamic props that is the creation deprecation
+            // (gh20854's `&__get` returning an absent `$this->x`).
+            if let [FieldStep::Prop(n)] = &steps[..] {
+                let target = match &lazy_root {
+                    Some(r) => Some(r.clone()),
+                    None => match base {
+                        FieldBase::Local(s) => self.frames[top].slots.get(s as usize).map(|v| v.deref_clone()),
+                        FieldBase::Global(s) => self.frames[0].slots.get(s as usize).map(|v| v.deref_clone()),
+                        FieldBase::Superglobal(i) => self.superglobals.get(i as usize).map(|v| v.deref_clone()),
+                        FieldBase::This => self.frames[top].this.as_ref().map(|v| v.deref_clone()),
+                    },
+                };
+                if let Some(o) = target.as_ref().and_then(deref_object) {
+                    let ocid = o.borrow().class_id as usize;
+                    let dynamic = matches!(
+                        resolve_prop_access(&self.classes, ocid, n, self.frames[top].class),
+                        PropAccess::Dynamic
+                    );
+                    if dynamic
+                        && !o.borrow().props.contains(n.as_ref())
+                        && !self.allows_dynamic_props(ocid)
+                    {
+                        let cls = String::from_utf8_lossy(&self.classes[ocid].name).into_owned();
+                        let prop = String::from_utf8_lossy(n).into_owned();
+                        self.diags.push(Diag::Deprecated(format!(
+                            "Creation of dynamic property {cls}::${prop} is deprecated"
+                        )));
+                    }
+                }
+            }
+            // Taking a reference to an *uninitialized* non-nullable typed
+            // property is an error (zend_fetch_property_address,
+            // fetch_ref_skipped_prop_does_not_initialize).
+            if let [FieldStep::Prop(n)] = &steps[..] {
+                let target = match &lazy_root {
+                    Some(r) => Some(r.clone()),
+                    None => match base {
+                        FieldBase::Local(s) => self.frames[top].slots.get(s as usize).map(|v| v.deref_clone()),
+                        FieldBase::Global(s) => self.frames[0].slots.get(s as usize).map(|v| v.deref_clone()),
+                        FieldBase::Superglobal(i) => self.superglobals.get(i as usize).map(|v| v.deref_clone()),
+                        FieldBase::This => self.frames[top].this.as_ref().map(|v| v.deref_clone()),
+                    },
+                };
+                if let Some(o) = target.as_ref().and_then(deref_object) {
+                    let cid = o.borrow().class_id as usize;
+                    let key = self.prop_storage_key(cid, n, self.frames[top].class);
+                    if matches!(o.borrow().props.get(&key), Some(Zval::Undef)) {
+                        if let Some((decl, hint)) = prop_type_decl(&self.classes, cid, n) {
+                            if !hint.nullable {
+                                return Err(PhpError::Error(format!(
+                                    "Cannot access uninitialized non-nullable property {}::${} by reference",
+                                    String::from_utf8_lossy(&self.classes[decl].name),
+                                    String::from_utf8_lossy(n),
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            let cell = {
+                let fs = FieldScope { classes: &self.classes, scope: self.frames[top].class };
+                if let Some(mut root) = lazy_root {
+                    field_cell(&mut root, &steps, &mut keys.into_iter(), fs)?
+                } else {
+                    let base_cell = field_base_mut(&mut self.frames, &mut self.superglobals, top, base)?;
+                    if steps.is_empty() {
+                        make_cell(base_cell)
+                    } else {
+                        field_cell(base_cell, &steps, &mut keys.into_iter(), fs)?
+                    }
+                }
+            };
+            // A reference to a *typed* property keeps enforcing its type
+            // on writes through the alias (PHP's typed references).
+            match &steps[..] {
+                [FieldStep::Prop(name)] => {
+                    let name = name.clone();
+                    self.register_prop_typed_ref(base, top, &name, &cell);
+                }
+                [FieldStep::PropDyn] => {
+                    if let Some(k) = keys_first_backup.as_ref() {
+                        let name = self.dyn_prop_name_value(k)?;
+                        self.register_prop_typed_ref(base, top, &name, &cell);
+                    }
+                }
+                _ => {}
+            }
+            Ok(cell)
+    }
+}

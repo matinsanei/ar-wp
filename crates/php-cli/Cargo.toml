@@ -1,0 +1,41 @@
+[package]
+name = "php-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "phpr"
+path = "src/main.rs"
+
+[features]
+# WP-45 Fase 0: byte-attribution build (PHPR_MEM_CENSUS). Instrumentation
+# builds only — never parity/A-B binaries. See FOOTPRINT_CPU_ROADMAP.md.
+mem-census = ["php-runtime/mem-census", "php-types/mem-census"]
+# WP-62 M2.3: form-B arm-cost diagnostic (see php-runtime/relbase-probe).
+relbase-probe = ["php-runtime/relbase-probe"]
+# S-95.0 leva A-ZV1: contatori del meccanismo «clone che muore subito»
+# (PHPR_ZVAL_CENSUS=1 stampa la riga a fine processo). Strumentazione soltanto.
+zval-census = ["php-runtime/zval-census"]
+# S-79.0.6 (Council WP-80 A-BG16): per-request census line on the cli-server
+# arm — the prerequisite for judging A-BB1 (the alloc A/B needed counters on
+# BOTH arms; exit stats were never going to exist on this one, KG-79.B).
+census-instrumentation = ["php-runtime/census-instrumentation"]
+# S-103 leva-nulla (KS-BA-104-2): braccio B dell'A/B di taratura layout —
+# una pad function mai chiamata accanto a run_loop. Mai parità.
+null-lever = ["php-runtime/null-lever"]
+# S-145 sonda-B lato prezzi: SOLO il builtin __phpr_sonda_b, nessuna census
+# (wp145-harness/s145-sonda-b-modello.md). Probe build, mai parità.
+sonda-price = ["php-runtime/sonda-price"]
+# S-147 census unico ORM (concilio S-146): op-census per l'attribuzione dei
+# movimenti Zval al sito VM (righe s147mv/s147dg via mem-census). Solo
+# strumentazione — mai parità.
+op-census = ["php-runtime/op-census"]
+
+[dependencies]
+php-types.workspace = true
+php-runtime.workspace = true
+php-builtins.workspace = true
+log.workspace = true
+libc = "0.2"
+mimalloc.workspace = true

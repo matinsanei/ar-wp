@@ -1,0 +1,1454 @@
+//! VM oop logic, extracted from vm/mod.rs (no semantic change).
+use super::*;
+
+pub(super) fn read_property(recv: &Zval, name: &[u8], diags: &mut Diags) -> Zval {
+    match recv {
+        Zval::Object(o) => {
+            let obj = o.borrow();
+            if let Some(v) = obj.props.get(name) {
+                return v.deref_clone();
+            }
+            let cls = String::from_utf8_lossy(obj.class_name.as_bytes()).into_owned();
+            drop(obj);
+            // `name` may be a mangled storage key; diagnostics show the source name.
+            let prop = String::from_utf8_lossy(php_types::prop_display_name(name)).into_owned();
+            diags.push(Diag::Warning(format!("Undefined property: {cls}::${prop}")));
+            Zval::Null
+        }
+        Zval::Ref(rc) => read_property(&rc.borrow(), name, diags),
+        Zval::Null | Zval::Undef => {
+            let prop = String::from_utf8_lossy(name).into_owned();
+            diags.push(Diag::Warning(format!("Attempt to read property \"{prop}\" on null")));
+            Zval::Null
+        }
+        other => {
+            let prop = String::from_utf8_lossy(name).into_owned();
+            diags.push(Diag::Warning(format!(
+                "Attempt to read property \"{prop}\" on {}",
+                other.type_name_for_error()
+            )));
+            Zval::Null
+        }
+    }
+}
+
+/// Write `value` into property `name` of `recv` (following a `Ref` receiver),
+/// returning the value it displaced (`None` if the property was newly created).
+/// Callers that track destruction timing pass the displaced value to
+/// [`Vm::gc_note`]; the others drop it (unchanged behaviour).
+pub(super) fn write_property(recv: &Zval, name: &[u8], value: Zval) -> Result<Option<Zval>, PhpError> {
+    match recv {
+        Zval::Object(o) => {
+            // A slot holding a reference is written THROUGH — aliases keep
+            // seeing the update (Zend zend_assign_to_variable on an IS_REF
+            // slot); only a rebind (`=&`, the field_set_mode rebind path)
+            // replaces it.
+            let cell = match o.borrow().props.get(name) {
+                Some(Zval::Ref(cell)) => Some(Rc::clone(cell)),
+                _ => None,
+            };
+            if let Some(cell) = cell {
+                let old = std::mem::replace(&mut *cell.borrow_mut(), value);
+                return Ok(Some(old));
+            }
+            Ok(o.borrow_mut().props.replace(name, value))
+        }
+        Zval::Ref(rc) => write_property(&rc.borrow(), name, value),
+        other => Err(PhpError::Error(format!(
+            "Attempt to assign property \"{}\" on {}",
+            String::from_utf8_lossy(name),
+            other.type_name_for_error()
+        ))),
+    }
+}
+
+/// Slot-aware twin of [`read_property`] (WP-29): a resolved slot index reads
+/// the declared storage directly — no name hash, no dyn-entry scan. `None`
+/// slot, a `Ref` receiver, or an absent slot (unset → the undefined-property
+/// warning path) fall back to the by-name read, which owns every diagnostic.
+#[inline]
+pub(super) fn read_property_at(recv: &Zval, name: &[u8], slot: Option<u32>, diags: &mut Diags) -> Zval {
+    if let (Some(i), Zval::Object(o)) = (slot, recv) {
+        if let Some(v) = o.borrow().props.get_slot(i) {
+            return v.deref_clone();
+        }
+    }
+    read_property(recv, name, diags)
+}
+
+/// Slot-aware twin of [`write_property`] (WP-29): same write-through-`Ref`
+/// discipline, same displaced-value return for GC noting. A stale index
+/// (`Err` from `replace_slot`) or a `None` slot falls back to the name path —
+/// a write is never lost.
+#[inline]
+pub(super) fn write_property_at(recv: &Zval, name: &[u8], slot: Option<u32>, value: Zval) -> Result<Option<Zval>, PhpError> {
+    if let (Some(i), Zval::Object(o)) = (slot, recv) {
+        // A slot holding a reference is written THROUGH (aliases keep seeing
+        // the update) — mirror `write_property` exactly.
+        let cell = match o.borrow().props.get_slot(i) {
+            Some(Zval::Ref(cell)) => Some(Rc::clone(cell)),
+            _ => None,
+        };
+        if let Some(cell) = cell {
+            let old = std::mem::replace(&mut *cell.borrow_mut(), value);
+            return Ok(Some(old));
+        }
+        return match o.borrow_mut().props.replace_slot(i, value) {
+            Ok(old) => Ok(old),
+            Err(v) => write_property(recv, name, v),
+        };
+    }
+    write_property(recv, name, value)
+}
+
+/// Slot-aware twin of [`prop_isset`] (WP-29).
+#[inline]
+pub(super) fn prop_isset_at(recv: &Zval, name: &[u8], slot: Option<u32>) -> bool {
+    if let (Some(i), Zval::Object(o)) = (slot, recv) {
+        return match o.borrow().props.get_slot(i) {
+            Some(v) => !matches!(v.deref_clone(), Zval::Null | Zval::Undef),
+            None => false,
+        };
+    }
+    prop_isset(recv, name)
+}
+
+/// The shared storage cell for object property `name`, promoting it to a
+/// `Zval::Ref` in place if it is a plain value (so a `foreach ($o as &$v)` binds
+/// `$v` to the property and writes through it). The property must already exist.
+pub(super) fn prop_ref_cell(o: &Rc<RefCell<Object>>, name: &[u8]) -> Rc<RefCell<Zval>> {
+    let mut b = o.borrow_mut();
+    if let Some(Zval::Ref(rc)) = b.props.get(name) {
+        return Rc::clone(rc);
+    }
+    let cur = b.props.get(name).cloned().unwrap_or(Zval::Null);
+    let cell = php_types::zcell_prop(cur);
+    b.props.set(name, Zval::Ref(Rc::clone(&cell)));
+    cell
+}
+
+/// `isset($o->name)`: true iff the property exists and is not null/undefined
+/// (silent), following a reference receiver.
+pub(super) fn prop_isset(recv: &Zval, name: &[u8]) -> bool {
+    match recv {
+        Zval::Object(o) => match o.borrow().props.get(name) {
+            Some(v) => !matches!(v.deref_clone(), Zval::Null | Zval::Undef),
+            None => false,
+        },
+        Zval::Ref(rc) => prop_isset(&rc.borrow(), name),
+        _ => false,
+    }
+}
+
+/// `unset($o->name)`: remove the property (no-op if absent or non-object).
+pub(super) fn prop_unset(recv: &Zval, name: &[u8]) -> Option<Zval> {
+    match recv {
+        Zval::Object(o) => o.borrow_mut().props.remove(name),
+        Zval::Ref(rc) => prop_unset(&rc.borrow(), name),
+        _ => None,
+    }
+}
+
+/// Resolve a method by name at run time, walking the receiver class's `parent`
+/// chain child→ancestor (case-insensitive). Returns the *defining* class id and
+/// the method's index in [`crate::bytecode::CompiledClass::methods`].
+pub(super) fn resolve_method_runtime(classes: &[&CompiledClass], start: ClassId, name: &[u8]) -> Option<(ClassId, usize)> {
+    // WP-29 B1: the class's flattened case-insensitive table answers with a
+    // binary search (no chain walk, no per-method case-compare). Collisions
+    // sit adjacent (sorted by hash) and verify against the defining class's
+    // real method name. A miss — or an empty table (seed stub) — falls
+    // through to the walking scan below: cold (undefined-method paths), and
+    // the safety net should a linked chain ever exceed what the compiling
+    // unit saw.
+    if let Some(class) = classes.get(start) {
+        let tbl = &class.methods_ci;
+        // Below this size the direct chain scan (early-exit byte compare)
+        // beats hash+bsearch — same trade as PropsLayout's HASH_SCAN_MIN.
+        // The table still matters for the WP-style god classes (wpdb,
+        // WP_Query, PHPUnit TestCase chains: 50-300 methods).
+        if tbl.len() >= 12 {
+            let h = crate::bytecode::ci_hash(name);
+            let mut i = tbl.partition_point(|e| e.0 < h);
+            while let Some(&(eh, cid, midx)) = tbl.get(i) {
+                if eh != h {
+                    break;
+                }
+                if classes
+                    .get(cid as usize)
+                    .and_then(|c| c.methods.get(midx as usize))
+                    .is_some_and(|m| m.name.eq_ignore_ascii_case(name))
+                {
+                    return Some((cid as usize, midx as usize));
+                }
+                i += 1;
+            }
+        }
+    }
+    let mut cid = Some(start);
+    while let Some(c) = cid {
+        // `.get` rather than `[c]`: defensive against a stale id; the global class
+        // table (step 57, Phase 1c) keeps ids valid across modules.
+        let class = classes.get(c)?;
+        if let Some(i) = class.methods.iter().position(|m| m.name.eq_ignore_ascii_case(name)) {
+            return Some((c, i));
+        }
+        cid = class.parent;
+    }
+    None
+}
+
+/// The class id of an object value (following a reference), or `None` for a
+/// non-object.
+pub(super) fn object_class_id(v: &Zval) -> Option<ClassId> {
+    match v {
+        Zval::Object(o) => Some(o.borrow().class_id as usize),
+        Zval::Ref(rc) => object_class_id(&rc.borrow()),
+        _ => None,
+    }
+}
+
+/// The object a value resolves to (following a reference), or `None` for a
+/// non-object — for inspecting a field-path base that may be a `Ref`.
+pub(super) fn deref_object(v: &Zval) -> Option<Rc<RefCell<Object>>> {
+    match v {
+        Zval::Object(o) => Some(o.clone()),
+        Zval::Ref(rc) => deref_object(&rc.borrow()),
+        _ => None,
+    }
+}
+
+/// The object id of a value (following a reference), or 0 for a non-object — the
+/// key the hook guard uses to mark an active property hook on an instance.
+pub(super) fn object_id(v: &Zval) -> u32 {
+    match v {
+        Zval::Object(o) => o.borrow().id,
+        Zval::Ref(rc) => object_id(&rc.borrow()),
+        _ => 0,
+    }
+}
+
+/// Whether class `a` is `b` or descends from it (parent chain only) — the test
+/// behind forwarding `$this` propagation for `Parent::m()`-style calls.
+pub(super) fn class_is_a(classes: &[&CompiledClass], a: ClassId, b: ClassId) -> bool {
+    let mut cur = Some(a);
+    while let Some(c) = cur {
+        if c == b {
+            return true;
+        }
+        cur = classes[c].parent;
+    }
+    false
+}
+
+/// Resolve a class constant at run time (for `static::CONST`): own constants and
+/// parent chain first, then interfaces transitively. Returns the declaring class
+/// id and the constant's index. Case-sensitive, like PHP and the compiler's
+/// `find_class_const`.
+pub(super) fn find_const_runtime(classes: &[&CompiledClass], start: ClassId, name: &[u8]) -> Option<(ClassId, usize)> {
+    let mut c = Some(start);
+    while let Some(x) = c {
+        if let Some(i) = classes[x].consts.iter().position(|k| k.name.as_ref() == name) {
+            return Some((x, i));
+        }
+        c = classes[x].parent;
+    }
+    let mut c = Some(start);
+    while let Some(x) = c {
+        for &i in &classes[x].interfaces {
+            if let Some(r) = find_const_runtime(classes, i, name) {
+                return Some(r);
+            }
+        }
+        c = classes[x].parent;
+    }
+    None
+}
+
+/// The "call to undefined method" fatal, shared by instance and static dispatch.
+pub(super) fn undefined_method(classes: &[&CompiledClass], cid: ClassId, method: &[u8]) -> PhpError {
+    PhpError::Error(format!(
+        "Call to undefined method {}::{}()",
+        String::from_utf8_lossy(&classes[cid].name),
+        String::from_utf8_lossy(method)
+    ))
+}
+
+/// Whether a member of visibility `vis` declared on `decl` is accessible from the
+/// running frame's class `cur` (OOP-2b), mirroring the tree-walker's
+/// `visible_from`: public always; private only from the declaring class;
+/// protected from anywhere in the same hierarchy.
+pub(super) fn visible_from(classes: &[&CompiledClass], cur: Option<ClassId>, vis: Visibility, decl: ClassId) -> bool {
+    match vis {
+        Visibility::Public => true,
+        Visibility::Private => cur == Some(decl),
+        Visibility::Protected => matches!(
+            cur,
+            Some(cc) if class_is_a(classes, cc, decl) || class_is_a(classes, decl, cc)
+        ),
+    }
+}
+
+/// [`visible_from`] for a *method*, with Zend's prototype rule for `protected`:
+/// the check runs against the ROOT declaration up the parent chain, so a
+/// sibling subclass may call an override it inherited access to
+/// (zend_check_protected on `fbc->common.prototype` — PHPUnit's UnaryOperator
+/// calling IsIdentical::failureDescription, both under Constraint).
+pub(super) fn method_visible_from(
+    classes: &[&CompiledClass],
+    cur: Option<ClassId>,
+    vis: Visibility,
+    decl: ClassId,
+    method: &[u8],
+) -> bool {
+    if !matches!(vis, Visibility::Protected) {
+        return visible_from(classes, cur, vis, decl);
+    }
+    // Walk to the outermost ancestor that still declares (a non-private)
+    // `method`: that is the prototype's scope.
+    let mut root = decl;
+    let mut cur_cls = classes[decl].parent;
+    while let Some(p) = cur_cls {
+        let declares = classes[p]
+            .methods
+            .iter()
+            .any(|m| m.func.name.eq_ignore_ascii_case(method) && m.visibility != Visibility::Private);
+        if declares {
+            root = p;
+        }
+        cur_cls = classes[p].parent;
+    }
+    visible_from(classes, cur, vis, root)
+}
+
+/// Zend's non-virtual private dispatch (`zend_get_parent_private_method`):
+/// when instance dispatch on `cid` resolves `method` in a class OTHER than the
+/// caller's scope, but the scope is an ANCESTOR of `cid` and declares its OWN
+/// private method with that name, the call binds to the scope's private — a
+/// private method is never overridden; the subclass's same-name method exists
+/// only for calls from other scopes. Consumer of record (WP-10): PHPUnit 9's
+/// `TestCase::runBare` → `$this->checkRequirements()` must reach TestCase's
+/// private, not WP_UnitTestCase_Base's protected override (which would then
+/// call `parent::checkRequirements()` and fatal).
+pub(super) fn parent_private_rebind(
+    classes: &[&CompiledClass],
+    scope: Option<ClassId>,
+    cid: ClassId,
+    method: &[u8],
+    resolved: Option<(ClassId, usize)>,
+) -> Option<(ClassId, usize)> {
+    let scope = scope?;
+    let (defc, _) = resolved?;
+    if defc == scope || scope == cid || !class_is_a(classes, cid, scope) {
+        return None;
+    }
+    let (mi, m) = classes
+        .get(scope)?
+        .methods
+        .iter()
+        .enumerate()
+        .find(|(_, m)| m.func.name.eq_ignore_ascii_case(method))?;
+    (m.visibility == Visibility::Private).then_some((scope, mi))
+}
+
+/// True if any PROPER ancestor of `cid` declares a private method named
+/// `method` (ci): for such a hierarchy [`parent_private_rebind`] fires when
+/// that ancestor is the calling scope, making the resolution scope-DEPENDENT
+/// — the WP-30 [`crate::bytecode::MethodIc`] must not cache it. Mirrors the
+/// rebind's first-wins `find` (trait aliases can duplicate a name). Protected
+/// ancestors don't matter: the rebind is private-only and the IC only caches
+/// public winners.
+pub(super) fn private_shadow_in_chain(
+    classes: &[&CompiledClass],
+    cid: ClassId,
+    method: &[u8],
+) -> bool {
+    let mut cur = classes.get(cid).and_then(|c| c.parent);
+    while let Some(a) = cur {
+        let Some(class) = classes.get(a) else { break };
+        if let Some(m) = class
+            .methods
+            .iter()
+            .find(|m| m.func.name.eq_ignore_ascii_case(method))
+        {
+            if m.visibility == Visibility::Private {
+                return true;
+            }
+        }
+        cur = class.parent;
+    }
+    false
+}
+
+/// Look up the unified, compile-time-resolved metadata for a declared instance
+/// property — a single hashmap lookup over the parent-flattened `prop_info` table
+/// (the flattening, with all shadowing rules applied, happened in `compile_class`).
+/// `None` for a dynamic / undeclared property. The `.get(class)?` is defensive
+/// against a partially-seeded class table.
+pub(super) fn prop_info<'a>(classes: &[&'a CompiledClass], class: ClassId, name: &[u8]) -> Option<&'a PropInfo> {
+    classes.get(class)?.prop_info.get(name)
+}
+
+/// Outcome of resolving a property access `obj->name` from a given `scope`
+/// (the property-mangling resolver). Decides both *which storage slot* an access
+/// targets and *whether* it is permitted.
+pub(super) enum PropAccess<'a> {
+    /// An accessible declared property: read/write under this storage key (the
+    /// plain name today; a mangled `\0Class\0name` for a private once mangling is on).
+    /// Borrowed from the class's immutable `prop_info` table (`'a` = the class
+    /// data's lifetime, independent of any `&Vm` borrow) — a property access
+    /// resolves without allocating. `slot` is the storage slot's index in the
+    /// OBJECT class's layout when known (WP-29: `Props::get_slot` skips the
+    /// name hash); `None` = virtual hooked, or an index that cannot be
+    /// trusted for this instance — use the key path.
+    Slot { key: &'a [u8], slot: Option<u32> },
+    /// No accessible declared property of this name — an undeclared (dynamic)
+    /// property, or (once mangling lands) a private declared only by an ancestor and
+    /// invisible to a related scope. Behaves as a dynamic property under the plain
+    /// name (a read warns "Undefined property", a write creates it).
+    Dynamic,
+    /// Declared but not accessible from `scope`: the caller raises the visibility
+    /// error (after first offering a magic accessor).
+    Denied { decl: ClassId, vis: Visibility },
+}
+
+/// Resolve a property access `obj_class->name` from `scope`. Single source of truth
+/// for both the storage key and the visibility decision, mirroring Zend's
+/// zend_get_property_info:
+///
+/// 1. If the running scope itself declares a *private* `name` and the object is an
+///    instance of that scope, the access targets the scope's mangled slot — even if
+///    a subclass redeclared a same-name private (the dual-slot case).
+/// 2. Otherwise the object's flattened table decides: an undeclared name is
+///    `Dynamic`; a visible declaration resolves to its slot; a *parent's* private
+///    on a child instance behaves as undeclared (Zend drops it from the child's
+///    table — reads warn "Undefined property", writes create a dynamic one); only
+///    an invisible private declared by the object's own class (or an invisible
+///    protected) is `Denied`.
+pub(super) fn resolve_prop_access<'a>(classes: &[&'a CompiledClass], obj_class: ClassId, name: &[u8], scope: Option<ClassId>) -> PropAccess<'a> {
+    if let Some(s) = scope {
+        if let Some(pi) = prop_info(classes, s, name) {
+            if pi.visibility == Visibility::Private
+                && pi.declaring_class == s
+                && class_is_a(classes, obj_class, s)
+            {
+                // The slot index is stamped against the SCOPE class's layout.
+                // A subclass instance shares the parent's leading indices
+                // UNLESS a virtual redeclaration removed storage entries
+                // (index shift), so only trust it when the object IS the
+                // scope class; otherwise fall back to the key path.
+                return PropAccess::Slot {
+                    key: &pi.storage_key,
+                    slot: if obj_class == s { pi.slot } else { None },
+                };
+            }
+        }
+    }
+    match prop_info(classes, obj_class, name) {
+        None => PropAccess::Dynamic,
+        Some(pi) => {
+            if visible_from(classes, scope, pi.visibility, pi.declaring_class) {
+                // `pi` comes from the OBJECT class's own flattened table, so
+                // its stamped slot indexes that class's layout — always valid
+                // for this instance.
+                PropAccess::Slot { key: &pi.storage_key, slot: pi.slot }
+            } else if pi.visibility == Visibility::Private && pi.declaring_class != obj_class {
+                PropAccess::Dynamic
+            } else {
+                PropAccess::Denied { decl: pi.declaring_class, vis: pi.visibility }
+            }
+        }
+    }
+}
+
+/// True when [`resolve_prop_access`]'s step-1 rule applies: the running
+/// scope declares its OWN private `name` and the object is an instance of
+/// that scope — the access targets the scope's mangled slot, so any
+/// leaf-table shortcut (the WP-25 per-class fast paths, which read the
+/// child's flattened entry) would resolve the WRONG storage. Discovered by
+/// the WP-35 scoped-IC tests: parent-private shadowed by a child-public
+/// same-name prop read 'c' where Zend reads 'p'.
+pub(super) fn scope_private_overrides(
+    classes: &[&CompiledClass],
+    obj_class: ClassId,
+    name: &[u8],
+    scope: Option<ClassId>,
+) -> bool {
+    if let Some(s) = scope {
+        if let Some(pi) = prop_info(classes, s, name) {
+            return pi.visibility == Visibility::Private
+                && pi.declaring_class == s
+                && class_is_a(classes, obj_class, s);
+        }
+    }
+    false
+}
+
+/// The property-resolution context a mixed field path (the recursive
+/// `field_write` / `field_get` / `field_unset` / `field_cell` walkers) drills
+/// with: the loaded classes plus the scope every `Prop` step resolves from.
+/// `Copy`, so the walkers thread it for free; the storage key is re-resolved at
+/// each `Prop` step against the class of the object actually encountered there,
+/// under the *same* scope — exactly Zend, where every FETCH_OBJ resolves with
+/// the executing function's scope.
+#[derive(Clone, Copy)]
+pub(super) struct FieldScope<'a> {
+    pub(super) classes: &'a [&'a CompiledClass],
+    pub(super) scope: Option<ClassId>,
+}
+
+impl<'a> FieldScope<'a> {
+    /// The storage key a `Prop` step addresses on an instance of `ocid`: the
+    /// resolved slot key for an accessible declared property, the plain name for
+    /// a dynamic one. A `Denied` step keeps addressing the *declared* slot — the
+    /// mixed-path walkers have never enforced visibility (pre-existing gap: no
+    /// `__get`/`__set` protocol on intermediate steps either), so an inaccessible
+    /// private must keep hitting its real storage rather than autovivifying a
+    /// parallel dynamic property (Bug #34893's `$a->p->t = 'bar'` through `__get`).
+    /// Like [`Self::prop_key`], but for the SILENT read walker (`field_get`,
+    /// backing isset/empty/`??`): an inaccessible declared property reads as
+    /// absent (`None`) — PHP's `isset($o->private)` from outside is false and
+    /// `$o->private ?? $d` yields `$d`, with no error (mirrors Op::PropIsset).
+    pub(super) fn prop_key_read<'n>(&self, ocid: ClassId, name: &'n [u8]) -> Option<std::borrow::Cow<'n, [u8]>>
+    where
+        'a: 'n,
+    {
+        match resolve_prop_access(self.classes, ocid, name, self.scope) {
+            // Borrowed straight from the class table (WP-29): the resolved
+            // key used to be copied per Prop step — a per-access allocation
+            // on every mixed-path walk.
+            PropAccess::Slot { key: k, .. } => Some(std::borrow::Cow::Borrowed(k)),
+            PropAccess::Dynamic => Some(std::borrow::Cow::Borrowed(name)),
+            PropAccess::Denied { .. } => None,
+        }
+    }
+
+    /// Whether `name` resolves to a *declared, accessible* property slot on an
+    /// instance of `ocid` from this scope — the guard the fused field ops use
+    /// before dispatching the ArrayAccess protocol on a leaf, so a *dynamic*
+    /// (magic/undeclared) property is left to the plain walker (bug40833:
+    /// `unset($o->magicProp[0])` must not skip `__get`).
+    pub(super) fn prop_is_declared_slot(&self, ocid: ClassId, name: &[u8]) -> bool {
+        matches!(resolve_prop_access(self.classes, ocid, name, self.scope), PropAccess::Slot { .. })
+    }
+
+    /// For a `Denied` resolution, the visibility word of PHP's "Cannot access
+    /// {vis} property" error; `None` when the property is accessible (or
+    /// dynamic) from this scope.
+    pub(super) fn prop_denied_vis(&self, ocid: ClassId, name: &[u8]) -> Option<&'static str> {
+        match resolve_prop_access(self.classes, ocid, name, self.scope) {
+            PropAccess::Denied { .. } => Some(
+                prop_info(self.classes, ocid, name)
+                    .map(|pi| match pi.visibility {
+                        Visibility::Private => "private",
+                        Visibility::Protected => "protected",
+                        Visibility::Public => "public",
+                    })
+                    .unwrap_or("private"),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Whether `name` is a *hooked* property on an instance of `ocid` (PHP 8.4).
+    /// A leaf write on one must defer to the VM caller so the set hook (or the
+    /// hooked-property write rules) dispatches — the walker itself only writes
+    /// raw storage.
+    pub(super) fn prop_hooked(&self, ocid: ClassId, name: &[u8]) -> bool {
+        prop_info(self.classes, ocid, name).is_some_and(|pi| pi.hooks.is_some())
+    }
+
+    /// Whether `name` is a declared TYPED property on `ocid`: a leaf write
+    /// must defer to the VM caller for type enforcement (and through-ref
+    /// typed sources) — the walker itself writes raw storage.
+    pub(super) fn prop_typed(&self, ocid: ClassId, name: &[u8]) -> bool {
+        prop_info(self.classes, ocid, name).is_some_and(|pi| pi.type_hint.is_some())
+    }
+
+    pub(super) fn prop_key<'n>(&self, ocid: ClassId, name: &'n [u8]) -> std::borrow::Cow<'n, [u8]>
+    where
+        'a: 'n,
+    {
+        match resolve_prop_access(self.classes, ocid, name, self.scope) {
+            PropAccess::Slot { key: k, .. } => std::borrow::Cow::Borrowed(k),
+            PropAccess::Denied { .. } => match prop_info(self.classes, ocid, name) {
+                Some(pi) => std::borrow::Cow::Borrowed(pi.storage_key.as_ref()),
+                None => std::borrow::Cow::Borrowed(name),
+            },
+            PropAccess::Dynamic => std::borrow::Cow::Borrowed(name),
+        }
+    }
+}
+
+/// The declaring class of a `readonly` instance property, or `None` if
+/// non-readonly / dynamic. The shadowing (a more-derived non-readonly
+/// redeclaration cancels) is already baked into `PropInfo.readonly`.
+pub(super) fn prop_readonly_decl(classes: &[&CompiledClass], class: ClassId, name: &[u8]) -> Option<ClassId> {
+    prop_info(classes, class, name).filter(|pi| pi.readonly).map(|pi| pi.declaring_class)
+}
+
+/// A typed instance property's declaring class and declared type, or `None` if
+/// untyped / dynamic. The untyped-redeclaration-cancels-type shadowing is already
+/// baked into `PropInfo.type_hint`.
+pub(super) fn prop_type_decl(classes: &[&CompiledClass], class: ClassId, name: &[u8]) -> Option<(ClassId, TypeHint)> {
+    let pi = prop_info(classes, class, name)?;
+    pi.type_hint.clone().map(|h| (pi.declaring_class, h))
+}
+
+/// A declared instance property's visibility and declaring class, or `None` if
+/// dynamic / undeclared.
+pub(super) fn prop_vis_decl(classes: &[&CompiledClass], class: ClassId, name: &[u8]) -> Option<(Visibility, ClassId)> {
+    prop_info(classes, class, name).map(|pi| (pi.visibility, pi.declaring_class))
+}
+
+/// Resolve a static property to its declaring class and index, walking the parent
+/// chain (OOP-2b).
+pub(super) fn find_static_prop(classes: &[&CompiledClass], start: ClassId, name: &[u8]) -> Option<(ClassId, usize)> {
+    let mut cid = Some(start);
+    while let Some(c) = cid {
+        if let Some(i) = classes[c].static_props.iter().position(|p| p.name.as_ref() == name) {
+            return Some((c, i));
+        }
+        cid = classes[c].parent;
+    }
+    None
+}
+
+/// Enforce instance-property visibility for an access from frame class `cur` on an
+/// object of `obj_class`. A dynamic / undeclared property is always accessible;
+/// the error cases are exactly [`resolve_prop_access`]'s `Denied` outcomes.
+pub(super) fn check_prop_access(
+    classes: &[&CompiledClass],
+    cur: Option<ClassId>,
+    obj_class: ClassId,
+    name: &[u8],
+) -> Result<(), PhpError> {
+    match resolve_prop_access(classes, obj_class, name, cur) {
+        PropAccess::Denied { decl, vis } => Err(prop_access_error(classes, decl, name, vis)),
+        _ => Ok(()),
+    }
+}
+
+/// The "Cannot access {private,protected} property C::$p" fatal.
+pub(super) fn prop_access_error(classes: &[&CompiledClass], decl: ClassId, name: &[u8], vis: Visibility) -> PhpError {
+    let kind = if matches!(vis, Visibility::Private) { "private" } else { "protected" };
+    PhpError::Error(format!(
+        "Cannot access {kind} property {}::${}",
+        String::from_utf8_lossy(&classes[decl].name),
+        String::from_utf8_lossy(name)
+    ))
+}
+
+/// The "Call to {private,protected} method C::m() from <scope>" fatal.
+pub(super) fn method_access_error(
+    classes: &[&CompiledClass],
+    decl: ClassId,
+    method: &[u8],
+    cur: Option<ClassId>,
+    vis: Visibility,
+) -> PhpError {
+    let kind = if matches!(vis, Visibility::Private) { "private" } else { "protected" };
+    let scope = match cur {
+        Some(c) => format!("scope {}", String::from_utf8_lossy(&classes[c].name)),
+        None => "global scope".to_string(),
+    };
+    PhpError::Error(format!(
+        "Call to {kind} method {}::{}() from {scope}",
+        String::from_utf8_lossy(&classes[decl].name),
+        String::from_utf8_lossy(method)
+    ))
+}
+
+/// The PHP 8.4 asymmetric-visibility write/unset denial for a NON-readonly
+/// declared property: `Some(fatal)` when `name`'s explicit set visibility
+/// excludes the running scope `cur` (readonly properties return `None` — the
+/// readonly write path owns their message shapes, set visibility included).
+/// `verb` is "modify" for an assignment, "unset" for `unset()`. The
+/// magic-`__set`/`__unset` dispatch for an explicitly-unset slot happens
+/// BEFORE this check (magic_applies), matching Zend's order.
+pub(super) fn asym_write_error(
+    classes: &[&CompiledClass],
+    cur: Option<ClassId>,
+    obj_class: ClassId,
+    name: &[u8],
+    verb: &str,
+) -> Option<PhpError> {
+    // Class-level pre-check: no asymmetric property anywhere in the
+    // flattened table → no lookup at all (the overwhelmingly common case).
+    if !classes.get(obj_class)?.has_asym_set {
+        return None;
+    }
+    let pi = prop_info(classes, obj_class, name)?;
+    let sv = pi.set_visibility?;
+    if pi.readonly {
+        return None;
+    }
+    // `protected(set)` is scoped against the property's PROTOTYPE — the root
+    // declaration up the parent chain — like protected methods (GH-19044: a
+    // sibling subclass may write a slot they both inherit). The error message
+    // still names the most-derived declaration.
+    let mut check_decl = pi.declaring_class;
+    if sv == Visibility::Protected {
+        while let Some(p) = classes.get(check_decl).and_then(|c| c.parent) {
+            match classes.get(p).and_then(|c| c.prop_info.get(name)) {
+                Some(ppi) => check_decl = ppi.declaring_class,
+                None => break,
+            }
+        }
+    }
+    if visible_from(classes, cur, sv, check_decl) {
+        return None;
+    }
+    let kind = match sv {
+        Visibility::Private => "private(set)",
+        _ => "protected(set)",
+    };
+    let scope = match cur {
+        Some(c) => format!("scope {}", String::from_utf8_lossy(&classes[c].name)),
+        None => "global scope".to_string(),
+    };
+    Some(PhpError::Error(format!(
+        "Cannot {verb} {kind} property {}::${} from {scope}",
+        String::from_utf8_lossy(&classes[pi.declaring_class].name),
+        String::from_utf8_lossy(name)
+    )))
+}
+
+/// What a W/RW/UNSET container fetch found in a property slot, for
+/// [`prop_indirect_guard`].
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum PropSlotState {
+    /// Holds an object — indirection through the handle never writes the slot.
+    Object,
+    /// Absent or typed-uninitialized (`Undef`).
+    Uninit,
+    /// Any other value (array / scalar / string).
+    Value,
+}
+
+/// Classify a raw property slot for [`prop_indirect_guard`] (references are
+/// looked through, like Zend's DEREF before the type check).
+pub(super) fn prop_slot_state(slot: Option<&Zval>) -> PropSlotState {
+    match slot {
+        None | Some(Zval::Undef) => PropSlotState::Uninit,
+        Some(Zval::Ref(c)) => prop_slot_state(Some(&c.borrow())),
+        Some(Zval::Object(_)) => PropSlotState::Object,
+        Some(_) => PropSlotState::Value,
+    }
+}
+
+/// The PHP 8.4 guard for fetching a *declared* property as a WRITE container
+/// (`$o->p[…] = v`, `$o->p->x = v`, `&$o->p`, `unset($o->p[…])`) — Zend's
+/// `zend_std_get_property_ptr_ptr` + `zend_std_read_property` pair for
+/// BP_VAR_W/RW/UNSET on a readonly or set-visibility-restricted slot:
+/// - a compound (`rw`) fetch of an uninitialized TYPED slot is the "Typed
+///   property C::$p must not be accessed before initialization" fatal, BEFORE
+///   any readonly/aviz consideration (ptr_ptr's BP_VAR_RW branch — fires for
+///   plain typed properties too);
+/// - an object value passes (Zend hands back a handle copy — writes through it
+///   cannot modify the slot);
+/// - readonly is "Cannot indirectly modify readonly property C::$p"
+///   (unconditional — Zend denies even the declaring scope);
+/// - a denied set visibility is "Cannot indirectly modify {kind} property
+///   C::$p from {scope}" (prototype-scoped like [`asym_write_error`]);
+/// - an UNSET fetch of an uninitialized slot is a silent no-op.
+/// A slot that is not get-accessible from `cur` is exempt: Zend falls to the
+/// magic (`__get`) protocol there, which the walkers' deferral already serves.
+pub(super) fn prop_indirect_guard(
+    classes: &[&CompiledClass],
+    cur: Option<ClassId>,
+    obj_class: ClassId,
+    name: &[u8],
+    state: PropSlotState,
+    rw: bool,
+    unset: bool,
+) -> Result<(), PhpError> {
+    let Some(pi) = prop_info(classes, obj_class, name) else { return Ok(()) };
+    if !matches!(resolve_prop_access(classes, obj_class, name, cur), PropAccess::Slot { .. }) {
+        return Ok(());
+    }
+    if rw && state == PropSlotState::Uninit && pi.type_hint.is_some() {
+        return Err(PhpError::Error(format!(
+            "Typed property {}::${} must not be accessed before initialization",
+            String::from_utf8_lossy(&classes[pi.declaring_class].name),
+            String::from_utf8_lossy(name)
+        )));
+    }
+    if state == PropSlotState::Object {
+        return Ok(());
+    }
+    if pi.readonly {
+        if unset && state == PropSlotState::Uninit {
+            return Ok(());
+        }
+        return Err(PhpError::Error(format!(
+            "Cannot indirectly modify readonly property {}::${}",
+            String::from_utf8_lossy(&classes[pi.declaring_class].name),
+            String::from_utf8_lossy(name)
+        )));
+    }
+    if let Some(err) = asym_write_error(classes, cur, obj_class, name, "indirectly modify") {
+        if unset && state == PropSlotState::Uninit {
+            return Ok(());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Decide whether writing readonly property `decl::$name` from scope `cur` is
+/// allowed, given whether the property is already initialised on the instance.
+/// Returns the fatal to raise, or `None` if the write is a permitted first
+/// initialisation. Mirrors PHP 8.4: an already-initialised readonly property
+/// cannot be modified from *any* scope; an uninitialised one carries implicit
+/// `protected(set)` visibility — unless an explicit aviz modifier widens it
+/// (`public public(set) readonly`, Symfony's Cache attribute) or narrows it
+/// (`private(set) readonly`).
+pub(super) fn readonly_write_error(
+    classes: &[&CompiledClass],
+    cur: Option<ClassId>,
+    decl: ClassId,
+    name: &[u8],
+    initialized: bool,
+    set_vis: Option<Visibility>,
+) -> Option<PhpError> {
+    let cls = String::from_utf8_lossy(&classes[decl].name);
+    let prop = String::from_utf8_lossy(name);
+    if initialized {
+        return Some(PhpError::Error(format!("Cannot modify readonly property {cls}::${prop}")));
+    }
+    // Uninitialised: allowed from scopes the (explicit or implicit) set
+    // visibility admits. An explicit aviz modifier also owns the error text —
+    // Zend then omits the "readonly" word ("Cannot modify private(set)
+    // property C::$p from global scope").
+    let vis = set_vis.unwrap_or(Visibility::Protected);
+    if visible_from(classes, cur, vis, decl) {
+        return None;
+    }
+    // Zend drops the "readonly" word only for an explicit private(set)
+    // (the aviz error path owns that shape); an explicit — or implicit —
+    // protected(set) readonly keeps it (asymmetric_visibility/readonly.phpt).
+    let kind = match (set_vis, vis) {
+        (Some(_), Visibility::Private) => "private(set) property",
+        _ => "protected(set) readonly property",
+    };
+    let scope = match cur {
+        Some(c) => format!("scope {}", String::from_utf8_lossy(&classes[c].name)),
+        None => "global scope".to_string(),
+    };
+    Some(PhpError::Error(format!(
+        "Cannot modify {kind} {cls}::${prop} from {scope}"
+    )))
+}
+
+/// Whether an object of `class_id` is an instance of `target`: the class itself,
+/// any ancestor, or any implemented interface (transitively), mirroring the
+/// tree-walker's `is_instance_of` (OOP-1 omits the `Stringable` auto-impl).
+pub(super) fn is_instance_of(
+    classes: &[&CompiledClass],
+    stringable: Option<ClassId>,
+    class_id: ClassId,
+    target: ClassId,
+) -> bool {
+    // `Stringable` is auto-implemented (step 24-1): any class with a resolvable
+    // `__toString` satisfies it, even without an explicit `implements Stringable`.
+    if stringable == Some(target)
+        && resolve_method_runtime(classes, class_id, b"__toString").is_some()
+    {
+        return true;
+    }
+    let mut cur = Some(class_id);
+    while let Some(c) = cur {
+        if c == target {
+            return true;
+        }
+        if classes[c].interfaces.iter().any(|&i| iface_is_a(classes, i, target)) {
+            return true;
+        }
+        cur = classes[c].parent;
+    }
+    false
+}
+
+/// Whether interface `i` is, or transitively extends, `target`.
+pub(super) fn iface_is_a(classes: &[&CompiledClass], i: ClassId, target: ClassId) -> bool {
+    if i == target {
+        return true;
+    }
+    classes[i].interfaces.iter().any(|&p| iface_is_a(classes, p, target))
+}
+
+impl<'m> Vm<'m> {
+    /// Memoized [`is_instance_of`] (WP-36): the first walk's answer for a
+    /// `(class, target)` pair is final for the life of the run (append-only
+    /// class table, immutable ancestry — see `iof_cache`), so the hot callers
+    /// — the `Fiber` shunt on every instance call, `instanceof`, catch
+    /// matching — pay one hash lookup instead of the chain walk.
+    pub(super) fn instance_of(&self, class_id: ClassId, target: ClassId) -> bool {
+        if let Some(&b) = self.iof_cache.borrow().get(&(class_id, target)) {
+            return b;
+        }
+        let b = is_instance_of(&self.classes, self.stringable_id, class_id, target);
+        self.iof_cache.borrow_mut().insert((class_id, target), b);
+        b
+    }
+
+    /// `(object)` cast (PAR): an object passes through; an array becomes a
+    /// stdClass with one property per element (int keys stringified); null/unset
+    /// is an empty stdClass; a scalar becomes `stdClass { scalar: v }`. Mirrors
+    /// `eval::object_cast`.
+    pub(super) fn object_cast(&mut self, v: Zval) -> Result<Zval, PhpError> {
+        match v.deref_clone() {
+            // Any object-flavoured value passes through unchanged: in PHP
+            // `(object)$o` on an object (closures and generators included) is
+            // the SAME instance — WP's `_wp_filter_build_unique_id` relies on
+            // `spl_object_id((object)$closure)` being stable across calls.
+            obj @ (Zval::Object(_) | Zval::Closure(_) | Zval::Generator(_)) => Ok(obj),
+            Zval::Array(a) => {
+                let obj = self.alloc_stdclass()?;
+                if let Zval::Object(o) = &obj {
+                    let mut b = o.borrow_mut();
+                    for (k, val) in a.iter() {
+                        let name = match k {
+                            Key::Int(i) => i.to_string().into_bytes(),
+                            Key::Str(s) => s.as_bytes().to_vec(),
+                        };
+                        b.props.set(&name, val.deref_clone());
+                    }
+                }
+                Ok(obj)
+            }
+            Zval::Null | Zval::Undef => self.alloc_stdclass(),
+            scalar => {
+                let obj = self.alloc_stdclass()?;
+                if let Zval::Object(o) = &obj {
+                    o.borrow_mut().props.set(b"scalar", scalar);
+                }
+                Ok(obj)
+            }
+        }
+    }
+
+    /// Allocate a fresh empty `stdClass` instance (PAR), for `(object)` casts.
+    /// Resolved against the VM's own table (NOT the current module's index:
+    /// a WP-63 contract-v2 unit module carries an empty `class_index`; the
+    /// two resolve identically whenever both are populated — stdClass is
+    /// registered by the prelude in every image).
+    pub(super) fn alloc_stdclass(&mut self) -> Result<Zval, PhpError> {
+        let cid = self
+            .class_index
+            .get(&b"stdclass"[..])
+            .copied()
+            .ok_or_else(|| PhpError::Error("VM: stdClass is not available".to_string()))?;
+        self.alloc_object(cid)
+    }
+
+    /// Resolve a runtime class-reference value to its class id (PAR, dynamic
+    /// class): an object reuses its class; a string is looked up
+    /// case-insensitively with a leading `\` stripped; anything else (or an
+    /// unknown name) yields `None`. Used by `instanceof $cls` (where `None` means
+    /// `false`); `new $cls` resolves inline so it can distinguish the error kinds.
+    pub(super) fn class_id_from_value(&self, v: &Zval) -> Option<ClassId> {
+        match v {
+            Zval::Object(o) => Some(o.borrow().class_id as usize),
+            Zval::Str(s) => {
+                let raw = s.as_bytes();
+                let name = raw.strip_prefix(b"\\").unwrap_or(raw);
+                self.class_index.get(LcKey::new(name).as_slice()).copied()
+            }
+            Zval::Ref(r) => self.class_id_from_value(&r.borrow()),
+            _ => None,
+        }
+    }
+
+    /// [`Self::class_id_from_value`] with a class-*name* miss running the
+    /// autoloaders first — `method_exists`/`property_exists` on a not-yet-loaded
+    /// class name load it, like PHP (dbal's Symfony-version probes rely on it).
+    /// `instanceof` keeps the non-loading variant (Zend does not autoload there).
+    pub(super) fn class_id_from_value_autoload(
+        &mut self,
+        v: &Zval,
+    ) -> Result<Option<ClassId>, PhpError> {
+        if let Some(c) = self.class_id_from_value(v) {
+            return Ok(Some(c));
+        }
+        match v {
+            Zval::Str(s) => {
+                let raw = s.as_bytes();
+                let name = raw.strip_prefix(b"\\").unwrap_or(raw).to_vec();
+                self.resolve_class_autoload(&name)
+            }
+            Zval::Ref(r) => {
+                let inner = r.borrow().clone();
+                self.class_id_from_value_autoload(&inner)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) fn magic_applies(
+        &self,
+        o: &Rc<RefCell<Object>>,
+        name: &[u8],
+        cur_class: Option<ClassId>,
+        kind: MagicKind,
+        magic_name: &[u8],
+    ) -> Option<(ClassId, usize, u32)> {
+        let cid = o.borrow().class_id as usize;
+        let access = resolve_prop_access(&self.classes, cid, name, cur_class);
+        self.magic_applies_resolved(o, name, &access, kind, magic_name)
+    }
+
+    /// [`Self::magic_applies`] with the property access already resolved by
+    /// the caller (S-133 ctor resolve-once): `prop_set_entry`'s non-plain
+    /// path resolves ONCE and shares the result between this check and its
+    /// key/slot block. `access` MUST come from `resolve_prop_access` on the
+    /// SAME (object class, name, scope) triple the wrapper would use —
+    /// equivalence by construction (the resolve is pure and nothing between
+    /// the two former call sites mutates class or props).
+    pub(super) fn magic_applies_resolved(
+        &self,
+        o: &Rc<RefCell<Object>>,
+        name: &[u8],
+        access: &PropAccess<'_>,
+        kind: MagicKind,
+        magic_name: &[u8],
+    ) -> Option<(ClassId, usize, u32)> {
+        let (cid, oid, present, accessible) = {
+            let obj = o.borrow();
+            let cid = obj.class_id as usize;
+            // Presence is judged at the *resolved* slot: a declared-but-unset
+            // private (mangled key) triggers magic from its own scope; a parent's
+            // private resolved `Dynamic` from a child scope is "present" only if a
+            // plain dynamic slot exists.
+            // An explicitly-unset typed property (slot kept `Undef`, marked)
+            // counts as ABSENT here, so `__get`/`__isset` dispatch for it —
+            // never-initialized typed slots (Undef, unmarked) stay "present"
+            // and keep the before-init fatal on read instead.
+            let undef_unset = |key: &[u8]| {
+                matches!(obj.props.get(key), Some(Zval::Undef)) && obj.is_typed_unset(key)
+            };
+            let (present, accessible) = match access {
+                PropAccess::Slot { key: k, .. } => (obj.props.contains(k) && !undef_unset(k), true),
+                PropAccess::Dynamic => (obj.props.contains(name) && !undef_unset(name), true),
+                PropAccess::Denied { .. } => (obj.props.contains(name), false),
+            };
+            (cid, obj.id, present, accessible)
+        };
+        if present && accessible {
+            return None;
+        }
+        if !self.magic_guard.is_empty() && self.magic_guard.contains(&(oid, kind, name.to_vec())) {
+            return None;
+        }
+        let (defc, midx) = resolve_method_runtime(&self.classes, cid, magic_name)?;
+        Some((defc, midx, oid))
+    }
+
+    /// Run `__destruct` on every object still tracked at the end of the script,
+    /// in reverse creation order (PHP shutdown is LIFO), step OOP-3d. The frame
+    /// stack is cleared first so this works even after a fatal unwound `main`.
+    /// Run `register_shutdown_function` callbacks in registration order at script
+    /// end — after the main run (and any uncaught-fatal banner), before object
+    /// destructors. A synthetic `main` frame gives `call_callable` a caller frame
+    /// for value-builtin results. A throw inside a callback is swallowed (PHP turns
+    /// it into a separate shutdown-time fatal, not modelled here).
+    pub(super) fn run_shutdown_functions(&mut self) {
+        if self.shutdown_fns.is_empty() {
+            return;
+        }
+        // Zend runs shutdown callbacks BEFORE the globals teardown: the bottom
+        // (global) frame must survive, because its slots ARE the global
+        // variables (`global $upgrading` in WP_Fatal_Error_Handler::handle, or
+        // any callback reading $GLOBALS). After a normal end the frame was
+        // parked by `Ret` (`retired_main`); after a fatal it is still the
+        // unwind floor. The synthetic stand-in covers the no-frames edge.
+        self.frames.truncate(1);
+        if self.frames.is_empty() {
+            match self.retired_main.take() {
+                Some(f) => self.frames.push(f),
+                None => self.frames.push(Frame::new(&self.module.main, self.module)),
+            }
+        }
+        for (cb, args) in std::mem::take(&mut self.shutdown_fns) {
+            // `exit`/`die` in a shutdown callback aborts the remaining callbacks
+            // (PHP). Other throws are swallowed (a separate fatal is not modelled).
+            if let Err(PhpError::Exit(_)) = self.call_callable(cb, args) {
+                break;
+            }
+        }
+        self.frames.truncate(1);
+    }
+
+    pub(super) fn run_shutdown_destructors(&mut self) {
+        // Phase A (S-72.4, Zend `shutdown_destructors`): repeated
+        // `zend_hash_reverse_apply(symbol_table, zend_call_destructors)` —
+        // walk the GLOBAL slots in REVERSE order and release only an OBJECT
+        // slot holding the LAST user reference (strong == slot + store
+        // registry [+ gc-buffer clone]), until a pass changes nothing.
+        // Cyclic or shared globals survive to the store-walk below (fixture
+        // d2: dtor order c,a then b,d,e). Ref-held globals are left to the
+        // store-walk (Zend's IS_INDIRECT niche — not modelled).
+        // After a normal end the global frame was parked by `Ret`
+        // (`retired_main`); after a fatal it is still `frames[0]`.
+        let mut gframe = if !self.frames.is_empty() {
+            Some(self.frames.swap_remove(0))
+        } else {
+            self.retired_main.take()
+        };
+        if let Some(gf) = gframe.as_mut() {
+            loop {
+                let mut changed = false;
+                for idx in (0..gf.slots.len()).rev() {
+                    // OBS-1 (INV-RECV-1, tavola emendata S-103): absolute
+                    // strong_count observer — mid-arm the in-flight receiver
+                    // handle keeps the count above this threshold.
+                    let last_user_ref = |rc: &Rc<RefCell<Object>>| {
+                        // BORROW-OK: shared read, no walk in flight.
+                        let extra = usize::from(rc.borrow().gc.buffered());
+                        Rc::strong_count(rc) == 2 + extra
+                    };
+                    let releasable = match &gf.slots[idx] {
+                        Zval::Object(rc) => last_user_ref(rc),
+                        // OBS-2 (INV-RECV-1): a Closure is an object in
+                        // Zend's symbol table: a slot holding its only
+                        // reference releases here and its captures die with
+                        // it (droporder in-closure).
+                        Zval::Closure(c) => Rc::strong_count(c) == 1,
+                        // OBS-3 (INV-RECV-1, FUORI perimetro move: observes
+                        // the CELL, never the moved handle). After any
+                        // include, main's globals live in SHARED cells
+                        // (cross-unit slot bridging) — Zend's symbol table
+                        // holds them as plain objects, so a cell whose only
+                        // holder is this slot releases like one.
+                        Zval::Ref(cell) if Rc::strong_count(cell) == 1 => {
+                            // BORROW-OK: shared read on the cell (no walk).
+                            match &*cell.borrow() {
+                                Zval::Object(rc) => last_user_ref(rc),
+                                Zval::Closure(c) => Rc::strong_count(c) == 1,
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    if releasable {
+                        let v = std::mem::replace(&mut gf.slots[idx], Zval::Undef);
+                        self.gc_note(&v);
+                        drop(v);
+                        let _ = self.gc_sweep_impl(None, true);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        drop(gframe);
+        self.frames.clear();
+        // S-72.4 (WP-72, Stogov dal sorgente 8.5.7): Zend's
+        // `shutdown_destructors` walks the object store in CREATION order
+        // (cyclic objects included) and keeps walking entries the destructors
+        // themselves append (fixture d4: a dtor-spawned object is destructed
+        // too). `created` is keyed by the monotone object id, so ascending
+        // BTreeMap iteration IS store order; each round's handles stay alive
+        // until the round ends (a destructor may still reach a peer), then
+        // drop wholesale — the spawn loop re-takes whatever was born.
+        loop {
+            let survivors = std::mem::take(&mut self.created);
+            if survivors.is_empty() {
+                break;
+            }
+            // The walk consumes the strong store (wholesale drop per round):
+            // the break phase can only reach the surviving CYCLES through
+            // weaks captured BEFORE the drop (S-72.4 — without this the
+            // break found an empty store and the memory half was a no-op).
+            self.teardown_weaks.extend(survivors.values().map(Rc::downgrade));
+            self.dtor_walk_round(survivors);
+        }
+    }
+
+    /// One store-order destructor round over a snapshot of the object store.
+    fn dtor_walk_round(&mut self, survivors: std::collections::BTreeMap<u32, Rc<RefCell<Object>>>) {
+        for (_, o) in survivors.iter() {
+            let (cid, id) = {
+                let b = o.borrow();
+                (b.class_id as usize, b.id)
+            };
+            if self.destructed.contains(&id) {
+                continue;
+            }
+            // A lazy *wrapper* (uninitialized ghost, or a proxy) never runs its own
+            // `__destruct` (PHP 8.4) — mirrors the `gc_sweep` rule for objects that
+            // survive to shutdown. The real instance behind a proxy is itself a
+            // tracked survivor and runs its destructor on its own turn.
+            if o.borrow().lazy.is_some() {
+                continue;
+            }
+            if let Some((defc, midx)) = resolve_method_runtime(&self.classes, cid, b"__destruct") {
+                self.destructed.insert(id);
+                o.borrow().gc.set_destructed(true);
+                let callee = &self.classes[defc].methods[midx].func;
+                let m = self.class_mod(defc);
+                let mut frame = self.pooled_frame(callee, m);
+                frame.this = Some(Zval::Object(Rc::clone(o)));
+                frame.class = Some(defc);
+                frame.static_class = Some(cid);
+                self.frames.push(frame);
+                // S-73.1: Catch exception thrown in destructor and abort walk
+                match self.run() {
+                    Err(PhpError::Thrown(_)) => {
+                        // Exception in destructor: abort remaining dtor walk (return early)
+                        return;
+                    }
+                    Err(_) => {
+                        // Other errors: continue walk (destructors run even on errors)
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
+
+    /// S-72.4 (WP-72) — the "free wholesale" half of Zend's request shutdown:
+    /// after every observable flush (session/streams/output buffers), sever
+    /// the outgoing edges of every object still registered so the per-request
+    /// `Rc` cycles dissolve (Zend frees the store wholesale; phpr breaks the
+    /// edges instead — the WP_Metadata_Lazyloader 20 obj/req family, WP-71
+    /// §7.7). An EXPLICIT call before the VM drops (M-72.3); the three-phase
+    /// discipline (detect → dtor → break) means NO user code runs here, so a
+    /// busy cell is declared unreachable (K-M72.2). Only edges LEAVING
+    /// registry objects are cut — a reference INTO a shared arena is a plain
+    /// decref (M-72.4 frontier).
+    pub(super) fn break_request_cycles(&mut self) {
+        // Semina/drain of the VM's own value roots first (P-72.3): what they
+        // referenced is either acyclic (dies on the drop below) or cyclic
+        // (its props are broken below).
+        self.frames.clear();
+        self.retired_main = None;
+        for s in self.superglobals.iter_mut() {
+            *s = Zval::Undef;
+        }
+        self.autoloaders.clear();
+        // WP-49 root buffers: the gc buffer holds STRONG clones of noted
+        // objects — without this drain every cycle member it noted survives
+        // the break (alive_after read 20/req instead of ~0).
+        self.gc_buf.clear();
+        // Whatever the dtor-walk registered (pre-drop weaks) plus anything
+        // born AFTER it (session flush / stream finalizers) still in the
+        // strong store.
+        let mut weaks = std::mem::take(&mut self.teardown_weaks);
+        let survivors = std::mem::take(&mut self.created);
+        weaks.extend(survivors.values().map(Rc::downgrade));
+        drop(survivors);
+        let reg = weaks.len() as u64;
+        if reg == 0 {
+            // Fast path (B-72.2): empty store ⇒ zero work.
+            return;
+        }
+        let (mut broken, mut busy) = (0u64, 0u64);
+        for w in &weaks {
+            // Still alive after the strong store dropped = held by a cycle
+            // (or by a VM field the drain above did not cover).
+            let Some(o) = w.upgrade() else { continue };
+            let taken = match o.try_borrow_mut() {
+                Ok(mut b) => {
+                    let t = std::mem::take(&mut b.props);
+                    b.proxy_instance = None;
+                    broken += 1;
+                    Some(t)
+                }
+                Err(_) => {
+                    busy += 1;
+                    None
+                }
+            };
+            // The cascade drop runs with NO guard alive on this object (a
+            // dying peer may re-reach it through the severed graph).
+            drop(taken);
+        }
+        let alive_after = weaks.iter().filter(|w| w.strong_count() > 0).count() as u64;
+        super::teardown_note(reg, broken, busy, alive_after);
+    }
+
+    /// Dispatch an instance method call `obj->method(args)` where the receiver's
+    /// class `cid` and bound `$this` are already resolved (OOP). A missing or
+    /// inaccessible target routes to `__call`, otherwise raises the visibility /
+    /// Dispatch an instance method call `$this->method(args)` with `$this` already
+    /// deref-cloned. A `Generator`/`Fiber` receiver routes to the native built-in
+    /// methods (their result is pushed directly); any other object resolves the
+    /// method at run time via [`Self::dispatch_instance_call`]; a non-object is the
+    /// "Call to a member function …() on …" fatal. Shared by [`Op::MethodCall`] and
+    /// the spread variant [`Op::MethodCallArgs`].
+    /// `deref` (WP-53): value-context call site — a by-ref user callee gets
+    /// `RET_DEREF` on its frame (the Ret epilogue copies the returned `Ref`,
+    /// REF-4b, replacing the old trailing `DerefTop`); a native result is
+    /// deref-copied at its push site. False only for `$x =& $o->m()`.
+    pub(super) fn method_call(
+        &mut self,
+        top: usize,
+        this: Zval,
+        method: &[u8],
+        mut args: Vec<Zval>,
+        ic: Option<&crate::bytecode::MethodIc>,
+        deref: bool,
+    ) -> Result<(), PhpError> {
+        // Deferred place arguments (SEND_VAR_EX) resolve against the callee's
+        // by-ref mask now that the receiver — hence the callee — is known; a
+        // native receiver or a `__call` route takes every argument by value.
+        if args.iter().any(|a| matches!(a, Zval::ArgPlace(_))) {
+            let callee = self.instance_arg_ref_target(top, &this, method);
+            self.materialize_arg_places(top, &mut args, callee)?;
+            // R-fetch warnings report the CALL's line, not the callee's next
+            // emit point.
+            let line = self.cur_line(top);
+            self.flush_diags(line)?;
+        }
+        // A `Generator` is not a user object: dispatch its built-in methods
+        // (current/key/next/valid/rewind/…) directly (GEN).
+        if let Zval::Generator(gs) = &this {
+            let gs = Rc::clone(gs);
+            // Native dispatch — no `bind_params` step — so a reference pushed by a
+            // dynamic call (SEND_VAR_EX) is decayed to its value first.
+            let result = self.generator_method(gs, method, decay_args(args))?;
+            let result =
+                if deref && matches!(result, Zval::Ref(_)) { result.deref_clone() } else { result };
+            self.frames[top].stack.push(result);
+            return Ok(());
+        }
+        // A `Fiber` instance's methods (start/resume/getReturn/is*) are dispatched
+        // natively, except `__construct` which runs the prelude body (GEN-4).
+        if let (Zval::Object(o), Some(fcid)) = (&this, self.fiber_class_id) {
+            let cid = o.borrow().class_id as usize;
+            if self.instance_of(cid, fcid) {
+                let result = self.fiber_method(&this, method, decay_args(args))?;
+                let result =
+                    if deref && matches!(result, Zval::Ref(_)) { result.deref_clone() } else { result };
+                self.frames[top].stack.push(result);
+                return Ok(());
+            }
+        }
+        // A closure value's built-in methods (`$c->bindTo(...)`, `$c->call(...)`)
+        // are dispatched natively — a closure is not a user object (step 19-6).
+        if let Zval::Closure(cl) = &this {
+            let cl = Rc::clone(cl);
+            let result = self.closure_instance_method(&cl, method, decay_args(args))?;
+            let result =
+                if deref && matches!(result, Zval::Ref(_)) { result.deref_clone() } else { result };
+            self.frames[top].stack.push(result);
+            return Ok(());
+        }
+        let cid = match &this {
+            Zval::Object(o) => o.borrow().class_id as usize,
+            other => {
+                return Err(PhpError::Error(format!(
+                    "Call to a member function {}() on {}",
+                    String::from_utf8_lossy(method),
+                    other.value_name_for_error()
+                )))
+            }
+        };
+        self.dispatch_instance_call(top, cid, this, method, args, ic, deref)
+    }
+
+    /// Dispatch an instance method call `$this->method(positional…, named…)` whose
+    /// **named arguments** are bound at run time against the callee's `param_names`
+    /// (Session A). A non-object receiver is the "Call to a member function …" fatal
+    /// (a `Generator`/`Fiber`'s native methods take no named arguments — the first
+    /// name is reported as unknown). A resolved-and-visible user method binds via
+    /// [`build_named_frame`]; a missing/inaccessible one routes to `__call` (the
+    /// named args ride in the `$args` array as string keys, like the evaluator),
+    /// else the visibility / undefined-method error.
+    pub(super) fn dispatch_instance_call_named(
+        &mut self,
+        top: usize,
+        this: Zval,
+        method: &[u8],
+        positional: Vec<Zval>,
+        named: Vec<(Box<[u8]>, Zval)>,
+        deref: bool,
+    ) -> Result<(), PhpError> {
+        let cid = match &this {
+            // A `Generator`/`Fiber`'s native methods take no named arguments.
+            Zval::Generator(_) => return Err(unknown_named_param(&named)),
+            Zval::Object(o) => o.borrow().class_id as usize,
+            other => {
+                return Err(PhpError::Error(format!(
+                    "Call to a member function {}() on {}",
+                    String::from_utf8_lossy(method),
+                    other.value_name_for_error()
+                )))
+            }
+        };
+        if let Some(fcid) = self.fiber_class_id {
+            if self.instance_of(cid, fcid) {
+                return Err(unknown_named_param(&named));
+            }
+        }
+        let mut resolved = resolve_method_runtime(&self.classes, cid, method);
+        // Caller-scope private wins (Zend non-virtual private dispatch).
+        if let Some(rb) = parent_private_rebind(
+            &self.classes,
+            self.frames[top].class,
+            cid,
+            method,
+            resolved,
+        ) {
+            resolved = Some(rb);
+        }
+        let usable = resolved.filter(|&(defc, midx)| {
+            method_visible_from(&self.classes, self.frames[top].class, self.classes[defc].methods[midx].visibility, defc, method)
+        });
+        match usable {
+            Some((defc, midx)) => {
+                let callee = &self.classes[defc].methods[midx].func;
+                let qn = format!(
+                    "{}::{}",
+                    String::from_utf8_lossy(&self.classes[defc].name),
+                    String::from_utf8_lossy(method)
+                );
+                // The frame's module must be the unit that COMPILED the method
+                // (class_mod), not the currently-running one: the body's
+                // bytecode indices (MakeClosure, Op::Call) resolve there. A
+                // PHPUnit test invoked with named data-provider args used to
+                // get the entry script's module here and die on MakeClosure.
+                let mut frame =
+                    build_named_frame(callee, self.class_mod(defc), &qn, positional, named)?;
+                // Value-context copy of a `&m()` return (WP-53, ex-`DerefTop`).
+                if deref && callee.by_ref && !callee.is_generator {
+                    frame.flags.set(FrameFlags::RET_DEREF, true);
+                }
+                frame.this = Some(this);
+                frame.class = Some(defc);
+                frame.static_class = Some(cid); // LSB = receiver's actual class
+                self.enter_callee(frame)?;
+            }
+            None => match resolve_method_runtime(&self.classes, cid, b"__call") {
+                Some((cdefc, cmidx)) => {
+                    let cf = &self.classes[cdefc].methods[cmidx].func;
+                    let set_deref = deref && cf.by_ref && !cf.is_generator;
+                    self.push_magic_call_named(cdefc, cmidx, Some(this), cid, method, positional, named);
+                    if set_deref {
+                        self.frames
+                            .last_mut()
+                            .expect("magic __call frame just pushed")
+                            .flags
+                            .set(FrameFlags::RET_DEREF, true);
+                    }
+                }
+                None => {
+                    return Err(match resolved {
+                        Some((defc, midx)) => method_access_error(
+                            &self.classes,
+                            defc,
+                            method,
+                            self.frames[top].class,
+                            self.classes[defc].methods[midx].visibility,
+                        ),
+                        None => undefined_method(&self.classes, cid, method),
+                    })
+                }
+            },
+        }
+        Ok(())
+    }
+}

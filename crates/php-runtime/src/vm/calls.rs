@@ -1,0 +1,1507 @@
+//! VM calls logic, extracted from vm/mod.rs (no semantic change).
+use super::*;
+
+/// Invoke a by-reference-first builtin, handing it `&mut Zval` for the slot cell
+/// (following a `Zval::Ref` so the write lands in the shared target).
+pub(super) fn builtin_ref_call(
+    f: BuiltinRefFn,
+    cell: &mut Zval,
+    rest: &[Zval],
+    out: &mut Vec<u8>,
+    diags: &mut Diags,
+    stringify: &std::collections::HashMap<u32, php_types::ZStr>,
+) -> Result<Zval, PhpError> {
+    // The ref-first family (sort/array_push/…) never writes to a stdout
+    // stream, so its ob-bypass sink is a discarded local.
+    let mut direct = Vec::new();
+    let empty_debug = std::collections::HashMap::new();
+    let mut ctx = Ctx {
+        out,
+        diags,
+        direct_out: &mut direct,
+        debug_info: &empty_debug,
+        stringify,
+    };
+    if let Zval::Ref(rc) = cell {
+        let mut guard = rc.borrow_mut();
+        f(&mut guard, rest, &mut ctx)
+    } else {
+        f(cell, rest, &mut ctx)
+    }
+}
+
+/// The value (non-ref) builtins that *unconditionally* string-coerce their
+/// string parameters (all of them route through `string::str_at`): the VM
+/// precomputes `__toString` for their Stringable object arguments before
+/// dispatch so the pure builtin sees the coerced string. Every function here
+/// takes only string/scalar parameters, so precomputing all object arguments is
+/// safe (an object only ever lands on a string parameter). Introspection and
+/// int/array builtins are intentionally excluded — no `__toString` runs for them.
+pub(super) fn value_builtin_string_coerces(name: &[u8]) -> bool {
+    matches!(
+        name,
+        // `strval` IS the coercion (symfony's array_map('strval', $cookies));
+        // `explode` takes only string/int parameters, so a Stringable subject
+        // (`explode("\r\n", $response)` on a Response) converts here too.
+        b"strval"
+            | b"explode"
+            // Pure string-parameter family: PHP's ZPP coerces a Stringable
+            // argument for every `string` parameter (wp-cli feeds a
+            // DirectoryIterator to `substr($filename, -4)`).
+            | b"substr"
+            | b"strlen"
+            | b"strtolower"
+            | b"strtoupper"
+            | b"ucfirst"
+            | b"lcfirst"
+            | b"ucwords"
+            | b"trim"
+            | b"ltrim"
+            | b"rtrim"
+            | b"strrev"
+            | b"str_pad"
+            | b"str_repeat"
+            | b"strpos"
+            | b"strrpos"
+            | b"stripos"
+            | b"strripos"
+            | b"strstr"
+            | b"stristr"
+            | b"strrchr"
+            | b"str_split"
+            | b"md5"
+            | b"sha1"
+            | b"crc32"
+            | b"urlencode"
+            | b"rawurlencode"
+            | b"urldecode"
+            | b"rawurldecode"
+            | b"base64_encode"
+            | b"str_contains"
+            | b"str_starts_with"
+            | b"str_ends_with"
+            | b"substr_count"
+            | b"substr_compare"
+            | b"substr_replace"
+            // Comparison family: every parameter is a string, PHP's ZPP
+            // coerces a Stringable (they already read via ctx.to_zstr).
+            | b"strcmp"
+            | b"strcasecmp"
+            | b"strncmp"
+            | b"strncasecmp"
+            | b"strnatcmp"
+            | b"strnatcasecmp"
+            | b"similar_text"
+            | b"bin2hex"
+            | b"hex2bin"
+            | b"addslashes"
+            | b"addcslashes"
+            | b"stripslashes"
+            | b"stripcslashes"
+            | b"str_increment"
+            | b"str_decrement"
+            | b"count_chars"
+            | b"str_word_count"
+            | b"nl2br"
+            | b"wordwrap"
+            | b"strtr"
+            | b"chunk_split"
+            | b"strip_tags"
+            | b"quotemeta"
+            | b"levenshtein"
+            | b"htmlspecialchars"
+            | b"htmlentities"
+            | b"htmlspecialchars_decode"
+            | b"html_entity_decode"
+            // Filesystem path family: every parameter is a path/scalar (plus
+            // at most a resource context), and PHP coerces a Stringable there
+            // (`rename($from, new SplFileInfo($to))` — symfony File::move).
+            | b"rename"
+            | b"copy"
+            | b"unlink"
+            | b"file_exists"
+            | b"is_file"
+            | b"is_dir"
+            | b"is_link"
+            | b"is_readable"
+            | b"is_writable"
+            | b"is_writeable"
+            | b"is_executable"
+            | b"is_uploaded_file"
+            | b"mkdir"
+            | b"rmdir"
+            | b"touch"
+            | b"chmod"
+            | b"filesize"
+            | b"filemtime"
+            | b"filectime"
+            | b"fileatime"
+            | b"fileperms"
+            | b"filetype"
+            | b"realpath"
+            | b"basename"
+            | b"dirname"
+            | b"pathinfo"
+            | b"readlink"
+            | b"tempnam"
+            | b"file_get_contents"
+            | b"file"
+            | b"stat"
+            | b"lstat"
+    )
+}
+
+/// Value builtins that string-coerce not only their direct string arguments but
+/// also the *elements* of their array arguments (`str_replace` accepts array
+/// search/replace/subject). Their `__toString` precompute recurses into arrays.
+/// Excludes `sprintf`/`printf`, which coerce per format specifier (`%s` calls
+/// `__toString`, `%d` does not), so an eager precompute there would run
+/// `__toString` spuriously. (`implode`/`join` are host builtins with their own
+/// VM-aware coercion, so they are handled in `ho_implode`, not here.)
+pub(super) fn value_builtin_string_coerces_deep(name: &[u8], args: &[Zval]) -> bool {
+    match name {
+        b"str_replace" | b"str_ireplace" => true,
+        // `array_unique` compares element string representations under its
+        // default SORT_STRING flag (PHPUnit dedupes ExecutionOrderDependency
+        // objects this way), so Stringable elements need the precompute. The
+        // string-coercing flags: SORT_STRING (2), SORT_LOCALE_STRING (5),
+        // either | SORT_FLAG_CASE (8). SORT_REGULAR/SORT_NUMERIC never call
+        // `__toString`, so the eager precompute must not run for them.
+        b"array_unique" => match args.get(1).map(Zval::deref_clone) {
+            None | Some(Zval::Undef) => true,
+            Some(Zval::Long(f)) => matches!(f, 2 | 5 | 10 | 13),
+            Some(_) => true,
+        },
+        _ => false,
+    }
+}
+
+/// The by-ref-first builtins that *unconditionally* string-coerce every element
+/// of their target array (natural-order sorts): the VM precomputes `__toString`
+/// for their Stringable elements before dispatch. A `SORT_REGULAR` sort is
+/// deliberately excluded — it compares objects structurally, not via `__toString`.
+pub(super) fn ref_builtin_string_coerces(name: &[u8]) -> bool {
+    matches!(name, b"natsort" | b"natcasesort")
+}
+
+/// The values a [`ref_builtin_string_coerces`] builtin will string-coerce: the
+/// elements of its target array (following a reference to it). One level only —
+/// the sort coerces the top-level values, not anything nested inside them.
+pub(super) fn ref_stringify_roots(cell: &Zval) -> Vec<Zval> {
+    match cell {
+        Zval::Array(a) => a.iter().map(|(_, v)| v.clone()).collect(),
+        Zval::Ref(c) => ref_stringify_roots(&c.borrow()),
+        _ => Vec::new(),
+    }
+}
+
+/// §3.19-bis (S-127): the by-ref-out PROCESS builtins that also resolve as
+/// dynamic string callables — `(canonical, by-ref positions (index, name))`.
+/// `popen` stays absent (correct-or-absent: no pipe resource yet).
+pub(super) fn host_builtin_out_dynamic(
+    name: &[u8],
+) -> Option<(&'static [u8], &'static [(usize, &'static [u8])])> {
+    const T: &[(&[u8], &[(usize, &[u8])])] = &[
+        (b"exec", &[(1, b"output"), (2, b"result_code")]),
+        (b"system", &[(1, b"result_code")]),
+        (b"passthru", &[(1, b"result_code")]),
+        (b"proc_open", &[(2, b"pipes")]),
+    ];
+    T.iter().find(|(n, _)| name.eq_ignore_ascii_case(n)).map(|&(n, p)| (n, p))
+}
+
+/// The fatal a call raises when a name isn't a callable VM builtin (defensive:
+/// the compiler already filters these, so this is a safety net).
+pub(super) fn undefined_builtin(name: &[u8]) -> PhpError {
+    log_missing_builtin(name);
+    PhpError::Error(format!(
+        "Call to undefined function {}()",
+        String::from_utf8_lossy(name)
+    ))
+}
+
+/// Coverage-audit aid: when the `PHPR_LOG_MISSING` env var names a file, append
+/// each called-but-undefined function name to it (one per line). A framework run
+/// then lists exactly which builtins it reached that phpr does not implement —
+/// prioritizing stdlib work by real use. A no-op when the var is unset.
+pub(super) fn log_missing_builtin(name: &[u8]) {
+    if let Ok(path) = std::env::var("PHPR_LOG_MISSING") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{}", String::from_utf8_lossy(name));
+        }
+    }
+}
+
+/// Flatten a runtime argument array into positional values for a spread call
+/// (`...$arr` feeding a dynamic-dispatch call, Session A): keys are dropped and
+/// each value deref-cloned. A non-array yields no arguments. Shared by the
+/// `…Args` call opcodes and [`Op::CallArgs`].
+/// Convert an engine constant's literal HIR value ([`crate::lower::resolve_constant`])
+/// to a [`Zval`] for `constant()` (B3); `None` for a non-scalar form.
+pub(super) fn const_literal_to_zval(kind: crate::hir::ExprKind) -> Option<Zval> {
+    use crate::hir::ExprKind;
+    Some(match kind {
+        ExprKind::Null => Zval::Null,
+        ExprKind::Bool(b) => Zval::Bool(b),
+        ExprKind::Int(i) => Zval::Long(i),
+        ExprKind::Float(f) => Zval::Double(f),
+        ExprKind::Str(b) => Zval::Str(PhpStr::new(b.into_vec())),
+        _ => return None,
+    })
+}
+
+pub(super) fn args_from_array_value(v: Zval) -> Vec<Zval> {
+    match v.deref_clone() {
+        Zval::Array(a) => a.iter().map(|(_, v)| v.deref_clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Split a runtime argument array into positional (int-keyed, in order) and
+/// **named** (string-keyed) arguments, mirroring how PHP treats a spread of a
+/// string-keyed array (8.1) and how the compiler encodes `new C(named: …)` for
+/// a class resolved only at run time: positional values ride on integer keys,
+/// named values on their parameter-name string keys. A non-array yields nothing.
+pub(super) fn split_args_from_array_value(v: Zval) -> (Vec<Zval>, Vec<(Box<[u8]>, Zval)>) {
+    match v.deref_clone() {
+        Zval::Array(a) => {
+            let mut positional = Vec::new();
+            let mut named = Vec::new();
+            for (k, v) in a.iter() {
+                // A reference element stays a live reference (Zend passes it
+                // by-ref when the parameter is by-ref; the frame binder decays
+                // it at a by-value position) — `build_args_array` pushes plain
+                // variables as references for exactly this.
+                let v = match v {
+                    Zval::Ref(rc) => Zval::Ref(Rc::clone(rc)),
+                    other => other.clone(),
+                };
+                match k {
+                    Key::Int(_) => positional.push(v),
+                    Key::Str(s) => named.push((s.as_bytes().to_vec().into_boxed_slice(), v)),
+                }
+            }
+            (positional, named)
+        }
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+/// Pack call arguments into a 0-indexed list array — the second argument handed
+/// to `__call` / `__callStatic` (OOP-3a), mirroring the tree-walker's `pack_args`.
+pub(super) fn pack_args(args: Vec<Zval>) -> Zval {
+    let mut arr = PhpArray::new();
+    for a in args {
+        let _ = arr.append(a);
+    }
+    Zval::Array(Rc::new(arr))
+}
+
+/// Bind positional `args` to a callee frame's leading parameter slots (PAR).
+/// Omitted parameters are left `Undef` for the body's default prologue
+/// ([`Op::FillDefault`]) to fill. For a **variadic** function the leading fixed
+/// params are bound and every remaining argument is collected into an array in
+/// the variadic slot (empty when there are none); otherwise surplus arguments
+/// are dropped (PHP silently ignores them for a non-variadic function).
+/// Decay a by-value argument (SEND_VAR_EX): a reference yields a clone of its
+/// referent (the no-ref-to-ref invariant D-R11), anything else is moved as-is.
+/// A dynamic call ([`crate::compile`]'s `push_dyn_args`) pushes a `Ref` for
+/// every plain-variable argument so an undefined variable materialises and a
+/// run-time by-reference parameter can bind; this un-aliases it wherever the
+/// destination is by-value.
+pub(super) fn decay_arg(a: Zval) -> Zval {
+    match a {
+        Zval::Ref(cell) => cell.borrow().clone(),
+        // Backstop only: every dispatch funnel materializes deferred place
+        // arguments before any decay, so one reaching here is a missed funnel
+        // — degrade to NULL rather than leak the descriptor to user code.
+        // S-106-D-12 (A-MA-107-2): the backstop is NOISY now — debug builds
+        // abort at the missed funnel, census builds count the hits (a silent
+        // NULL was indistinguishable from a legitimate absent argument).
+        Zval::ArgPlace(_) => {
+            debug_assert!(false, "ArgPlace reached decay_arg: missed materialization funnel");
+            #[cfg(feature = "mem-census")]
+            php_types::memcensus::argplace_decay_note();
+            Zval::Null
+        }
+        other => other,
+    }
+}
+
+/// [`decay_arg`] over a whole positional argument list, for a native/magic
+/// receiver dispatched without a [`bind_params`] step (a generator/fiber/closure
+/// method, `__call`, an enum `from`), which always wants values.
+pub(super) fn decay_args(args: Vec<Zval>) -> Vec<Zval> {
+    // S-144 tranche-2: gemello del funnel vecargs di `bind_params` per il
+    // dispatch nativo/magic (perimetri disgiunti per costruzione — il
+    // chiamante usa l'uno O l'altro); altri path nativi restano FUORI
+    // perimetro, dichiarato nel criterio.
+    #[cfg(feature = "mem-census")]
+    if args.capacity() > 0 {
+        php_types::memcensus::s144_vecargs_note();
+    }
+    args.into_iter().map(decay_arg).collect()
+}
+
+pub(super) fn bind_params(frame: &mut Frame, args: Vec<Zval>) {
+    // S-105 H-D gate G2: arità al choke-point del perimetro della leva args.
+    // Solo build census: la build di parità non contiene la chiamata.
+    #[cfg(feature = "mem-census")]
+    php_types::memcensus::arity_note(args.len());
+    // S-144 tranche-2: una Vec argomenti CON buffer allocato che arriva al
+    // bind è un evento `vecargs` (capacity>0 ⟺ almeno un alloc a monte; la
+    // crescita sta nei realloc, disaggregati). Il path diretto stack→slot
+    // non alloca e correttamente non passa di qui.
+    #[cfg(feature = "mem-census")]
+    if args.capacity() > 0 {
+        php_types::memcensus::s144_vecargs_note();
+    }
+    // WP-37 fast path: a simple-call callee (no by-ref/variadic) receiving
+    // EXACTLY its declared arity — every slot gets a by-value argument, no
+    // surplus to snapshot, no `Undef` for the default prologue. Equal to the
+    // generic non-variadic arm below with every `param_by_ref` false.
+    if frame.func.simple_call && args.len() == frame.func.n_params as usize {
+        frame.argc = args.len() as u32;
+        for (i, a) in args.into_iter().enumerate() {
+            frame.slots[i] = decay_arg(a);
+        }
+        return;
+    }
+    frame.argc = args.len() as u32;
+    match frame.func.variadic_slot {
+        None => {
+            let n = frame.func.n_params as usize;
+            // Snapshot arguments beyond the declared parameters: they have no slot,
+            // so `func_get_args` (D1) could not otherwise recover them. Surplus
+            // arguments are always by-value, so a reference is decayed here.
+            if args.len() > n {
+                frame.ext_mut().extra_args = args[n..].iter().map(|a| a.deref_clone()).collect();
+            }
+            for (i, a) in args.into_iter().enumerate() {
+                if i < n {
+                    // A by-reference parameter (`&$p`) keeps the caller's cell so
+                    // mutations alias back; every other parameter is by-value, so a
+                    // reference argument is decayed to a clone of its referent.
+                    frame.slots[i] = if frame.func.param_by_ref.get(i).copied().unwrap_or(false) {
+                        a
+                    } else {
+                        decay_arg(a)
+                    };
+                }
+            }
+        }
+        Some(vslot) => {
+            let v = vslot as usize;
+            // Whether the variadic pack itself is declared `&...$rest` (its flag
+            // sits at the variadic slot's index, parallel to `param_by_ref`).
+            let variadic_by_ref = frame.func.param_by_ref.get(v).copied().unwrap_or(false);
+            let mut it = args.into_iter().enumerate();
+            for slot in frame.slots.iter_mut().take(v) {
+                match it.next() {
+                    Some((i, a)) => {
+                        *slot = if frame.func.param_by_ref.get(i).copied().unwrap_or(false) {
+                            a
+                        } else {
+                            decay_arg(a)
+                        };
+                    }
+                    None => break, // omitted fixed params stay Undef (default prologue)
+                }
+            }
+            let mut rest = PhpArray::new();
+            for (_, a) in it {
+                let _ = rest.append(if variadic_by_ref { a } else { decay_arg(a) });
+            }
+            frame.slots[v] = Zval::Array(Rc::new(rest));
+        }
+    }
+}
+
+/// The catchable `Error` PHP raises for a named argument with no place to go —
+/// reported for the first name. Used when the target has no parameter list to
+/// bind against (a `Generator`/`Fiber`'s native methods).
+pub(super) fn unknown_named_param(named: &[(Box<[u8]>, Zval)]) -> PhpError {
+    match named.first() {
+        Some((name, _)) => PhpError::Error(format!(
+            "Unknown named parameter ${}",
+            String::from_utf8_lossy(name)
+        )),
+        None => PhpError::Error("Unknown named parameter".to_string()),
+    }
+}
+
+/// Build a callee frame for a method call with **named** (and positional)
+/// arguments, binding by name against `callee.param_names` at run time (Session
+/// A). Positional values fill the leading fixed slots; each named value targets
+/// its matching fixed parameter (gaps stay `Undef` for the default prologue) or,
+/// with no match and a trailing `...$rest`, is collected into the variadic array
+/// keyed by its name (string key) — surplus positional args are collected too (int
+/// keys). Mirrors the evaluator's errors: a duplicate/positional collision is an
+/// overwrite `Error`, a name with no home (and no variadic) is unknown, and a
+/// required parameter left unbound is the named-call `ArgumentCountError`
+/// (`f(): Argument #N ($name) not passed`, zend_handle_undef_args — the
+/// positional-only "Too few arguments" form never applies here). `display_name`
+/// is the `Class::method` used in that message; `frame.this`/`class`/
+/// `static_class` are set by the caller.
+pub(super) fn build_named_frame<'m>(
+    callee: &'m Func,
+    module: &'m Module,
+    display_name: &str,
+    positional: Vec<Zval>,
+    named: Vec<(Box<[u8]>, Zval)>,
+) -> Result<Frame<'m>, PhpError> {
+    let n_params = callee.n_params as usize;
+    let fixed = match callee.variadic_slot {
+        Some(s) => s as usize,
+        None => n_params,
+    };
+    let has_variadic = callee.variadic_slot.is_some();
+    let passed = positional.len() + named.len();
+    let mut frame = Frame::new(callee, module);
+    let mut variadic = PhpArray::new();
+    // Positional args fill the leading fixed slots; surplus goes to the variadic.
+    for (i, a) in positional.into_iter().enumerate() {
+        if i < fixed {
+            frame.slots[i] = a;
+        } else if has_variadic {
+            let _ = variadic.append(a);
+        }
+    }
+    // Named args target a fixed parameter by name, or collect into the variadic.
+    for (name, val) in named {
+        match callee.param_names[..fixed].iter().position(|pn| pn[..] == name[..]) {
+            Some(j) if !matches!(frame.slots[j], Zval::Undef) => {
+                return Err(PhpError::Error(format!(
+                    "Named parameter ${} overwrites previous argument",
+                    String::from_utf8_lossy(&name)
+                )))
+            }
+            Some(j) => frame.slots[j] = val,
+            None if has_variadic => {
+                variadic.insert(Key::Str(PhpStr::new(name.to_vec())), val);
+            }
+            None => {
+                return Err(PhpError::Error(format!(
+                    "Unknown named parameter ${}",
+                    String::from_utf8_lossy(&name)
+                )))
+            }
+        }
+    }
+    if let Some(vs) = callee.variadic_slot {
+        frame.slots[vs as usize] = Zval::Array(Rc::new(variadic));
+    }
+    // Every required (default-less, non-variadic) parameter must be bound.
+    for (i, &required) in callee.param_required.iter().enumerate() {
+        if required && matches!(frame.slots[i], Zval::Undef) {
+            return Err(PhpError::ArgumentCountError(format!(
+                "{display_name}(): Argument #{} (${}) not passed",
+                i + 1,
+                String::from_utf8_lossy(&callee.param_names[i])
+            )));
+        }
+    }
+    frame.argc = passed as u32;
+    Ok(frame)
+}
+
+impl<'m> Vm<'m> {
+    /// Dispatch a dynamic call on a runtime callee value (CLO + B1): an anonymous
+    /// closure runs its body (binding captures then args); a named closure / FCC or
+    /// a plain string names a user function / builtin; a `"Class::method"` string or
+    /// a `[target, method]` array is a static / instance method callable; an object
+    /// is callable via `__invoke`; a reference is followed. Anything else is an
+    /// uncatchable "not callable" error. A pushed frame runs via the main loop; a
+    /// builtin result is pushed on the current frame's stack.
+    pub(super) fn invoke_value(&mut self, callee: Zval, args: Vec<Zval>) -> Result<(), PhpError> {
+        match callee {
+            Zval::Closure(cl) => match &cl.named {
+                None => self.push_closure_frame(&cl, args),
+                Some(name) => {
+                    let nb = name.as_bytes();
+                    // A `Closure::fromCallable` method callable carries `Class::method`
+                    // in `named` (a function name never contains `::`). Dispatch it as
+                    // a pre-authorized method call — on the bound object for an instance
+                    // callable, else statically on the named class.
+                    if let Some(pos) = nb.windows(2).position(|w| w == b"::") {
+                        let m = nb[pos + 2..].to_vec();
+                        if let Some(this) = cl.bound_this.clone().filter(|t| matches!(t, Zval::Object(_))) {
+                            let cid = object_class_id(&this).expect("bound method object");
+                            return self.enter_authorized_method(cid, Some(this), &m, args);
+                        }
+                        let cls = Zval::Str(PhpStr::new(nb[..pos].to_vec()));
+                        let cid = self.resolve_dynamic_class(&cls)?;
+                        return self.enter_authorized_method(cid, None, &m, args);
+                    }
+                    let name = nb.to_vec();
+                    self.invoke_named(&name, args)
+                }
+            },
+            Zval::Str(ref s) => {
+                let bytes = s.as_bytes();
+                // `"Class::method"` is a static method callable.
+                if let Some(pos) = bytes.windows(2).position(|w| w == b"::") {
+                    let cls = Zval::Str(PhpStr::new(bytes[..pos].to_vec()));
+                    let method = bytes[pos + 2..].to_vec();
+                    let cid = self.resolve_dynamic_class(&cls)?;
+                    let top = self.frames.len() - 1;
+                    self.dispatch_static_call(top, cid, &method, false, args, Vec::new(), None)
+                } else {
+                    let name = bytes.to_vec();
+                    self.invoke_named(&name, args)
+                }
+            }
+            Zval::Array(ref a) => self.invoke_array_callable(a, args),
+            Zval::Object(ref o) => {
+                // An object is callable iff its class defines `__invoke` (D-22.7).
+                let cid = o.borrow().class_id as usize;
+                if resolve_method_runtime(&self.classes, cid, b"__invoke").is_some() {
+                    let top = self.frames.len() - 1;
+                    // `deref: false` preserves the pre-WP-53 behaviour: no
+                    // `DerefTop` ever followed the CallValue family.
+                    self.dispatch_instance_call(top, cid, callee.clone(), b"__invoke", args, None, false)
+                } else {
+                    Err(PhpError::Error(format!(
+                        "Object of type {} is not callable",
+                        String::from_utf8_lossy(&self.classes[cid].name)
+                    )))
+                }
+            }
+            Zval::Ref(rc) => {
+                let inner = rc.borrow().clone();
+                self.invoke_value(inner, args)
+            }
+            other => Err(PhpError::Error(format!(
+                "Value of type {} is not callable",
+                other.type_name_for_error()
+            ))),
+        }
+    }
+
+    /// A `[target, method]` array callable: `target` is an object (instance call)
+    /// or a class-name string (static call); `method` is a string. A malformed
+    /// array is an uncatchable "not callable" error.
+    pub(super) fn invoke_array_callable(&mut self, arr: &PhpArray, args: Vec<Zval>) -> Result<(), PhpError> {
+        let not_callable =
+            || PhpError::Error("Value of type array is not callable".to_string());
+        let elems: Vec<Zval> = arr.iter().map(|(_, v)| v.deref_clone()).collect();
+        if elems.len() != 2 {
+            return Err(not_callable());
+        }
+        let method = match &elems[1] {
+            Zval::Str(s) => s.as_bytes().to_vec(),
+            _ => return Err(not_callable()),
+        };
+
+        // S-73.2.1: Ensure frames is not empty before accessing frames[top].
+        // During shutdown (when handlers are invoked), frames may be empty.
+        // Push a synthetic caller frame if needed to provide context for method dispatch.
+        let pushed_frame = if self.frames.is_empty() {
+            // Find any class with at least one method to use for frame context
+            let mut found_frame = false;
+            for cid in 0..self.classes.len() {
+                if !self.classes[cid].methods.is_empty() {
+                    let m_mod = self.class_mod(cid);
+                    let func = &self.classes[cid].methods[0].func;
+                    let frame = self.pooled_frame(func, m_mod);
+                    self.frames.push(frame);
+                    found_frame = true;
+                    break;
+                }
+            }
+            found_frame
+        } else {
+            false
+        };
+
+        let top = self.frames.len() - 1;
+        let result = match &elems[0] {
+            Zval::Object(_) => {
+                let cid = object_class_id(&elems[0]).expect("object class id");
+                // `deref: false`: no `DerefTop` ever followed a callable-array
+                // dispatch (pre-WP-53 behaviour preserved).
+                self.dispatch_instance_call(top, cid, elems[0].clone(), &method, args, None, false)
+            }
+            Zval::Str(_) => {
+                let cid = self.resolve_dynamic_class(&elems[0])?;
+                self.dispatch_static_call(top, cid, &method, false, args, Vec::new(), None)
+            }
+            _ => Err(not_callable()),
+        };
+
+        // Pop the synthetic frame if we pushed one
+        if pushed_frame {
+            self.frames.pop();
+        }
+
+        result
+    }
+
+    /// Invoke a user callable (`$callable($args)`) from inside a host builtin and
+    /// run it to completion, returning its value (B1). Resolves the callable via
+    /// [`Self::invoke_value`], then — when that pushed a frame — drives a *nested*
+    /// bounded [`Self::run_loop`] from the new baseline (mirrors `drive_fiber`):
+    /// an exception caught inside the callable resumes there, an uncaught one
+    /// unwinds out (its frames dropped) so it propagates through the host builtin.
+    /// A value-builtin / generator-function callable pushes no frame — its result
+    /// (or `Generator` handle) is taken straight off the caller's stack.
+    pub(super) fn call_callable(&mut self, callee: Zval, args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let baseline = self.frames.len();
+        self.invoke_value(callee, args)?;
+        if self.frames.len() == baseline {
+            // No frame pushed: a value builtin (or a generator-function callable,
+            // whose `Generator` handle is the call's value) left its result on the
+            // calling frame's operand stack.
+            return Ok(self.frames[baseline - 1]
+                .stack
+                .pop()
+                .expect("host callable result on the caller stack"));
+        }
+        self.drive_to_return(baseline)
+    }
+
+    /// L-AM1 (S-159): arity-1 mirror of [`Self::call_callable`] for a
+    /// pre-admitted anonymous closure — same baseline/drive contract, no
+    /// args-Vec. The caller has already checked, once per host call, that the
+    /// closure is anonymous (`named.is_none()`) and its body is `simple_call`
+    /// with exactly one parameter; every other callable shape stays on
+    /// [`Self::call_callable`].
+    pub(super) fn call_closure_one(&mut self, cl: &Closure, arg: Zval) -> Result<Zval, PhpError> {
+        let baseline = self.frames.len();
+        self.push_closure_frame_one(cl, arg)?;
+        if self.frames.len() == baseline {
+            // Mirror of call_callable's no-frame arm: unreachable for a user
+            // closure body (which always pushes a frame); kept for structural
+            // equality with the full path.
+            return Ok(self.frames[baseline - 1]
+                .stack
+                .pop()
+                .expect("host callable result on the caller stack"));
+        }
+        self.drive_to_return(baseline)
+    }
+
+    /// L-AM2 (S-162): once-per-host-call resolution of a plain string
+    /// callable to a user function admitted for the arity-1 no-Vec path.
+    /// Mirrors `invoke_named`'s user-function resolution (leading-backslash
+    /// strip, `find_fn_ci`, then `linked_functions`); admission is
+    /// `simple_call` with exactly one parameter. Any other shape — builtin,
+    /// `"Class::method"` (never a function name), a name that does not
+    /// resolve — returns `None` and stays on the generic loop. Hoisting is
+    /// idempotent: a user name that already resolves cannot change its
+    /// resolution mid-call (redefinition is fatal; linking only adds names).
+    pub(super) fn resolve_fn_one(&self, name: &[u8]) -> Option<(&'m Module, usize)> {
+        let name = name.strip_prefix(b"\\").unwrap_or(name);
+        let hit = self
+            .module
+            .find_fn_ci(name)
+            .map(|i| (self.module, i))
+            .or_else(|| self.linked_functions.get(LcKey::new(name).as_slice()).copied())?;
+        let f = &hit.0.functions[hit.1];
+        (f.simple_call && f.n_params == 1).then_some(hit)
+    }
+
+    /// L-AM2 (S-162): arity-1 mirror of [`Self::call_callable`] for a
+    /// pre-admitted user function named by a string callable — same
+    /// baseline/drive contract as [`Self::call_closure_one`], no args-Vec.
+    pub(super) fn call_fn_one(&mut self, fmod: &'m Module, idx: usize, arg: Zval) -> Result<Zval, PhpError> {
+        let baseline = self.frames.len();
+        self.push_fn_frame_one(fmod, idx, arg)?;
+        if self.frames.len() == baseline {
+            // Mirror of call_callable's no-frame arm: unreachable for a user
+            // function body (which always pushes a frame); kept for
+            // structural equality with the full path.
+            return Ok(self.frames[baseline - 1]
+                .stack
+                .pop()
+                .expect("host callable result on the caller stack"));
+        }
+        self.drive_to_return(baseline)
+    }
+
+    /// L-AU1 (S-163): arity-1 mirror of [`Self::call_callable`] for a
+    /// pre-admitted `[object, method]` array callable — same baseline/drive
+    /// contract as [`Self::call_fn_one`], no args-Vec, no elems-Vec, no
+    /// method-name copy. Admission (per loader, per miss, by the caller in
+    /// `try_autoload`): public non-static user method, `simple_call` with
+    /// exactly one parameter, no private homonym in the receiver's ancestor
+    /// chain — the `MethodIc` fill predicate, so the resolution is
+    /// scope-independent and skipping `parent_private_rebind` + the
+    /// visibility check is sound for every calling scope.
+    pub(super) fn call_method_one(
+        &mut self,
+        defc: usize,
+        midx: usize,
+        cid: usize,
+        this: Zval,
+        arg: Zval,
+    ) -> Result<Zval, PhpError> {
+        let baseline = self.frames.len();
+        self.push_method_frame_one(defc, midx, cid, this, arg)?;
+        if self.frames.len() == baseline {
+            // Mirror of call_callable's no-frame arm: unreachable for a user
+            // method body (which always pushes a frame); kept for structural
+            // equality with the full path.
+            return Ok(self.frames[baseline - 1]
+                .stack
+                .pop()
+                .expect("host callable result on the caller stack"));
+        }
+        self.drive_to_return(baseline)
+    }
+
+    /// Normalise the `$newThis` argument of `bindTo`/`bind`/`call`: an object
+    /// binds, `null` (or anything else) clears the binding (step 19-6).
+    fn closure_this_arg(v: Option<Zval>) -> Option<Zval> {
+        match v.map(|v| v.deref_clone()) {
+            Some(o @ Zval::Object(_)) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Build a copy of `cl` with a new bound `$this`, optional new class scope,
+    /// and a fresh object id (step 19-6, mirrors `eval::rebind_closure`).
+    /// `new_scope` of `None` keeps the closure's current scope; `Some(s)` sets it
+    /// (where `s` of `None` means *unscoped*). The defining module id is preserved.
+    fn rebind_closure(
+        &mut self,
+        cl: &Closure,
+        bound_this: Option<Zval>,
+        new_scope: Option<Option<usize>>,
+    ) -> Zval {
+        let id = self.next_id();
+        // Rebinding also moves `static::`: a bound object's class wins, else
+        // an explicit new scope, else the closure's original LSB.
+        let lsb = match &bound_this {
+            Some(Zval::Object(o)) => Some(o.borrow().class_id as usize),
+            _ => match new_scope {
+                Some(s) => s.or(cl.lsb),
+                None => cl.lsb,
+            },
+        };
+        Zval::Closure(Rc::new(Closure {
+            fn_idx: cl.fn_idx,
+            captures: cl.captures.clone(),
+            named: cl.named.clone(),
+            bound_this,
+            id,
+            info: Rc::clone(&cl.info),
+            module_id: cl.module_id,
+            scope: new_scope.unwrap_or(cl.scope),
+            is_static: cl.is_static,
+            lsb,
+            walk: Default::default(),
+        }))
+    }
+
+    /// Resolve the `$newScope` argument of `Closure::bind`/`bindTo`. Returns
+    /// `None` to *keep* the closure's current scope (argument omitted, or the
+    /// sentinel string `"static"`); `Some(None)` for an explicit unscoped binding;
+    /// and `Some(Some(class_id))` for an object (its class) or a class-name string.
+    fn resolve_scope_arg(&self, v: Option<Zval>) -> Option<Option<usize>> {
+        match v.map(|v| v.deref_clone()) {
+            None => None,
+            Some(Zval::Str(s)) if s.as_bytes().eq_ignore_ascii_case(b"static") => None,
+            Some(Zval::Null) => Some(None),
+            Some(Zval::Object(o)) => Some(Some(o.borrow().class_id as usize)),
+            Some(Zval::Str(s)) => {
+                let b = s.as_bytes();
+                let lc = b.strip_prefix(b"\\").unwrap_or(b).to_ascii_lowercase();
+                Some(self.class_index.get(&lc[..]).copied())
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// A static closure cannot take an instance `$this`; `bindTo`/`bind`/`call`
+    /// with a non-null instance warns and yields `null` (step 19-6, PHP 8.x).
+    fn reject_static_bind(&mut self, cl: &Closure, new_this: &Option<Zval>) -> bool {
+        if cl.is_static && new_this.is_some() {
+            self.diags.push(Diag::Warning(
+                "Cannot bind an instance to a static closure, this will be an error in PHP 9"
+                    .to_string(),
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Built-in methods on a closure value: `$c->bindTo($newThis)` (rebind) and
+    /// `$c->call($newThis, ...$args)` (rebind then invoke). Mirrors
+    /// `eval::closure_method`.
+    pub(super) fn closure_instance_method(
+        &mut self,
+        cl: &Closure,
+        method: &[u8],
+        args: Vec<Zval>,
+    ) -> Result<Zval, PhpError> {
+        if method.eq_ignore_ascii_case(b"bindTo") {
+            let mut it = args.into_iter();
+            let new_this = Self::closure_this_arg(it.next());
+            let scope = self.resolve_scope_arg(it.next());
+            if self.reject_static_bind(cl, &new_this) {
+                return Ok(Zval::Null);
+            }
+            Ok(self.rebind_closure(cl, new_this, scope))
+        } else if method.eq_ignore_ascii_case(b"call") {
+            // `$c->call($newThis, ...$args)` rebinds `$this` *and* the scope to the
+            // class of `$newThis`, then invokes (step 19-6).
+            let mut it = args.into_iter();
+            let new_this = Self::closure_this_arg(it.next());
+            if self.reject_static_bind(cl, &new_this) {
+                return Ok(Zval::Null);
+            }
+            let scope = Some(new_this.as_ref().and_then(object_class_id));
+            let rest: Vec<Zval> = it.collect();
+            let bound = self.rebind_closure(cl, new_this, scope);
+            self.call_callable(bound, rest)
+        } else {
+            Err(PhpError::Error(format!(
+                "Call to undefined method Closure::{}()",
+                String::from_utf8_lossy(method)
+            )))
+        }
+    }
+
+    /// Static methods on the `Closure` class: `Closure::bind($c, $newThis)` and
+    /// `Closure::fromCallable($callable)`. Mirrors `eval::closure_static`.
+    pub(super) fn closure_static_method(
+        &mut self,
+        method: &[u8],
+        args: Vec<Zval>,
+    ) -> Result<Zval, PhpError> {
+        if method.eq_ignore_ascii_case(b"bind") {
+            let mut it = args.into_iter();
+            let target = it.next().map(|v| v.deref_clone());
+            let new_this = Self::closure_this_arg(it.next());
+            let scope = self.resolve_scope_arg(it.next());
+            match target {
+                Some(Zval::Closure(cl)) => {
+                    if self.reject_static_bind(&cl, &new_this) {
+                        return Ok(Zval::Null);
+                    }
+                    Ok(self.rebind_closure(&cl, new_this, scope))
+                }
+                _ => Err(PhpError::Error(
+                    "Closure::bind(): Argument #1 ($closure) must be of type Closure".to_string(),
+                )),
+            }
+        } else if method.eq_ignore_ascii_case(b"fromCallable") {
+            // The scope creating the closure, governing the accessibility of a
+            // private/protected method callable — checked once here; the resulting
+            // closure is then invocable from anywhere (D-18.10 / PHP semantics).
+            let caller_class = self.frames[self.frames.len() - 1].class;
+            let nc = || {
+                PhpError::Error(
+                    "Closure::fromCallable(): Argument #1 ($callback) is not callable".to_string(),
+                )
+            };
+            match args.into_iter().next().map(|v| v.deref_clone()) {
+                // An existing closure passes through unchanged.
+                Some(Zval::Closure(cl)) => Ok(Zval::Closure(cl)),
+                Some(Zval::Str(s)) => {
+                    let b = s.as_bytes();
+                    // `"Class::method"` is a static-method callable.
+                    if let Some(pos) = b.windows(2).position(|w| w == b"::") {
+                        let cls = Zval::Str(PhpStr::new(b[..pos].to_vec()));
+                        let m = b[pos + 2..].to_vec();
+                        return self.make_method_closure(&cls, &m, caller_class).ok_or_else(nc);
+                    }
+                    // A function-name string becomes a named (first-class-callable)
+                    // closure, like `Op::MakeFcc`.
+                    let id = self.next_id();
+                    let params = self
+                        .module
+                        .functions
+                        .iter()
+                        .find(|f| super::name_eq_ignore_case(&f.name, b))
+                        .map(|f| super::closure_params(f))
+                        .unwrap_or_default();
+                    let info = Rc::new(ClosureInfo {
+                        kind: ClosureRender::Function(s.clone()),
+                        params,
+                    });
+                    Ok(Zval::Closure(Rc::new(Closure {
+                        fn_idx: 0,
+                        captures: Vec::new(),
+                        named: Some(s),
+                        bound_this: None,
+                        id,
+                        info,
+                        module_id: 0,
+                        scope: None,
+                        is_static: false,
+                        lsb: None,
+                        walk: Default::default(),
+                    })))
+                }
+                // An invokable object: the callable is its `__invoke` method
+                // (ControllerEvent's `$controller(...)` on an invokable
+                // controller lowers to `fromCallable($controller)`).
+                Some(v @ Zval::Object(_)) => {
+                    self.make_method_closure(&v, b"__invoke", caller_class).ok_or_else(nc)
+                }
+                // `[$object, 'method']` (instance) or `['Class', 'method']` (static).
+                Some(Zval::Array(a)) => {
+                    let elems: Vec<Zval> = a.iter().map(|(_, v)| v.deref_clone()).collect();
+                    if elems.len() == 2 {
+                        if let Zval::Str(m) = &elems[1] {
+                            if let Some(c) =
+                                self.make_method_closure(&elems[0], m.as_bytes(), caller_class)
+                            {
+                                return Ok(c);
+                            }
+                        }
+                    }
+                    Err(nc())
+                }
+                _ => Err(nc()),
+            }
+        } else {
+            Err(PhpError::Error(format!(
+                "Call to undefined method Closure::{}()",
+                String::from_utf8_lossy(method)
+            )))
+        }
+    }
+
+    /// Build a `Closure` from a *method* callable — `[$obj, 'm']` (instance) or
+    /// `['Class', 'm']` / `"Class::m"` (static) — as `Closure::fromCallable`
+    /// accepts. Returns `None` (surfaced as the "not callable" error) when the
+    /// class or method is unknown or the method is not accessible from
+    /// `caller_class`; PHP checks accessibility once, at creation. The closure
+    /// carries `Class::method` in `named` — its `::` marks a method callable for
+    /// [`Self::invoke_value`], since a function name never contains `::` — and, for
+    /// an instance callable, the bound object in `bound_this`.
+    fn make_method_closure(
+        &mut self,
+        target: &Zval,
+        method: &[u8],
+        caller_class: Option<usize>,
+    ) -> Option<Zval> {
+        let (cid, bound): (usize, Option<Zval>) = match target {
+            Zval::Object(o) => (o.borrow().class_id as usize, Some(target.clone())),
+            Zval::Str(s) => {
+                let b = s.as_bytes();
+                let lc = b.strip_prefix(b"\\").unwrap_or(b).to_ascii_lowercase();
+                (self.class_index.get(&lc[..]).copied()?, None)
+            }
+            _ => return None,
+        };
+        let (scope, params) = match resolve_method_runtime(&self.classes, cid, method) {
+            Some((defc, midx)) => {
+                if !visible_from(
+                    &self.classes,
+                    caller_class,
+                    self.classes[defc].methods[midx].visibility,
+                    defc,
+                ) {
+                    return None;
+                }
+                (defc, super::closure_params(&self.classes[defc].methods[midx].func))
+            }
+            // No such method, but the class has the magic receiver: PHP builds a
+            // *trampoline* closure (0 params, no file/line) that dispatches
+            // `__call`/`__callStatic` at call time (`enter_authorized_method`).
+            // Scope/called-class are both the callable's class.
+            None => {
+                let magic: &[u8] = if bound.is_some() { b"__call" } else { b"__callStatic" };
+                resolve_method_runtime(&self.classes, cid, magic)?;
+                (cid, Vec::new())
+            }
+        };
+        let mut disp = self.classes[cid].name.to_vec();
+        disp.extend_from_slice(b"::");
+        disp.extend_from_slice(method);
+        let ns = PhpStr::new(disp);
+        let info = Rc::new(ClosureInfo {
+            kind: ClosureRender::Function(ns.clone()),
+            params,
+        });
+        let id = self.next_id();
+        Some(Zval::Closure(Rc::new(Closure {
+            fn_idx: 0,
+            captures: Vec::new(),
+            named: Some(ns),
+            bound_this: bound,
+            id,
+            info,
+            module_id: 0,
+            scope: Some(scope),
+            is_static: false,
+            lsb: Some(cid),
+            walk: Default::default(),
+        })))
+    }
+
+    /// Enter a method a `Closure::fromCallable` closure was pre-authorized to call,
+    /// *without* re-checking visibility: accessibility was validated when the
+    /// closure was created (see [`Self::make_method_closure`]), so a private /
+    /// protected target stays callable wherever the closure travels. Also the
+    /// engine behind `ReflectionMethod::invoke` (privileged, PHP 8.1+).
+    pub(super) fn enter_authorized_method(
+        &mut self,
+        cid: usize,
+        this: Option<Zval>,
+        method: &[u8],
+        mut args: Vec<Zval>,
+    ) -> Result<(), PhpError> {
+        match resolve_method_runtime(&self.classes, cid, method) {
+            Some((defc, midx)) => {
+                let callee = &self.classes[defc].methods[midx].func;
+                // Deferred place arguments (SEND_VAR_EX, from a dynamic call
+                // through a method first-class callable) resolve against the
+                // callee's by-ref mask now that the method is known.
+                if args.iter().any(|a| matches!(a, Zval::ArgPlace(_))) {
+                    let top = self.frames.len() - 1;
+                    self.materialize_arg_places(top, &mut args, Some(callee))?;
+                }
+                let m = self.class_mod(defc);
+                let mut frame = self.pooled_frame(callee, m);
+                bind_params(&mut frame, args);
+                frame.this = this;
+                frame.class = Some(defc);
+                frame.static_class = Some(cid); // LSB = the callable's class
+                self.enter_callee(frame)
+            }
+            // A magic trampoline closure (`Closure::fromCallable` on a
+            // `__call`/`__callStatic` name): dispatch the magic receiver with
+            // `($method, $args)` — same packing as the regular magic-call path.
+            None => {
+                let magic: &[u8] = if this.is_some() { b"__call" } else { b"__callStatic" };
+                if let Some((defc, midx)) = resolve_method_runtime(&self.classes, cid, magic) {
+                    // A magic route takes every argument by value: R-fetch any
+                    // deferred place argument before packing.
+                    if args.iter().any(|a| matches!(a, Zval::ArgPlace(_))) {
+                        let top = self.frames.len() - 1;
+                        self.materialize_arg_places(top, &mut args, None)?;
+                    }
+                    let margs =
+                        vec![Zval::Str(PhpStr::new(method.to_vec())), pack_args(args)];
+                    let callee = &self.classes[defc].methods[midx].func;
+                    let m = self.class_mod(defc);
+                    let mut frame = self.pooled_frame(callee, m);
+                    bind_params(&mut frame, margs);
+                    frame.this = this;
+                    frame.class = Some(defc);
+                    frame.static_class = Some(cid);
+                    return self.enter_callee(frame);
+                }
+                Err(undefined_method(&self.classes, cid, method))
+            }
+        }
+    }
+
+    /// Drive a *nested* bounded [`Self::run_loop`] from `baseline` (the frame count
+    /// before a callee frame was pushed) until that callee returns, propagating an
+    /// uncaught exception out with its frames dropped. Shared by [`Self::call_callable`]
+    /// (B1) and [`Self::vm_stringify`] (D2) — both run a freshly-pushed frame to its
+    /// `Ret` from inside a host builtin.
+    pub(super) fn drive_to_return(&mut self, baseline: usize) -> Result<Zval, PhpError> {
+        let outcome = loop {
+            match self.run_loop(baseline) {
+                Ok(exit) => break Ok(exit),
+                Err(e) => match self.unwind(e, baseline) {
+                    None => continue,
+                    Some(e) => break Err(e),
+                },
+            }
+        };
+        match outcome {
+            Ok(RunExit::Returned(v)) => Ok(v),
+            Ok(_) => unreachable!("a synchronously driven callee does not yield/suspend at its own baseline"),
+            Err(e) => {
+                // Frames above the baseline die without a `Ret`: note their
+                // contents like the unwind path does.
+                while self.frames.len() > baseline {
+                    let dead = self.frames.pop().expect("frames above baseline");
+                    self.gc_note_frame(&dead);
+                    self.recycle_frame(dead);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Dispatch a call to a function *name* (a string callable / first-class
+    /// callable / named closure): a user function (case-insensitive, shadows
+    /// builtins) installs a frame; a value builtin runs and pushes its result.
+    pub(super) fn invoke_named(&mut self, name: &[u8], mut args: Vec<Zval>) -> Result<(), PhpError> {
+        // A fully-qualified name (`'\trim'`) resolves like the bare one; the
+        // undefined-function message keeps the name as written, as PHP does.
+        let written = name;
+        let name = name.strip_prefix(b"\\").unwrap_or(name);
+        // Only unconditionally-hoisted functions resolve by name eagerly;
+        // conditional declarations become callable through `linked_functions`
+        // once their `Op::DeclareFn` has run. (WP-29 B2: binary search on the
+        // module's ci table — the old whole-table scan case-compared every
+        // function, prelude included, per dynamic call.)
+        if let Some(idx) = self.module.find_fn_ci(name) {
+            let callee = &self.module.functions[idx];
+            // Deferred place arguments (SEND_VAR_EX) resolve against the
+            // callee's by-ref mask now that it is known.
+            if args.iter().any(|a| matches!(a, Zval::ArgPlace(_))) {
+                let top = self.frames.len() - 1;
+                self.materialize_arg_places(top, &mut args, Some(callee))?;
+            }
+            let m = self.module;
+            let mut frame = self.pooled_frame(callee, m);
+            bind_params(&mut frame, args);
+            self.enter_callee(frame)?;
+            return Ok(());
+        }
+        // A function declared by a linked eval/include unit (step 57): resolve it
+        // and run its frame in the module that defined it.
+        if let Some(&(fmod, idx)) = self.linked_functions.get(LcKey::new(name).as_slice()) {
+            let callee = &fmod.functions[idx];
+            if args.iter().any(|a| matches!(a, Zval::ArgPlace(_))) {
+                let top = self.frames.len() - 1;
+                self.materialize_arg_places(top, &mut args, Some(callee))?;
+            }
+            let mut frame = self.pooled_frame(callee, fmod);
+            bind_params(&mut frame, args);
+            self.enter_callee(frame)?;
+            return Ok(());
+        }
+        // Everything below (registry builtins, host builtins) takes arguments
+        // by value: R-fetch any deferred place argument, like a native callee.
+        if args.iter().any(|a| matches!(a, Zval::ArgPlace(_))) {
+            let top = self.frames.len() - 1;
+            self.materialize_arg_places(top, &mut args, None)?;
+        }
+        match self.registry.get(name) {
+            Some(Builtin::Value(f)) => {
+                let f = *f;
+                // Same __toString precompute as the compiled Op::CallBuiltin
+                // path: a string-coercing builtin invoked as a CALLBACK
+                // (`array_map('strval', $cookies)`) must still honor
+                // Stringable objects.
+                if value_builtin_string_coerces(name) {
+                    self.stringify_args = self.compute_stringify(&args, false)?;
+                } else if value_builtin_string_coerces_deep(name, &args) {
+                    self.stringify_args = self.compute_stringify(&args, true)?;
+                }
+                let line = self.cur_line(self.frames.len() - 1);
+                let result = self.run_value_builtin(f, &args, line)?;
+                let top = self.frames.len() - 1;
+                self.frames[top].stack.push(result);
+                Ok(())
+            }
+            Some(Builtin::RefFirst(_)) => Err(PhpError::Error(format!(
+                "VM: dynamic call to by-reference builtin {}() is out of slice",
+                String::from_utf8_lossy(name)
+            ))),
+            None => {
+                // Host builtins (call-a-callable / introspection / preg / date / …)
+                // live outside the stateless `registry`; resolve the value-returning
+                // family here so a host builtin works as a dynamic string callable
+                // (`$fn='preg_quote'; $fn(...)`, `call_user_func`, `array_map`) and via
+                // the namespaced-fallback path. Arguments are by value, exactly as the
+                // compiled `Op::CallHostBuiltin` path passes them.
+                if let Some(canon) = host_builtin_canonical(name) {
+                    let result = self.dispatch_host_builtin(canon, args)?;
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(result);
+                    return Ok(());
+                }
+                // `current`/`key` read the cursor without moving it — their
+                // parameter lost the `&` in PHP 8.1, so a dynamic string
+                // callable (`array_map('current', $rows)`) passes the array
+                // by value. The pointer-MOVING family keeps the error below,
+                // exactly as PHP refuses a by-ref arg it cannot bind.
+                // §3.19-bis (S-127): the by-ref-out process family resolves
+                // as a DYNAMIC string callable too (Composer's
+                // Silencer::call('exec', "sudo -K …")). Arguments travel BY
+                // VALUE: a supplied by-ref position cannot bind, so it warns
+                // exactly like Zend's trampoline ("must be passed by
+                // reference, value given" — oracle-probed on
+                // call_user_func('proc_open', …), which RUNS and returns the
+                // resource with the pipes lost) and the call proceeds; the
+                // out-values are discarded.
+                if let Some((canon, refpos)) = host_builtin_out_dynamic(name) {
+                    let line = self.cur_line(self.frames.len() - 1);
+                    for &(i, pname) in refpos {
+                        if args.len() > i {
+                            let msg = format!(
+                                "{}(): Argument #{} (${}) must be passed by reference, value given",
+                                String::from_utf8_lossy(canon),
+                                i + 1,
+                                String::from_utf8_lossy(pname),
+                            );
+                            self.raise_diagnostic(2, &msg, line)?;
+                        }
+                    }
+                    let (result, _out, _out2) =
+                        self.dispatch_host_builtin_out(canon, args, 1)?;
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(result);
+                    return Ok(());
+                }
+                if let Some(canon) = host_builtin_ref_first(name) {
+                    if canon == b"current" || canon == b"key" {
+                        let mut a0 = args
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Zval::Null)
+                            .deref_clone();
+                        let op =
+                            if canon == b"current" { PtrOp::Current } else { PtrOp::Key };
+                        let result = array_pointer_apply(&mut a0, op)?;
+                        let top = self.frames.len() - 1;
+                        self.frames[top].stack.push(result);
+                        return Ok(());
+                    }
+                }
+                // S-145 sonda-B: il builtin dei prezzi esiste SOLO nella
+                // build probe `sonda-price` (mai in HOST_BUILTIN_NAMES: in
+                // parità il nome resta undefined e get_defined_functions
+                // non lo elenca). Il driver lo chiama come string-callable,
+                // che arriva QUI per costruzione.
+                #[cfg(feature = "sonda-price")]
+                if name == b"__phpr_sonda_b" {
+                    let result = self.ho_sonda_b(args)?;
+                    let top = self.frames.len() - 1;
+                    self.frames[top].stack.push(result);
+                    return Ok(());
+                }
+                Err(undefined_builtin(written))
+            }
+        }
+    }
+
+    /// Dispatch an unqualified namespaced call by name, performing PHP's two-step
+    /// lookup: try the namespaced `name` first, then the global `fallback`. A
+    /// namespaced function defined in another compilation unit (autoloaded /
+    /// included) is registered in `linked_functions`, so it binds here even though
+    /// the compiler could not resolve it statically. When neither is callable the
+    /// catchable "Call to undefined function" reports the namespaced `name`, exactly
+    /// as PHP does (`N\foo()` rather than the bare `foo()`).
+    pub(super) fn invoke_named_fallback(
+        &mut self,
+        name: &[u8],
+        fallback: &[u8],
+        args: Vec<Zval>,
+    ) -> Result<(), PhpError> {
+        if self.is_name_callable(name) {
+            self.invoke_named(name, args)
+        } else if self.is_name_callable(fallback) {
+            self.invoke_named(fallback, args)
+        } else {
+            Err(undefined_builtin(name))
+        }
+    }
+
+    /// Enter a freshly-built callee `frame`: if its body is a generator,
+    /// materialise a `Generator` handle on the caller's operand stack instead of
+    /// running it (GEN); otherwise push it to run. The caller is the current top
+    /// frame, so this is called *before* `frame` is pushed.
+    pub(super) fn enter_callee(&mut self, frame: Frame<'m>) -> Result<(), PhpError> {
+        // WP-37 fast path: a simple-call callee has nothing per-call that can
+        // raise or divert — no hint coercion (the call-line / strict-mode
+        // captures below feed only its TypeError), no variadic pack, not a
+        // generator. Just push the frame.
+        if frame.func.simple_call {
+            if log::log_enabled!(target: "phpr::call", log::Level::Trace) {
+                log::trace!(
+                    target: "phpr::call",
+                    "enter {}() (depth {})",
+                    String::from_utf8_lossy(&frame.func.name),
+                    self.frames.len() + 1
+                );
+            }
+            self.frames.push(frame);
+            return Ok(());
+        }
+        // The call site is the caller's current line, reported in an arg TypeError
+        // (captured before the callee frame is pushed). There may be NO caller
+        // frame: an output-buffer callback (`ob_gzhandler`) invoked by the final
+        // buffer flush runs after `main` has returned and the frame stack is
+        // empty — treat that as line 0 rather than underflowing to `usize::MAX`.
+        let call_line = self.frames.len().checked_sub(1).map(|i| self.cur_line(i)).unwrap_or(0);
+        // strict_types governs the CALL SITE's unit (Zend: the caller's file
+        // decides argument coercion) — captured before the callee is pushed. A
+        // strict main script must not leak strictness into weak vendor units.
+        let caller_strict =
+            self.frames.last().map(|f| f.module.strict).unwrap_or(self.module.strict);
+        // Push the callee frame, then coerce/check each by-value argument against
+        // its declared hint *within* that frame (step 14 / 16): PHP throws an
+        // argument TypeError inside the function, so its stack trace shows this call
+        // and "thrown in" reports the definition line. By-reference and variadic
+        // slots are left untouched; an omitted (`Undef`) optional argument is
+        // coerced later, when the default prologue fills it.
+        self.frames.push(frame);
+        let top = self.frames.len() - 1;
+        let func = self.frames[top].func;
+        if log::log_enabled!(target: "phpr::call", log::Level::Trace) {
+            log::trace!(
+                target: "phpr::call",
+                "enter {}() (depth {})",
+                String::from_utf8_lossy(&func.name),
+                self.frames.len()
+            );
+        }
+        if func.has_hints {
+            let strict = caller_strict;
+            for i in 0..func.n_params as usize {
+                if Some(i as Slot) == func.variadic_slot {
+                    continue;
+                }
+                if func.param_by_ref.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                let Some(hint) = func.param_hints.get(i).cloned().flatten() else {
+                    continue;
+                };
+                if matches!(self.frames[top].slots[i], Zval::Undef) {
+                    continue;
+                }
+                let val = self.frames[top].slots[i].clone();
+                match self.coerce_or_check_hint(val, &hint, strict) {
+                    // The frame stays pushed on the error path so the unwind's trace
+                    // capture includes this call; unwind then pops it.
+                    Ok(c) => self.frames[top].slots[i] = c,
+                    Err(given) => {
+                        return Err(self.arg_type_error(
+                            func,
+                            i + 1,
+                            func.param_names.get(i).map(|n| &n[..]),
+                            &hint,
+                            &given,
+                            call_line,
+                        ))
+                    }
+                }
+            }
+        }
+        // The variadic pack (`T ...$rest`): each collected element is checked /
+        // coerced against the element hint at its true call-argument position — the
+        // fixed slots consumed args `0..v`, so pack element #k is argument `v+k+1`
+        // (PHP omits the parameter name for a variadic element). A by-reference
+        // variadic (`&...$rest`) is left untouched, like a by-ref fixed parameter.
+        if let Some(vslot) = func.variadic_slot {
+            let v = vslot as usize;
+            let by_ref = func.param_by_ref.get(v).copied().unwrap_or(false);
+            if !by_ref {
+                if let Some(hint) = func.param_hints.get(v).cloned().flatten() {
+                    let strict = caller_strict;
+                    let items: Vec<(Key, Zval)> = match &self.frames[top].slots[v] {
+                        Zval::Array(a) => {
+                            a.iter().map(|(k, val)| (k.clone(), val.clone())).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    if !items.is_empty() {
+                        let mut coerced = PhpArray::new();
+                        for (idx, (k, val)) in items.into_iter().enumerate() {
+                            match self.coerce_or_check_hint(val, &hint, strict) {
+                                Ok(c) => coerced.insert(k, c),
+                                Err(given) => {
+                                    return Err(self.arg_type_error(
+                                        func,
+                                        v + idx + 1,
+                                        None,
+                                        &hint,
+                                        &given,
+                                        call_line,
+                                    ))
+                                }
+                            }
+                        }
+                        self.frames[top].slots[v] = Zval::Array(Rc::new(coerced));
+                    }
+                }
+            }
+        }
+        // A generator function materialises a `Generator` handle instead of running:
+        // pop the (checked) frame back off and hand it to `make_generator`.
+        if func.is_generator {
+            let mut frame = self.frames.pop().expect("just-pushed generator frame");
+            // Honour a return cell (e.g. an `IteratorAggregate::getIterator()` that
+            // is itself a generator): the handle goes to the cell, not the stack.
+            let ret_cell = frame.ret_cell.take();
+            let gen = self.make_generator(frame);
+            match ret_cell {
+                Some(cell) => *cell.borrow_mut() = gen,
+                None => {
+                    let caller = self.frames.len() - 1;
+                    self.frames[caller].stack.push(gen);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The callee's name as PHP renders it in a type error: `Class::method` for a
+    /// method (the running callee frame's class), or the bare function name
+    /// otherwise. The callee frame is the current top frame at both error sites.
+    fn qualified_callee_name(&self, f: &Func) -> String {
+        let fname = String::from_utf8_lossy(&f.name);
+        match self.frames.last().and_then(|fr| fr.class) {
+            Some(cid) => format!(
+                "{}::{}",
+                String::from_utf8_lossy(&self.classes[cid].name),
+                fname
+            ),
+            None => fname.into_owned(),
+        }
+    }
+
+    /// The catchable `TypeError` PHP raises for a return value that failed scalar
+    /// coercion (step 14). `getMessage()` carries no location ("…returned"); the
+    /// throwable's file/line are left to default to the faulting `return`
+    /// statement's site (PHP reports the *return* line, not the declaration), which
+    /// `__toString` renders as the standard "… in <file>:<line>" suffix.
+    pub(super) fn return_type_error(&self, f: &Func, hint: &TypeHint, given: &str) -> PhpError {
+        PhpError::TypeError(format!(
+            "{}(): Return value must be of type {}, {} returned",
+            self.qualified_callee_name(f),
+            hint.display_name(),
+            given,
+        ))
+    }
+
+    /// The catchable `TypeError` PHP raises for an argument that failed scalar
+    /// coercion, matching PHP's exact wording (step 14). `getMessage()` names the
+    /// *call* site ("… called in <file> on line <N>"); the throwable's file/line
+    /// report the *definition* site, which `__toString` renders as the special
+    /// "… and defined in <file>:<line>" suffix. `arg_num` is 1-based; `pname` is
+    /// the parameter name (`Some` for a fixed parameter → "Argument #N ($name)…",
+    /// `None` for a variadic-pack element → "Argument #N …", matching PHP which
+    /// omits the name for a variadic element).
+    fn arg_type_error(
+        &self,
+        f: &Func,
+        arg_num: usize,
+        pname: Option<&[u8]>,
+        hint: &TypeHint,
+        given: &str,
+        call_line: Line,
+    ) -> PhpError {
+        let file = String::from_utf8_lossy(&self.module.file).into_owned();
+        let named = match pname {
+            Some(n) => format!(" (${})", String::from_utf8_lossy(n)),
+            None => String::new(),
+        };
+        let head = format!(
+            "{}(): Argument #{}{} must be of type {}, {} given",
+            self.qualified_callee_name(f),
+            arg_num,
+            named,
+            hint.display_name(),
+            given,
+        );
+        // A prelude-defined function stands in for a PHP *internal* function,
+        // whose argument TypeError has no ", called in …" suffix and reports the
+        // call site (not a definition site) — a plain TypeError does exactly that.
+        if f.file.as_ref() == b"prelude" {
+            return PhpError::TypeError(head);
+        }
+        PhpError::TypeErrorAt {
+            msg: format!("{head}, called in {file} on line {call_line}"),
+            file: self.module.file.to_vec().into_boxed_slice(),
+            line: f.line,
+        }
+    }
+}

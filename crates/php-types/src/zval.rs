@@ -1,0 +1,470 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::{GenState, Object, PhpArray, PhpStr, ZStr};
+
+/// A PHP value. Mirrors the observable semantics of `zval`
+/// (Zend/zend_types.h:355-380, type tags :620-631).
+///
+/// `Undef` is distinct from `Null`: reading an unset variable raises
+/// "Warning: Undefined variable" and yields NULL; the engine needs the
+/// distinction, programs never see it directly.
+///
+/// Heap types use `Rc` with copy-on-write via `Rc::make_mut`, which matches
+/// Zend's refcount + SEPARATE_* separation exactly.
+#[cfg_attr(not(feature = "mem-census"), derive(Clone))]
+#[derive(Debug)]
+pub enum Zval {
+    Undef,
+    Null,
+    Bool(bool),
+    Long(i64),
+    Double(f64),
+    Str(ZStr),
+    Array(Rc<PhpArray>),
+    /// A PHP reference (`IS_REFERENCE`, step 11d): a shared, mutable cell that
+    /// any number of variables / array elements can alias. Writing through any
+    /// alias is visible to all. **Invariant:** the inner value is never itself a
+    /// `Ref` (PHP collapses reference-to-reference). Consumers materialise the
+    /// underlying value with [`Zval::deref_clone`]; only `var_dump` inspects the
+    /// `Ref` wrapper directly (to print the `&` marker for container elements).
+    Ref(Rc<RefCell<Zval>>),
+    /// A closure / callable value (`Zval::Closure`, step 18, D-18.1). PHP
+    /// closures are objects (`instanceof Closure`); with no OOP yet we model them
+    /// as a dedicated variant. The body lives in the evaluator's closure table
+    /// (selected by [`Closure::fn_idx`]); `gettype` reports `"object"`.
+    Closure(Rc<Closure>),
+    /// A user-defined class instance (`Zval::Object`, step 19, D-19.1). Handle
+    /// semantics: the shared `Rc<RefCell<Object>>` means `$q = $p` aliases the
+    /// same instance and writes through any handle are visible to all (unlike the
+    /// copy-on-write `Array`). `gettype` reports `"object"`.
+    Object(Rc<RefCell<Object>>),
+    /// A `Generator` object (step 39, D-GEN-3): the value a generator function
+    /// returns. Like `Closure` it is modelled as a dedicated variant rather than
+    /// a user-class instance; `gettype` reports `"object"` and `instanceof`
+    /// special-cases `Generator`/`Iterator`/`Traversable`. Handle semantics via
+    /// the shared `Rc<RefCell<GenState>>` (assigning the variable aliases the
+    /// same running generator). See [`crate::GenState`].
+    Generator(Rc<RefCell<GenState>>),
+    /// A stream resource (`Zval::Resource`, step 51, D-51.1): the value `fopen`
+    /// and friends return. Handle semantics like `Object` — `$g = $f` aliases
+    /// the same stream via the shared `Rc<RefCell<Resource>>`, so `fclose($g)`
+    /// also closes `$f`. `gettype` reports "resource"/"resource (closed)". The
+    /// byte stream itself lives in [`crate::Resource`]; only `fopen` (which owns
+    /// the id counter) mints these, in the evaluator (D-51.3).
+    Resource(Rc<RefCell<crate::Resource>>),
+    /// A weak reference to an object (the backing of `WeakReference`/`WeakMap`).
+    /// Holds a `Weak` so it does *not* keep the object alive; `upgrade()` yields
+    /// the object while at least one strong handle remains, else `None` (true
+    /// weakness). Never surfaces to user code — `WeakReference::get()` /
+    /// `WeakMap` offsets upgrade it to an object or `null` via the internal
+    /// `__weak_get` builtin, and `var_dump` special-cases the two classes.
+    WeakHandle(std::rc::Weak<RefCell<Object>>),
+    /// A deferred function-argument *place* (Zend's FETCH_DIM_FUNC_ARG feeding
+    /// SEND_VAR_EX): an all-`Index` path rooted at a variable, passed as an
+    /// argument to a call whose callee — hence whether the parameter is
+    /// by-reference — is only known at bind time. The dispatch funnels
+    /// materialize it there: a by-reference parameter W-fetches (aliases the
+    /// element, creating a missing key silently), a by-value one R-fetches
+    /// (warns on a missing key, creates nothing). Never escapes the call
+    /// window — no other consumer sees this variant.
+    ArgPlace(Rc<ArgPlace>),
+}
+
+/// S-145 sonda-B (modello wp145-harness/s145-sonda-b-modello.md): sotto
+/// `mem-census` la derive lascia il posto a questo impl MANUALE che conta
+/// ogni movimento per CLASSE prima di clonare — il denominatore della
+/// partizione memcpy/inc-dec/nota. Variante per variante il corpo è la
+/// stessa copia della derive (Rc::clone / copy); senza feature la derive
+/// resta e la forma di parità non cambia di un byte.
+#[cfg(feature = "mem-census")]
+impl Clone for Zval {
+    #[inline]
+    fn clone(&self) -> Self {
+        crate::memcensus::s145_clone_note(self);
+        match self {
+            Zval::Undef => Zval::Undef,
+            Zval::Null => Zval::Null,
+            Zval::Bool(b) => Zval::Bool(*b),
+            Zval::Long(n) => Zval::Long(*n),
+            Zval::Double(d) => Zval::Double(*d),
+            Zval::Str(s) => Zval::Str(s.clone()),
+            Zval::Array(a) => Zval::Array(Rc::clone(a)),
+            Zval::Ref(r) => Zval::Ref(Rc::clone(r)),
+            Zval::Closure(c) => Zval::Closure(Rc::clone(c)),
+            Zval::Object(o) => Zval::Object(Rc::clone(o)),
+            Zval::Generator(g) => Zval::Generator(Rc::clone(g)),
+            Zval::Resource(r) => Zval::Resource(Rc::clone(r)),
+            Zval::WeakHandle(w) => Zval::WeakHandle(w.clone()),
+            Zval::ArgPlace(p) => Zval::ArgPlace(Rc::clone(p)),
+        }
+    }
+}
+
+/// S-144 tranche-2 (census, revisione S-143 az.1): funnel di nascita dei box
+/// condivisi `Rc<RefCell<Zval>>` (classe `rczval` del criterio S-143 p.2).
+/// Senza la feature `mem-census` è testualmente `Rc::new(RefCell::new(v))`
+/// (`#[inline]`, nessun simbolo census nel binario di parità). Il tipo del
+/// parametro è il classificatore: un sito il cui payload non è `Zval`
+/// (Object/Resource/GenState) NON compila qui — l'enumerazione dei siti è
+/// chiusa dal compilatore, non dalla diligenza.
+#[inline]
+pub fn zcell(v: Zval) -> Rc<RefCell<Zval>> {
+    #[cfg(feature = "mem-census")]
+    crate::memcensus::s144_rczval_note(false);
+    Rc::new(RefCell::new(v))
+}
+
+/// [`zcell`] per i SOLI siti inequivocabilmente di macchineria-proprietà
+/// (prop_ref_cell, makeref magic, radici lazy dei field-set): alimenta
+/// `rczval_prop_n`, il lato STRETTO del bracket del criterio S-144.
+#[inline]
+pub fn zcell_prop(v: Zval) -> Rc<RefCell<Zval>> {
+    #[cfg(feature = "mem-census")]
+    crate::memcensus::s144_rczval_note(true);
+    Rc::new(RefCell::new(v))
+}
+
+/// Payload of [`Zval::ArgPlace`]: which store roots the path, the steps to
+/// walk, the `Index` keys (already evaluated, source order), and the root
+/// variable's bare name for the R-branch's "Undefined variable" warning
+/// (empty when the base cannot be an undefined variable).
+#[derive(Debug)]
+pub struct ArgPlace {
+    pub base: ArgPlaceBase,
+    pub steps: Box<[ArgPlaceStep]>,
+    pub keys: Vec<Zval>,
+    pub name: Box<[u8]>,
+}
+
+/// The store rooting an [`ArgPlace`] path.
+#[derive(Clone, Copy, Debug)]
+pub enum ArgPlaceBase {
+    /// Caller-frame local slot.
+    Local(u32),
+    /// Slot in the global (bottom) frame.
+    Global(u32),
+    /// VM-level superglobal store index (`$_SESSION` &c.).
+    Superglobal(u8),
+    /// The caller frame's `$this` (a property path like `$this->data`).
+    This,
+}
+
+/// One step of an [`ArgPlace`] path: an array/ArrayAccess dimension (its key
+/// rides in `ArgPlace::keys`, one per `Index`, source order) or a literal
+/// property name. Dynamic property names (`->$n`) are never deferred.
+#[derive(Clone, Debug)]
+pub enum ArgPlaceStep {
+    Index,
+    Prop(Box<[u8]>),
+    /// `$a[]` in argument position (always the final step): a by-ref
+    /// parameter appends a fresh element and aliases it; a by-value one is
+    /// PHP's runtime "Cannot use [] for reading" Error (WP-17, PclZip).
+    Append,
+}
+
+/// A lowered-and-captured closure value (step 18). `fn_idx` selects the body
+/// (`FnDecl`) from the evaluator's flat closure table (D-18.2); `captures` are
+/// the `(dst-slot, value)` bindings snapshotted at *creation* time — a `use($x)`
+/// by-value capture holds a plain clone, a `use(&$x)` by-reference capture holds
+/// a `Zval::Ref` to the shared cell (D-18.3).
+impl Drop for Closure {
+    fn drop(&mut self) {
+        // Handle freed first (the pre-existing observable order: the id was
+        // released before the implicit field drop); the captured environment
+        // and bound $this can chain through further closures/objects, so they
+        // unwind via the bounded-drop trampoline (see `object::drop_bounded`).
+        crate::object::free_object_id(self.id);
+        crate::object::drop_bounded(crate::object::DeepDrop::Captures(std::mem::take(
+            &mut self.captures,
+        )));
+        if let Some(t) = self.bound_this.take() {
+            crate::object::drop_bounded(crate::object::DeepDrop::Val(t));
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Closure {
+    pub fn_idx: usize,
+    pub captures: Vec<(u32, Zval)>,
+    /// `Some(name)` for a first-class callable such as `strlen(...)` (step 18-6,
+    /// D-18.10): the value wraps a function *name* and `fn_idx`/`captures` are
+    /// unused. `None` for an ordinary anonymous/arrow closure.
+    pub named: Option<ZStr>,
+    /// The bound `$this` (step 19-6, D-19.19): captured at creation for a
+    /// non-static closure defined in a method, or set by `bindTo`/`Closure::bind`.
+    /// `None` for a static closure, a top-level closure, or a first-class callable.
+    pub bound_this: Option<Zval>,
+    /// Per-instance object handle, shown as `#N` by `var_dump` (step 18-7).
+    pub id: u32,
+    /// Shared render metadata for `var_dump` / `print_r` (step 18-7, D-18.9).
+    pub info: Rc<ClosureInfo>,
+    /// Stable id of the module that defined this closure, into the VM's module
+    /// registry. Keeps the closure callable after control leaves its defining
+    /// module — e.g. a closure created in an `include`/`eval` unit and invoked
+    /// later (Composer's `autoload_static` initializer). `0` is `main`.
+    pub module_id: usize,
+    /// The class *scope* the closure body runs in (a VM `ClassId`), governing
+    /// `private`/`protected` member access and `self::`/`static::`. Set at
+    /// creation to the defining class, or overridden by `Closure::bind`/`bindTo`'s
+    /// `$newScope` argument. `None` for an unscoped (top-level) closure.
+    pub scope: Option<usize>,
+    /// `static function () {}` — a static closure never binds `$this`, so
+    /// `bindTo`/`Closure::bind`/`call` with a non-null instance warns and yields
+    /// `null` (step 19-6). `false` for an ordinary closure or first-class callable.
+    pub is_static: bool,
+    /// The late-static-binding class captured at creation (the creating
+    /// frame's `static::`), or rebound by `bindTo`/`Closure::bind`. Distinct
+    /// from `scope`: a `static function` created inside `Base::getCb()` called
+    /// as `Child::getCb()` has scope Base but `static::` = Child
+    /// (php-ai-client's discovery strategy relies on it, WP-17).
+    pub lsb: Option<usize>,
+    /// Cycle-classify in-node mark (WP-52) — see [`crate::object::WalkMark`].
+    pub walk: crate::object::WalkMark,
+}
+
+/// What `var_dump` / `print_r` print for a closure value (step 18-7, D-18.9).
+#[derive(Clone, Debug)]
+pub struct ClosureInfo {
+    pub kind: ClosureRender,
+    /// Formal parameters, in order, for the trailing `parameter` pseudo-property
+    /// (omitted entirely when empty, matching PHP).
+    pub params: Vec<ClosureParam>,
+}
+
+/// The header form of a dumped closure: an ordinary closure shows
+/// `name`/`file`/`line`; a first-class callable shows a single `function`.
+#[derive(Clone, Debug)]
+pub enum ClosureRender {
+    Closure {
+        name: ZStr,
+        file: ZStr,
+        line: u32,
+    },
+    Function(ZStr),
+}
+
+/// One formal parameter as rendered by `var_dump` (`["$x"] => "<required>"`).
+#[derive(Clone, Debug)]
+pub struct ClosureParam {
+    /// Parameter name *without* the leading `$`.
+    pub name: Box<[u8]>,
+    pub optional: bool,
+}
+
+impl Zval {
+    pub fn str_from(s: &str) -> Zval {
+        Zval::Str(PhpStr::from_str(s))
+    }
+
+    /// Can this value (transitively) hold the last reference to a tracked
+    /// object, i.e. must a release note descend into it / buffer it?
+    /// (A-HO-103-1 ⊕ A-ST-103-5, Council WP-103: ONE predicate, exhaustive —
+    /// a new `Zval` variant fails to compile here instead of silently taking
+    /// a wildcard arm — encoding Zend's TWO levels: `Z_REFCOUNTED` (bit
+    /// test) narrowed by *collectable* (`GC_MAY_LEAK`). `Str` and `Resource`
+    /// are refcounted but never collectable — Zend never buffers them
+    /// (`gc_check_possible_root`); a noted `Ref` is routed INTO the descend
+    /// (`gc_note_slow`), which unwraps it there — the callers pass the
+    /// wrapper through, and the wrapper itself is never a root. A-HO-105-3:
+    /// this head used to claim the caller unwraps; the call sites refuted
+    /// that in S-103.)
+    #[inline]
+    pub fn is_gc_container(&self) -> bool {
+        match self {
+            // Collectable containers: can sit in / release a cycle. `Ref` is
+            // `true` NOT because the wrapper can be a root (it never is —
+            // Zend's gc_check_possible_root sees the inner value, and phpr's
+            // root sinks `gc_buf_push`/`gc_root_*` cannot even take a Ref BY
+            // TYPE) but because `true` is what routes a noted Ref into
+            // `gc_note_slow`'s descend, which unwraps it there (A-ST-104-4:
+            // the Hoare/Stogov conflict dissolves at the call sites — the
+            // enforcing assert lives in the descend, on the never-nested
+            // invariant).
+            Zval::Object(_) | Zval::Ref(_) | Zval::Array(_) | Zval::Closure(_) => true,
+            // Refcounted but NEVER collectable in Zend (no GC_MAY_LEAK).
+            Zval::Str(_) | Zval::Resource(_) => false,
+            // Generator: an object in Zend, NOT noted today — the documented
+            // PRE-existing hole A-HO-103-2 (backlog: birth-track evidence or
+            // fixture). Explicit here so the hole is a named decision, not a
+            // wildcard accident.
+            Zval::Generator(_) => false,
+            // Non-refcounted scalars / never-owning placeholders.
+            Zval::Undef
+            | Zval::Null
+            | Zval::Bool(_)
+            | Zval::Long(_)
+            | Zval::Double(_)
+            | Zval::WeakHandle(_)
+            | Zval::ArgPlace(_) => false,
+        }
+    }
+
+    /// Is this value's death free — no heap handle, no refcount to touch,
+    /// no drop glue owed? (A-HO-105-1, Council WP-105: the DROP-channel
+    /// predicate of the H-C2 lever, DISTINCT from the NOTE-channel
+    /// `is_gc_container` — the capital refutation R-HO-105-1 ≡ R2-Bak:
+    /// `Str`/`Resource`/`Generator` are `false` on the note predicate yet
+    /// their drop does real work, so a fast-out keyed on that predicate
+    /// would leak every popped string. Exhaustive by name: a new variant
+    /// fails to compile here. `WeakHandle` and `ArgPlace` are EXPLICITLY
+    /// non-trivial — dropping them decrements a `Weak`/`Rc` count.)
+    ///
+    /// A-HO-106-2 (Council WP-106): the H-C2 lever this predicate was born
+    /// for was MEASURED AND FELL in S-104 — Δ=−10,33/−11,33 ns/iter, 5/5,
+    /// channel refuted (run_loop is icache-bound; the 1101 outlined
+    /// drop-glue calls were nearly free — wp104-harness/hc2-ab-verdetto.out).
+    /// Do NOT re-propose a drop fast-out keyed on this predicate in the
+    /// dispatch loop; the predicate stays as documentation of the channel
+    /// and for its unit tooth.
+    #[inline]
+    pub fn is_trivial_drop(&self) -> bool {
+        match self {
+            // No heap behind the discriminant: the drop is a no-op.
+            Zval::Undef
+            | Zval::Null
+            | Zval::Bool(_)
+            | Zval::Long(_)
+            | Zval::Double(_) => true,
+            // Refcounted handles: the drop glue decrements (and may free).
+            Zval::Str(_)
+            | Zval::Array(_)
+            | Zval::Ref(_)
+            | Zval::Closure(_)
+            | Zval::Object(_)
+            | Zval::Generator(_)
+            | Zval::Resource(_) => false,
+            // Explicit, not lumped: a Weak decrement is still drop glue.
+            Zval::WeakHandle(_) => false,
+            // Explicit: the place holds an Rc<ArgPlace>.
+            Zval::ArgPlace(_) => false,
+        }
+    }
+
+    /// The underlying value, following a reference (D-R11). A non-reference is
+    /// cloned as-is; a `Ref` yields a clone of its current cell contents. By the
+    /// no-ref-to-ref invariant this never returns a `Ref`.
+    pub fn deref_clone(&self) -> Zval {
+        match self {
+            Zval::Ref(cell) => cell.borrow().clone(),
+            v => v.clone(),
+        }
+    }
+
+    /// Whether this value is a reference wrapper (used by `var_dump` to emit the
+    /// `&` marker on container elements).
+    pub fn is_ref(&self) -> bool {
+        matches!(self, Zval::Ref(_))
+    }
+
+    /// Type name as reported by gettype().
+    pub fn gettype(&self) -> &'static str {
+        match self {
+            Zval::Undef | Zval::Null | Zval::ArgPlace(_) => "NULL",
+            Zval::Bool(_) => "boolean",
+            Zval::Long(_) => "integer",
+            Zval::Double(_) => "double",
+            Zval::Str(_) => "string",
+            Zval::Array(_) => "array",
+            Zval::Ref(cell) => cell.borrow().gettype(),
+            Zval::Closure(_) | Zval::Object(_) | Zval::Generator(_) | Zval::WeakHandle(_) => "object",
+            // "resource" while open, "resource (closed)" after fclose (D-51.1).
+            Zval::Resource(r) => r.borrow().type_name(),
+        }
+    }
+
+    /// Type name as used in error messages (TypeError etc.).
+    pub fn error_type_name(&self) -> &'static str {
+        match self {
+            Zval::Undef | Zval::Null | Zval::ArgPlace(_) => "null",
+            Zval::Bool(_) => "bool",
+            Zval::Long(_) => "int",
+            Zval::Double(_) => "float",
+            Zval::Str(_) => "string",
+            Zval::Array(_) => "array",
+            Zval::Ref(cell) => cell.borrow().error_type_name(),
+            Zval::Closure(_) => "Closure",
+            Zval::Generator(_) => "Generator",
+            // A user object: the generic name. Use [`Self::type_name_for_error`]
+            // where PHP names it by class (operand / type errors).
+            Zval::Object(_) | Zval::WeakHandle(_) => "object",
+            Zval::Resource(r) => r.borrow().type_name(),
+        }
+    }
+
+    /// Like [`Self::error_type_name`] but names an object by its **class** — as
+    /// PHP's `zend_zval_type_name` does in operand and type errors ("stdClass",
+    /// not "object"). Returns an owned `String` since a class name is dynamic.
+    pub fn type_name_for_error(&self) -> String {
+        match self {
+            Zval::Object(o) => {
+                String::from_utf8_lossy(o.borrow().class_name.as_bytes()).into_owned()
+            }
+            Zval::Ref(cell) => cell.borrow().type_name_for_error(),
+            other => other.error_type_name().to_string(),
+        }
+    }
+
+    /// Names a value like PHP's `zend_zval_value_name`: bools read as their
+    /// *value* ("true"/"false"), everything else as [`Self::type_name_for_error`].
+    /// PHP 8.3+ uses this flavour in the "Call to a member function … on …"
+    /// fatal (while property-access warnings keep the plain type name).
+    pub fn value_name_for_error(&self) -> String {
+        match self {
+            Zval::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            Zval::Ref(cell) => cell.borrow().value_name_for_error(),
+            other => other.type_name_for_error(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_shares_heap_payload() {
+        let a = Zval::str_from("hello");
+        let b = a.clone();
+        match (&a, &b) {
+            (Zval::Str(x), Zval::Str(y)) => assert!(ZStr::ptr_eq(x, y)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn trivial_drop_seals_the_hc2_fast_out() {
+        // DENTI-105 (A-HO-105-1, Council WP-105): the DROP-channel
+        // predicate is true ONLY for the five no-heap scalars; a heap
+        // handle — Str INCLUDED, the capital refutation R-HO-105-1 —
+        // is never trivial. Cross-property: trivial ⇒ never container.
+        let trivial = [
+            Zval::Undef,
+            Zval::Null,
+            Zval::Bool(true),
+            Zval::Long(7),
+            Zval::Double(0.5),
+        ];
+        for v in &trivial {
+            assert!(v.is_trivial_drop(), "{} must be trivial", v.gettype());
+            assert!(!v.is_gc_container(), "trivial {} can never be a container", v.gettype());
+        }
+        let nontrivial = [
+            Zval::str_from("heap string"),
+            Zval::Array(Rc::new(PhpArray::new())),
+            Zval::Ref(Rc::new(RefCell::new(Zval::Long(1)))),
+        ];
+        for v in &nontrivial {
+            assert!(!v.is_trivial_drop(), "{} must NOT be trivial", v.gettype());
+        }
+    }
+
+    #[test]
+    fn gettype_names() {
+        assert_eq!(Zval::Null.gettype(), "NULL");
+        assert_eq!(Zval::Bool(true).gettype(), "boolean");
+        assert_eq!(Zval::Long(1).gettype(), "integer");
+        assert_eq!(Zval::Double(1.0).gettype(), "double");
+    }
+}

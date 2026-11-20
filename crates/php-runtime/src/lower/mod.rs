@@ -1,0 +1,3838 @@
+//! Bridge: mago AST (borrowed from a bumpalo arena) → owned [`crate::hir`].
+//!
+//! mago is reused as the PHP front-end (D-G8): it gives us a lossless, error
+//! recovering parser for PHP 8.x, eliminating the ~25K LOC of re2c lexer + Bison
+//! grammar. Its AST, however, borrows from an arena and stores text inline as
+//! `&[u8]`. This module walks that tree once and produces the *owned* HIR the
+//! evaluator consumes, doing the two resolutions described in [`crate::hir`]:
+//! variable→slot and span→line.
+//!
+//! Scope is Tier 1 procedural control flow (plan step 3/4). Constructs outside
+//! that scope (OOP, foreach/switch/match, functions, references, includes,
+//! variable-variables, array element targets) lower to
+//! [`LowerError::Unsupported`] rather than being silently dropped — the
+//! phpt-runner's capability scan (step 6) turns these into motivated SKIPs.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+
+use bumpalo::Bump;
+use mago_database::file::File;
+use mago_span::{HasSpan, Span};
+use mago_syntax::ast::{
+    AssignmentOperator, BinaryOperator,
+    Expression, Extends, Hint,
+    Identifier, Literal, LiteralInteger, Modifier, Node, Statement,
+    Use, UseItems, UseType, Variable,
+};
+use mago_syntax::parser::parse_file;
+
+use crate::hir::{
+    BinOp, Capture, ClassDecl, ExprKind, FnDecl, HintKind, Line, LoweredTrait, MethodDecl, Param,
+    Program, PropDecl, ScalarType, Slot, StaticAssignOp, Stmt, StmtKind, TypeHint,
+    Visibility,
+};
+
+mod stmt;
+mod class;
+mod curl_consts;
+mod expr;
+
+/// Why a script could not be lowered to HIR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LowerError {
+    /// mago reported one or more parse errors.
+    Parse(String),
+    /// A construct that is valid PHP but outside the current Tier 1 scope.
+    Unsupported { what: &'static str, line: Line },
+    /// A class declaration `extends`/`implements` a class/interface not yet known
+    /// (step 57, Phase 3). When lowering an `eval`/`include` unit the VM resolves
+    /// `name` via autoload and retries; a name that stays unresolvable defers the
+    /// declaration to its execution point (Zend late binding, [`DeferPolicy`]) —
+    /// only a non-deferrable site (e.g. a hoisted trait) leaves this as a fatal.
+    /// `kind` picks the faithful runtime message (`Class|Interface|Trait "X" not
+    /// found`).
+    UndefinedClass { name: Box<[u8]>, kind: MissingSym, line: Line },
+    /// A program that PHP *compiles* but rejects with a `Fatal error:` at link
+    /// time — e.g. an unresolved trait-method collision (step 21, D-21.5). Unlike
+    /// `Unsupported`, this is faithful PHP behaviour: `run_source` turns it into
+    /// an [`Outcome`](crate::Outcome) whose `rendered` stream carries the fatal.
+    Fatal { message: String, line: Line },
+}
+
+/// What sort of symbol an [`LowerError::UndefinedClass`] was expected to be —
+/// PHP's runtime binding error names the *expected* kind: `extends` wants a
+/// `Class`, `implements`/interface-`extends` an `Interface`, `use` a `Trait`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSym {
+    Class,
+    Interface,
+    Trait,
+}
+
+impl MissingSym {
+    /// The word PHP uses in `<word> "X" not found`.
+    pub fn word(self) -> &'static str {
+        match self {
+            MissingSym::Class => "Class",
+            MissingSym::Interface => "Interface",
+            MissingSym::Trait => "Trait",
+        }
+    }
+}
+
+impl std::fmt::Display for LowerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LowerError::Parse(msg) => write!(f, "parse error: {msg}"),
+            LowerError::Unsupported { what, line } => {
+                write!(f, "unsupported construct ({what}) on line {line}")
+            }
+            LowerError::UndefinedClass { name, kind, line } => {
+                write!(
+                    f,
+                    "{} \"{}\" not found on line {line}",
+                    kind.word(),
+                    String::from_utf8_lossy(name)
+                )
+            }
+            LowerError::Fatal { message, line } => write!(f, "{message} on line {line}"),
+        }
+    }
+}
+
+impl std::error::Error for LowerError {}
+
+/// Parse `source` (named `name` for diagnostics) and lower it to HIR, seeding the
+/// class/function tables with the built-in prelude only.
+pub fn lower_source(name: &[u8], source: &[u8]) -> Result<Program, LowerError> {
+    // The main script defers every unresolved supertype: autoload cannot run at
+    // lowering time, and Zend binds such declarations at execution anyway.
+    lower_source_impl(name, source, None, DeferPolicy::All)
+}
+
+/// Like [`lower_source`] but seeds the class table (and the static-id counter)
+/// from `seed_classes`/`seed_static` instead of just the built-in prelude —
+/// "compile against image" (step 57, Phase 1c-2c/3). An `eval`/`include` unit
+/// lowered this way resolves and **inherits** from classes already loaded
+/// (`eval("class Bar extends Foo {}")` sees `Foo`). `seed_classes` must already
+/// embed the prelude classes (the VM's accumulating image does), so the prelude
+/// is not re-seeded; the unit's own classes hoist contiguously after the seeded
+/// ones, keeping their ids aligned with the VM's global table. The prelude
+/// *functions* are always (re-)seeded.
+/// `declared` (WP-70 S-70.2) filters which SEED class names pre-populate the
+/// lowering `class_index`: only names it accepts (the VM passes its runtime
+/// class table) are eagerly resolvable — a seed entry that exists only as a
+/// conditional declaration never executed must NOT bind a supertype (Zend
+/// resolves a declare against the runtime table + autoload, never against a
+/// compile registry; the phantom-class family b_chain/b5/b6 of the WP-70
+/// council). `seed_conditional` names the seed entries that are conditional
+/// in their source unit — an eager bind against one marks the program
+/// [`Program::used_conditional_seed`] (cache-publish gate).
+pub fn lower_source_seeded(
+    name: &[u8],
+    source: &[u8],
+    seed_classes: &[std::rc::Rc<crate::hir::ClassDecl>],
+    seed_static: usize,
+    seed_traits: &[(Vec<u8>, LoweredTrait)],
+    seed_globals: &[Box<[u8]>],
+    seed_aliases: &[(Vec<u8>, Vec<u8>)],
+    declared: &dyn Fn(&[u8]) -> Option<usize>,
+    seed_conditional: &std::collections::HashSet<Vec<u8>>,
+    defer: DeferPolicy,
+) -> Result<Program, LowerError> {
+    lower_source_impl(
+        name,
+        source,
+        Some((
+            seed_classes,
+            seed_static,
+            seed_traits,
+            seed_globals,
+            seed_aliases,
+            declared,
+            seed_conditional,
+        )),
+        defer,
+    )
+}
+
+type Seed<'a> = (
+    &'a [std::rc::Rc<crate::hir::ClassDecl>],
+    usize,
+    &'a [(Vec<u8>, LoweredTrait)],
+    &'a [Box<[u8]>],
+    &'a [(Vec<u8>, Vec<u8>)],
+    &'a dyn Fn(&[u8]) -> Option<usize>,
+    &'a std::collections::HashSet<Vec<u8>>,
+);
+
+// WP-65 B-65.3 (KB65-3): cumulative wall-ns of the two lower phases over
+// SEEDED lowers only (include/eval/deferred + autoload retries — the
+// population the `lower_ns` window quotes): (lexparse, lowerhir, count).
+// Lex and parse are fused inside `parse_file` — the column says so.
+#[cfg(feature = "mem-census")]
+thread_local! {
+    static LOWER_PHASE_NS: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+#[cfg(feature = "mem-census")]
+pub(crate) fn census_lower_phase_take() -> (u64, u64, u64) {
+    LOWER_PHASE_NS.with(|c| c.get())
+}
+
+// WP-66 B-66.x (Bak b): the HIR share of lowers that error MID-PASS
+// (autoload retries) is COUNTED here, not narrated — it is the ~10%
+// residual of the B-65.3 lower balance: (partial_hir_ns, count).
+#[cfg(feature = "mem-census")]
+thread_local! {
+    static LOWER_PARTIAL_NS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+#[cfg(feature = "mem-census")]
+pub(crate) fn census_lower_partial_take() -> (u64, u64) {
+    LOWER_PARTIAL_NS.with(|c| c.get())
+}
+/// Drop-guard armed after lexparse books; a mid-pass error path drops it
+/// armed and the partial HIR time lands in `lower_partial`. The happy path
+/// defuses it right where `lowerhir` books.
+#[cfg(feature = "mem-census")]
+struct LowerPartialGuard {
+    t0: std::time::Instant,
+    base: u64,
+    armed: bool,
+}
+#[cfg(feature = "mem-census")]
+impl Drop for LowerPartialGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let hir = (self.t0.elapsed().as_nanos() as u64).saturating_sub(self.base);
+            LOWER_PARTIAL_NS.with(|c| {
+                let (ns, n) = c.get();
+                c.set((ns + hir, n + 1));
+            });
+        }
+    }
+}
+
+fn lower_source_impl(
+    name: &[u8],
+    source: &[u8],
+    seed: Option<Seed<'_>>,
+    defer: DeferPolicy,
+) -> Result<Program, LowerError> {
+    #[cfg(feature = "mem-census")]
+    let phase_seeded = seed.is_some();
+    #[cfg(feature = "mem-census")]
+    let phase_t0 = std::time::Instant::now();
+    let arena = Bump::new();
+    let file = File::ephemeral(Cow::Owned(name.to_vec()), Cow::Owned(source.to_vec()));
+    let program = parse_file(&arena, &file);
+    // Lexparse accumulates HERE (every seeded pass, retries included);
+    // lowerhir accumulates on the happy path only — a lower that errors
+    // mid-pass (autoload retry) loses its partial HIR tail, declared.
+    #[cfg(feature = "mem-census")]
+    let phase_lexparse = phase_t0.elapsed().as_nanos() as u64;
+    #[cfg(feature = "mem-census")]
+    if phase_seeded {
+        LOWER_PHASE_NS.with(|c| {
+            let (lp, lh, n) = c.get();
+            c.set((lp + phase_lexparse, lh, n + 1));
+        });
+    }
+    // WP-66 B-66.x: every early `?`/return below drops this armed.
+    #[cfg(feature = "mem-census")]
+    let mut partial_guard =
+        LowerPartialGuard { t0: phase_t0, base: phase_lexparse, armed: phase_seeded };
+
+    if program.has_errors() {
+        let msg = program
+            .errors
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(LowerError::Parse(msg));
+    }
+
+    let mut low = Lowerer::new(&file, name);
+    low.defer = match defer {
+        DeferPolicy::All => DeferConf::All,
+        DeferPolicy::No => DeferConf::No,
+    };
+    // `declare(strict_types=1)` must be the file's first statement, but the
+    // main pass only reaches it after hoisting — pre-scan so a deferred-decl
+    // snippet built *during* hoisting (an anonymous class in a method body)
+    // carries the right strictness.
+    for s in program.statements.as_slice() {
+        if let Statement::Declare(node) = s {
+            for item in node.items.iter() {
+                if item.name.value.eq_ignore_ascii_case(b"strict_types") {
+                    if let Expression::Literal(Literal::Integer(i)) = item.value {
+                        low.strict = i.value == Some(1);
+                    }
+                }
+            }
+        }
+    }
+    // Docblock trivia, for `getDocComment` retention (the AST drops comments).
+    low.docs = program
+        .trivia
+        .iter()
+        .filter(|t| t.kind.is_docblock())
+        .map(|t| (t.span.start.offset, t.span.end.offset))
+        .collect();
+    // A misplaced `namespace` is a compile-time fatal in PHP; reject it here
+    // (before hoisting) so it renders the exact error rather than being silently
+    // accepted or tripping a later invariant.
+    low.check_namespace_first(program.statements.as_slice())?;
+    match seed {
+        // Seed the built-in exception hierarchy (Throwable/Exception/Error + the
+        // SPL subclasses) at the front of the class table (ids 0..N), before any
+        // user class is hoisted (step 20). This makes `extends Exception`,
+        // `instanceof`, `new RuntimeException(...)`, property init and
+        // `parent::__construct` reuse the whole step-19 class machinery with no
+        // special-casing. The prelude's global functions (step 35: the procedural
+        // date API) are seeded ahead of the user's too, so user functions get ids
+        // contiguous after them. Call sites resolve by name, so no fix-up needed.
+        None => {
+            // S-79.0.3 (A-TH2): the prelude lowering is the a1 sub-channel —
+            // the census must not book it to the main script's account.
+            // S-80.0.3 (A-MS11): RAII window — an early return between open
+            // and close would silently lose the booking; Drop closes it.
+            #[cfg(feature = "census-instrumentation")]
+            let mut a1w = crate::alloc_census::A1Window::open();
+            let (pclasses, pindex, pfunctions, pfn_index, pstatic) = lower_prelude();
+            #[cfg(feature = "census-instrumentation")]
+            {
+                crate::alloc_census::note_prelude_counts(pfunctions.len(), pclasses.len());
+                a1w.close();
+            }
+            low.classes = pclasses;
+            low.class_index = pindex;
+            low.functions = pfunctions;
+            low.fn_index = pfn_index;
+            // Start the unit's `static $x` ids past the prelude's own bindings:
+            // the prelude bodies keep their 0..pstatic ids in every unit, so a
+            // fresh counter here would alias them onto user cells (or index past
+            // `Vm::statics` when the user program declares fewer statics).
+            low.static_count = pstatic;
+        }
+        // Compile-against-image: seed the caller's *class* image (which already
+        // embeds the prelude's classes), so an eval class can `extend`/`implement`
+        // a caller user class and flatten its inherited layout. Ids equal the
+        // caller's, so the eval's own classes hoist after and the VM's class-id
+        // relocation stays an identity for the shared ones. `static_count` is
+        // carried so the eval's new `static $x` cells get ids past the caller's
+        // range. The prelude's *functions* are still seeded (the eval needs the
+        // date API etc.), but the caller's user functions are deliberately NOT
+        // seeded: re-emitting them into the eval unit would make a call like
+        // `eval("foo();")` run the recompiled copy and mis-attribute its
+        // `__FILE__`/backtrace to "eval()'d code". Calling a caller user function
+        // from eval therefore remains unsupported here (a later phase resolves it
+        // against the caller module instead of re-emitting).
+        Some((sclasses, sstatic, straits, sglobals, saliases, declared, seed_conditional)) => {
+            // Seed the shared global variable name→slot registry (step 57): a
+            // seeded (`include`/`eval`) unit numbers its `$GLOBALS['x']` / `global
+            // $x` slots to *agree* with `main`'s (and every earlier unit's), since
+            // at run time all `DimBase::Global` ops index the one bottom (`main`)
+            // frame. Pre-populating `globals` in order reproduces the shared slot
+            // numbering; a genuinely new global name this unit introduces appends
+            // past the seed (the VM grows the bottom frame to match). Without this,
+            // each unit renumbers globals from 0 and cross-unit access aliases the
+            // wrong cell or overflows `main`'s frame.
+            for g in sglobals {
+                low.globals.slot_for(g);
+            }
+            low.classes = sclasses.to_vec();
+            low.seed_class_len = sclasses.len();
+            low.seed_conditional = seed_conditional.clone();
+            let mut ci: HashMap<Vec<u8>, usize> = HashMap::new();
+            for (i, cd) in sclasses.iter().enumerate() {
+                // WP-70 S-70.2: a seed entry is eagerly resolvable only if its
+                // name is DECLARED (runtime class table) — a conditional
+                // declaration never executed stays unresolvable, so a
+                // dependent statement defers to run time exactly like Zend
+                // (the phantom-class family: b_chain/b4/b5/b6).
+                let key = cd.name.to_ascii_lowercase();
+                if let Some(rid) = declared(&key) {
+                    // E-71.H2 (WP-72): a CONDITIONAL name binds to the image
+                    // of the branch the runtime actually DECLARED — the
+                    // runtime id picks the right duplicate (never "first
+                    // image wins": fixtures h2a/h2c fataled on the
+                    // un-executed branch). ONLY for seed-conditional names:
+                    // for plain classes the seed position is authoritative
+                    // (elision can skew id alignment — hk regression).
+                    let idx = if seed_conditional.contains(&key)
+                        && rid < sclasses.len()
+                        && sclasses[rid].name.to_ascii_lowercase() == key
+                    {
+                        rid
+                    } else {
+                        i
+                    };
+                    ci.entry(key).or_insert(idx);
+                }
+            }
+            // Runtime `class_alias` entries resolve to the ORIGINAL decl (index
+            // only — no clone), so `extends LegacyName` inherits the real class.
+            for (alias, orig) in saliases {
+                if let Some(&i) = ci.get(&orig.to_ascii_lowercase()) {
+                    ci.entry(alias.to_ascii_lowercase()).or_insert(i);
+                }
+            }
+            low.class_index = ci;
+            // Seed already-loaded traits so a `use T` here resolves against a trait
+            // declared in an earlier (e.g. autoloaded) unit (step 21, trait analogue
+            // of seed_classes). The keys are recorded so only this unit's *new*
+            // traits are re-emitted in `Program::traits`.
+            low.traits = straits
+                .iter()
+                .map(|(k, t)| {
+                    let mut t = t.clone();
+                    // Seeded from another unit: its closures aren't in this unit's
+                    // table, so flatten must re-append and shift them.
+                    t.external = true;
+                    (k.clone(), t)
+                })
+                .collect();
+            let (pfunctions, pfn_index, pstatic) = prelude_functions();
+            low.functions = pfunctions;
+            low.fn_index = pfn_index;
+            // The caller's total normally already covers the prelude range (main
+            // was seeded past it); `max` keeps the invariant for a caller image
+            // that predates any main unit (e.g. a bare eval host).
+            low.static_count = sstatic.max(pstatic);
+        }
+    }
+    let seeded_trait_keys: HashSet<Vec<u8>> = low.traits.keys().cloned().collect();
+    // Hoist function declarations first, so a call may textually precede its
+    // definition (PHP's function hoisting). Bodies are lowered here; the main
+    // pass below skips the declaration statements (they are no-ops). Each hoist
+    // pass descends into `namespace` blocks (step 50) via `for_blocks`, so names
+    // are registered fully-qualified and bodies resolve against the right imports.
+    let stmts = program.statements.as_slice();
+    low.for_blocks(stmts, |lo, body| {
+        for s in body {
+            if let Statement::Function(func) = s {
+                lo.hoist_function(func)?;
+            }
+        }
+        Ok(())
+    })?;
+    // Lower traits before classes, so a class's `use T` finds T fully resolved
+    // (step 21). Traits stay in the Lowerer; they never enter the class table.
+    low.for_blocks(stmts, |lo, body| lo.lower_traits(body))?;
+    low.hoist_classes(stmts)?;
+    // Seed global-namespace imports for the main pass (a no-`namespace` file may
+    // still carry top-level `use`s); each `namespace` arm re-scopes its own.
+    low.collect_uses(stmts);
+    let body = low.lower_stmts(stmts)?;
+    // Anonymous classes (`new class {…}`) collected during lowering get ids past
+    // every named class; register them so `new` resolves each by its synthetic
+    // name at compile time (step 51).
+    for decl in std::mem::take(&mut low.anon_classes) {
+        let key = decl.name.to_ascii_lowercase();
+        low.class_index.insert(key, low.classes.len());
+        low.classes.push(std::rc::Rc::new(decl));
+    }
+    // `goto`/label validation (step 45): the top-level script body is its own
+    // function scope. Each user function / method / closure validates its own
+    // body where it is lowered (`lower_function`/`lower_method`/`lower_closure`).
+    // WP-67 E-67.3 (declared bordo, Hejlsberg b): a goto error here exits
+    // BEFORE the lowerhir booking below, so its time lands in
+    // `lower_partial` via the armed drop-guard — accepted, not a leak.
+    validate_goto(&body)?;
+    // B-65.3: the HIR share of this pass (lexparse landed above).
+    #[cfg(feature = "mem-census")]
+    if phase_seeded {
+        let lowerhir = (phase_t0.elapsed().as_nanos() as u64).saturating_sub(phase_lexparse);
+        LOWER_PHASE_NS.with(|c| {
+            let (lp, lh, n) = c.get();
+            c.set((lp, lh + lowerhir, n));
+        });
+    }
+    // Happy path: the pass completed, its HIR time booked above (B-66.x).
+    #[cfg(feature = "mem-census")]
+    {
+        partial_guard.armed = false;
+    }
+    Ok(Program {
+        body,
+        file: name.into(),
+        slots: low.globals.slots,
+        functions: low.functions,
+        conditional_fns: low.conditional_fns,
+        conditional_classes: low.conditional_classes,
+        conditional_traits: low.conditional_traits,
+        closures: low.closures,
+        static_count: low.static_count,
+        strict: low.strict,
+        classes: low.classes,
+        // Carry only the traits *this* unit declared (not the seeded ones), so the
+        // VM can accumulate them into its cross-unit trait image.
+        traits: low
+            .traits
+            .into_iter()
+            .filter(|(k, _)| !seeded_trait_keys.contains(k))
+            .collect(),
+        const_attributes: low.const_attributes,
+        deferred: low.deferred,
+        used_conditional_seed: low.used_conditional_seed.get(),
+    })
+}
+
+/// The stack of loop/`switch`/`finally` barriers enclosing a `Label` or `Goto`,
+/// innermost last; each entry pairs a unique barrier id with its kind (step 45).
+type BarrierStack = Vec<(u32, BarrierKind)>;
+/// Map of label name → the barriers enclosing its definition (step 45).
+type LabelMap<'a> = HashMap<&'a [u8], BarrierStack>;
+/// One `goto`: its label, the barriers enclosing it, and its source line.
+type GotoSite<'a> = (&'a [u8], BarrierStack, Line);
+
+/// Enforce PHP's compile-time `goto` rules over one function scope's statement
+/// tree (step 45). `goto` is function-scoped, so the top-level script body and
+/// every function / method / closure body is validated independently.
+///
+/// PHP rejects three situations at *compile* time — before any output — which we
+/// surface as [`LowerError::Fatal`] (rendered with no partial output, exactly
+/// like the oracle):
+///   * `goto` to a label not defined in the scope → `'goto' to undefined label 'X'`;
+///   * a label defined twice → `Label 'X' already defined`;
+///   * `goto` that jumps *into* a loop or `switch` → `'goto' into loop or switch
+///     statement is disallowed`. Jumping *out of* a loop/switch is allowed, and
+///     `if` / `try` / plain blocks are transparent (verified against the oracle:
+///     a `goto` into a `try` body runs and its `finally` still fires).
+///
+/// Legality of an "into a loop/switch/finally" jump is decided by container
+/// stacks: each loop / `switch` / `finally` block gets a unique barrier id as
+/// the tree is walked, and every `Label`/`Goto` records the stack of barrier
+/// ids enclosing it. A `goto` may reach a label iff every barrier around the
+/// label also surrounds the goto — i.e. the label's barrier stack is a prefix of
+/// the goto's. `if` / `try` body / `catch` / plain blocks are *transparent*
+/// (no barrier), matching PHP: a `goto` into one of those is allowed.
+///
+/// The barrier *kind* (loop/switch vs finally) is recorded alongside the id so
+/// the right oracle message is produced: PHP distinguishes `'goto' into loop or
+/// switch statement is disallowed` from `jump into a finally block is
+/// disallowed`. When the label sits inside several barriers the goto is outside
+/// of, the innermost such barrier (the first mismatching stack entry) picks the
+/// message — the same one PHP reports.
+fn validate_goto(body: &[Stmt]) -> Result<(), LowerError> {
+    let mut labels: LabelMap = HashMap::new();
+    let mut gotos: Vec<GotoSite> = Vec::new();
+    let mut counter: u32 = 0;
+    collect_goto(body, &mut Vec::new(), &mut counter, &mut labels, &mut gotos)?;
+    for (name, gstack, line) in gotos {
+        match labels.get(name) {
+            None => {
+                return Err(LowerError::Fatal {
+                    message: format!(
+                        "'goto' to undefined label '{}'",
+                        String::from_utf8_lossy(name)
+                    ),
+                    line,
+                });
+            }
+            Some(lstack) => {
+                // Find the first barrier enclosing the label that does not also
+                // enclose the goto: that is the construct being jumped *into*.
+                let mismatch = lstack
+                    .iter()
+                    .enumerate()
+                    .find(|(i, (id, _))| gstack.get(*i).map(|(g, _)| g) != Some(id));
+                if let Some((_, (_, kind))) = mismatch {
+                    return Err(LowerError::Fatal {
+                        message: kind.message().to_string(),
+                        line,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The kind of construct a `goto` is forbidden from jumping *into* (step 45).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarrierKind {
+    /// A `for`/`foreach`/`while`/`do-while`/`switch` body.
+    LoopOrSwitch,
+    /// A `finally { … }` block (rejected with its own oracle message).
+    Finally,
+}
+
+impl BarrierKind {
+    fn message(self) -> &'static str {
+        match self {
+            BarrierKind::LoopOrSwitch => "'goto' into loop or switch statement is disallowed",
+            BarrierKind::Finally => "jump into a finally block is disallowed",
+        }
+    }
+}
+
+/// Single-pass walk for [`validate_goto`]: collect every `Label` (keyed by name,
+/// rejecting duplicates) and every `Goto`, each tagged with the stack of
+/// enclosing barriers. Loops, `switch` and `finally` push a barrier; `if`,
+/// `try` body, `catch` and plain blocks are walked transparently.
+fn collect_goto<'a>(
+    stmts: &'a [Stmt],
+    stack: &mut BarrierStack,
+    counter: &mut u32,
+    labels: &mut LabelMap<'a>,
+    gotos: &mut Vec<GotoSite<'a>>,
+) -> Result<(), LowerError> {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Label(name) => {
+                if labels.insert(name, stack.clone()).is_some() {
+                    return Err(LowerError::Fatal {
+                        message: format!(
+                            "Label '{}' already defined",
+                            String::from_utf8_lossy(name)
+                        ),
+                        line: s.line,
+                    });
+                }
+            }
+            StmtKind::Goto(name) => gotos.push((name, stack.clone(), s.line)),
+            StmtKind::Block(b) => collect_goto(b, stack, counter, labels, gotos)?,
+            StmtKind::If {
+                then,
+                elseifs,
+                otherwise,
+                ..
+            } => {
+                collect_goto(then, stack, counter, labels, gotos)?;
+                for (_, b) in elseifs {
+                    collect_goto(b, stack, counter, labels, gotos)?;
+                }
+                collect_goto(otherwise, stack, counter, labels, gotos)?;
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::DoWhile { body, .. }
+            | StmtKind::For { body, .. }
+            | StmtKind::Foreach { body, .. } => {
+                *counter += 1;
+                stack.push((*counter, BarrierKind::LoopOrSwitch));
+                collect_goto(body, stack, counter, labels, gotos)?;
+                stack.pop();
+            }
+            StmtKind::Switch { cases, .. } => {
+                *counter += 1;
+                stack.push((*counter, BarrierKind::LoopOrSwitch));
+                for c in cases {
+                    collect_goto(&c.body, stack, counter, labels, gotos)?;
+                }
+                stack.pop();
+            }
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                // The `try` body and `catch` blocks are transparent; only the
+                // `finally` block is a barrier (PHP forbids jumping into it).
+                collect_goto(body, stack, counter, labels, gotos)?;
+                for c in catches {
+                    collect_goto(&c.body, stack, counter, labels, gotos)?;
+                }
+                *counter += 1;
+                stack.push((*counter, BarrierKind::Finally));
+                collect_goto(finally, stack, counter, labels, gotos)?;
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The mago `Expression` variant name, for a precise `Unsupported` category
+/// (step 48 micro-step): the generic `"expression"` bucket told us nothing about
+/// *which* construct was missing, so the catch-all now reports the node kind
+/// (e.g. `expr:Instantiation`), making the phpt-runner skip detail actionable.
+fn expr_variant_name(e: &Expression) -> &'static str {
+    match e {
+        Expression::Binary(_) => "expr:Binary",
+        Expression::UnaryPrefix(_) => "expr:UnaryPrefix",
+        Expression::UnaryPostfix(_) => "expr:UnaryPostfix",
+        Expression::Parenthesized(_) => "expr:Parenthesized",
+        Expression::Literal(_) => "expr:Literal",
+        Expression::CompositeString(_) => "expr:CompositeString",
+        Expression::Assignment(_) => "expr:Assignment",
+        Expression::Conditional(_) => "expr:Conditional",
+        Expression::Array(_) => "expr:Array",
+        Expression::LegacyArray(_) => "expr:LegacyArray",
+        Expression::List(_) => "expr:List",
+        Expression::ArrayAccess(_) => "expr:ArrayAccess",
+        Expression::ArrayAppend(_) => "expr:ArrayAppend",
+        Expression::AnonymousClass(_) => "expr:AnonymousClass",
+        Expression::Closure(_) => "expr:Closure",
+        Expression::ArrowFunction(_) => "expr:ArrowFunction",
+        Expression::Variable(_) => "expr:Variable",
+        Expression::ConstantAccess(_) => "expr:ConstantAccess",
+        Expression::Identifier(_) => "expr:Identifier",
+        Expression::Match(_) => "expr:Match",
+        Expression::Yield(_) => "expr:Yield",
+        Expression::Construct(_) => "expr:Construct",
+        Expression::Throw(_) => "expr:Throw",
+        Expression::Clone(_) => "expr:Clone",
+        Expression::Call(_) => "expr:Call",
+        Expression::PartialApplication(_) => "expr:PartialApplication",
+        Expression::Access(_) => "expr:Access",
+        Expression::Parent(_) => "expr:Parent",
+        Expression::Static(_) => "expr:Static",
+        Expression::Instantiation(_) => "expr:Instantiation",
+        Expression::MagicConstant(_) => "expr:MagicConstant",
+        Expression::Pipe(_) => "expr:Pipe",
+        Expression::Error(_) => "expr:Error",
+        _ => "expr:other",
+    }
+}
+
+/// The mago `Statement` variant name, for a precise `Unsupported` category
+/// (step 48 micro-step). See [`expr_variant_name`].
+fn stmt_variant_name(s: &Statement) -> &'static str {
+    match s {
+        Statement::OpeningTag(_) => "stmt:OpeningTag",
+        Statement::ClosingTag(_) => "stmt:ClosingTag",
+        Statement::Inline(_) => "stmt:Inline",
+        Statement::Namespace(_) => "stmt:Namespace",
+        Statement::Use(_) => "stmt:Use",
+        Statement::Class(_) => "stmt:Class",
+        Statement::Interface(_) => "stmt:Interface",
+        Statement::Trait(_) => "stmt:Trait",
+        Statement::Enum(_) => "stmt:Enum",
+        Statement::Block(_) => "stmt:Block",
+        Statement::Constant(_) => "stmt:Constant",
+        Statement::Function(_) => "stmt:Function",
+        Statement::Declare(_) => "stmt:Declare",
+        Statement::Goto(_) => "stmt:Goto",
+        Statement::Label(_) => "stmt:Label",
+        Statement::Try(_) => "stmt:Try",
+        Statement::Foreach(_) => "stmt:Foreach",
+        Statement::For(_) => "stmt:For",
+        Statement::While(_) => "stmt:While",
+        Statement::DoWhile(_) => "stmt:DoWhile",
+        Statement::Continue(_) => "stmt:Continue",
+        Statement::Break(_) => "stmt:Break",
+        Statement::Switch(_) => "stmt:Switch",
+        Statement::If(_) => "stmt:If",
+        Statement::Return(_) => "stmt:Return",
+        Statement::Expression(_) => "stmt:Expression",
+        Statement::Echo(_) => "stmt:Echo",
+        Statement::EchoTag(_) => "stmt:EchoTag",
+        Statement::Global(_) => "stmt:Global",
+        Statement::Static(_) => "stmt:Static",
+        Statement::HaltCompiler(_) => "stmt:HaltCompiler",
+        Statement::Unset(_) => "stmt:Unset",
+        Statement::Noop(_) => "stmt:Noop",
+        _ => "stmt:other",
+    }
+}
+
+/// The built-in classes, authored in PHP and lowered once into the front of
+/// every program's class table (step 20): `stdClass` plus the throwable
+/// hierarchy. Mirrors PHP's core/SPL classes closely enough for catch-matching,
+/// the accessors, and `instanceof`.
+/// `getTrace`/`getTraceAsString` are stubs (no real stack trace is modelled);
+/// `file`/`line` are filled in by the evaluator at `new` time, not here.
+/// Segmented by domain under `lower/prelude/` (WP-12 follow-up: the old
+/// 5060-line prelude.php split, zero logic changes). `concat!` re-forms the
+/// SINGLE compilation unit at build time, so hoisting/order semantics are
+/// exactly the monolith's; only `core.php` carries the `<?php` opener.
+/// Declaration order within the unit is free (the Lowerer hoists every class
+/// before resolving `extends`/`implements` — the monolith already relied on
+/// forward references, e.g. PhpToken before Stringable).
+const PRELUDE_SRC_STR: &str = concat!(
+    include_str!("prelude/core.php"),
+    include_str!("prelude/spl.php"),
+    include_str!("prelude/reflection.php"),
+    include_str!("prelude/date.php"),
+    include_str!("prelude/pdo.php"),
+    include_str!("prelude/sqlite3.php"),
+    include_str!("prelude/dom.php"),
+    include_str!("prelude/session.php"),
+    include_str!("prelude/tidy.php"),
+);
+const PRELUDE_SRC: &[u8] = PRELUDE_SRC_STR.as_bytes();
+
+/// The namespaced prelude tail: PHP forbids `namespace` after global code, so
+/// `Pdo\Sqlite` (PHP 8.4's driver subclass) is its own unit, hoisted into the
+/// same class table by [`lower_prelude_uncached`]. `createFunction` (and the
+/// BC `PDO::sqliteCreateFunction`) run PHP callbacks inside sqlite's step
+/// loop via the ACTIVE_VM re-entry pointer in vm/pdo.rs; the rest of the UDF
+/// family (createAggregate/createCollation/setAuthorizer) keeps the honest
+/// undefined-method error.
+const PRELUDE_NS_SRC: &[u8] = include_bytes!("prelude_ns.php");
+
+/// The `BcMath\Number` value object (PHP 8.4+): its own namespaced unit,
+/// hoisted alongside `Pdo\Sqlite`. Delegates to the bc* builtins.
+const PRELUDE_BC_SRC: &[u8] = include_bytes!("prelude_bcmath.php");
+
+/// The `GMP` value object and the `gmp_*` functions (global namespace),
+/// delegating to the `_gmp_*` builtins. Hoisted for both classes AND functions.
+const PRELUDE_GMP_SRC: &[u8] = include_bytes!("prelude_gmp.php");
+
+/// ext/mysqli: the `mysqli`/`mysqli_result`/`mysqli_stmt` classes and the
+/// mysqli_* procedural functions (global namespace), delegating to the
+/// `__mysqli_*` host builtins (mysql crate) in vm/mysqli.rs.
+const PRELUDE_MYSQLI_SRC: &[u8] = include_bytes!("prelude_mysqli.php");
+
+/// ext/gd: the `GdImage` opaque handle class and the `image*` procedural
+/// functions (global namespace), delegating to the `__gd_*` host builtins
+/// (system-libgd FFI) in vm/gd.rs.
+const PRELUDE_GD_SRC: &[u8] = include_bytes!("prelude_gd.php");
+
+/// ext/fileinfo: the `finfo` opaque class and the finfo_*/mime_content_type
+/// procedural functions, delegating to the `__finfo_detect` builtin
+/// (php-builtins fileinfo.rs).
+const PRELUDE_FILEINFO_SRC: &[u8] = include_bytes!("prelude_fileinfo.php");
+
+/// The four owned products of lowering [`PRELUDE_SRC`]: the class table + its
+/// name→id index (step 20), and the global-function table + its name→index
+/// (step 35). Both are seeded into every real program before user declarations
+/// are hoisted, so user classes/functions get contiguous ids after them.
+type LoweredPrelude = (
+    Vec<std::rc::Rc<ClassDecl>>,
+    HashMap<Vec<u8>, usize>,
+    Vec<std::rc::Rc<FnDecl>>,
+    HashMap<Vec<u8>, usize>,
+    // The prelude's own `static $x` binding count: every unit's counter must
+    // start past it, or a prelude static would alias (or overflow) user cells.
+    usize,
+);
+
+thread_local! {
+    /// One lowering of the prelude per thread. Parsing + hoisting the whole
+    /// embedded PHP prelude is a large constant, and every `include`/`eval`
+    /// unit needs (a clone of) its products — re-lowering it per included file
+    /// dominates an autoload storm (PHPUnit's `preload()` requires ~1200 files).
+    static PRELUDE_CACHE: std::cell::OnceCell<LoweredPrelude> = const { std::cell::OnceCell::new() };
+}
+
+/// WP-67 P-67.3 (census-only): PRELUDE_CACHE population for the bounded-set
+/// metric — a OnceCell (0 or 1 lowering per thread), reported as its class
+/// and fn table sizes. Survives requests by design.
+#[cfg(feature = "mem-census")]
+pub(crate) fn census_prelude_entries() -> (u64, u64) {
+    PRELUDE_CACHE.with(|c| c.get().map_or((0, 0), |p| (p.0.len() as u64, p.2.len() as u64)))
+}
+
+/// Lower [`PRELUDE_SRC`] once per thread (cached) and return a clone of its
+/// owned class table + name→id index (step 20) plus the global functions it
+/// declares (step 35: the procedural date API). Function/`new` call sites
+/// resolve by *name* (the evaluator rebuilds its `fn_index`/class table from
+/// `Program`), so the prelude bodies need no index fix-up after being merged in.
+fn lower_prelude() -> LoweredPrelude {
+    PRELUDE_CACHE.with(|c| c.get_or_init(lower_prelude_uncached).clone())
+}
+
+/// A-BB6/A-AH22 (Council WP-82): fingerprint of the VIRGIN compile chain the
+/// cached MAIN unit is keyed on — COMPUTED from the very bindings this module
+/// lowers ([`PRELUDE_SRC`] + every hoisted namespaced/global prelude unit),
+/// never a hand-maintained literal (KS-AH-81-2) and never a copy of the
+/// prelude (KS-AH-82-2: a constant copy would be the literal in disguise —
+/// the falsifier test below feeds a MUTATED prelude through the same seam
+/// and demands a different fp). `reg_mode` enters the fp defensively: the
+/// LOWERING does not depend on it today, but the cached Module's ops do,
+/// and the fp must dominate everything the cached artifact was built from
+/// (the UnitKey carries reg_mode too — belt and braces, declared).
+pub(crate) fn main_chain_fp(reg_mode: bool) -> u64 {
+    static FP: [std::sync::OnceLock<u64>; 2] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    *FP[reg_mode as usize].get_or_init(|| main_chain_fp_from(PRELUDE_SRC, reg_mode))
+}
+
+/// Hash seam shared by production ([`main_chain_fp`], which passes the real
+/// [`PRELUDE_SRC`] binding) and the A-AH22 falsifier test (which passes a
+/// mutated copy and asserts the fp moves). Production code MUST NOT call
+/// this with anything but `PRELUDE_SRC` — the single-binding rule.
+fn main_chain_fp_from(prelude: &[u8], reg_mode: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    prelude.hash(&mut h);
+    // Every hoisted prelude unit lower_prelude_uncached consumes is part of
+    // the virgin chain (A-DS7: compile-relevant inputs ENUMERATED here).
+    PRELUDE_NS_SRC.hash(&mut h);
+    PRELUDE_BC_SRC.hash(&mut h);
+    PRELUDE_GMP_SRC.hash(&mut h);
+    PRELUDE_MYSQLI_SRC.hash(&mut h);
+    PRELUDE_GD_SRC.hash(&mut h);
+    PRELUDE_FILEINFO_SRC.hash(&mut h);
+    reg_mode.hash(&mut h);
+    h.finish()
+}
+
+#[cfg(test)]
+mod main_chain_fp_tests {
+    use super::*;
+
+    /// A-AH22 falsifier (KS-AH-82-2: no falsifier ⇒ lever rejected): a
+    /// mutated prelude through the same seam MUST move the fp; the real
+    /// binding is deterministic; reg_mode is a real input.
+    #[test]
+    fn main_chain_fp_falsifier_mutated_prelude_changes_fp() {
+        let base = main_chain_fp_from(PRELUDE_SRC, false);
+        let mut mutated = PRELUDE_SRC.to_vec();
+        mutated.extend_from_slice(b"\n// A-AH22 falsifier: injected mutation\n");
+        assert_ne!(
+            base,
+            main_chain_fp_from(&mutated, false),
+            "mutated prelude did not move MAIN_CHAIN_FP (A-AH22)"
+        );
+        assert_eq!(base, main_chain_fp_from(PRELUDE_SRC, false), "fp not deterministic");
+        assert_ne!(
+            base,
+            main_chain_fp_from(PRELUDE_SRC, true),
+            "reg_mode does not enter the fp (A-AH22)"
+        );
+        assert_eq!(base, main_chain_fp(false), "production path diverges from the seam");
+    }
+}
+
+/// The prelude's *functions* only (table + name→index), for the seeded
+/// (`include`/`eval`) lowering path — it takes its classes from the seed image,
+/// so cloning the cached prelude classes there would be pure waste.
+fn prelude_functions() -> (Vec<std::rc::Rc<FnDecl>>, HashMap<Vec<u8>, usize>, usize) {
+    PRELUDE_CACHE.with(|c| {
+        let p = c.get_or_init(lower_prelude_uncached);
+        (p.2.clone(), p.3.clone(), p.4)
+    })
+}
+
+fn lower_prelude_uncached() -> LoweredPrelude {
+    let arena = Bump::new();
+    let file = File::ephemeral(Cow::Borrowed(b"prelude".as_slice()), Cow::Borrowed(PRELUDE_SRC));
+    let program = parse_file(&arena, &file);
+    debug_assert!(
+        !program.has_errors(),
+        "exception prelude failed to parse: {:?}",
+        program.errors
+    );
+    let mut low = Lowerer::new(&file, b"prelude");
+    // Hoist classes first (a prelude function may `new` a prelude class), then
+    // the global functions, mirroring the order in `lower`.
+    low.hoist_classes(program.statements.as_slice())
+        .expect("exception prelude must lower");
+    for s in program.statements.as_slice() {
+        if let Statement::Function(func) = s {
+            low.hoist_function(func).expect("prelude function must lower");
+        }
+    }
+    // The namespaced tail (`Pdo\Sqlite`): PHP forbids a `namespace` statement
+    // after global code, so it lives in its own compilation unit, hoisted into
+    // the same tables (for_blocks scopes the namespace for the second file).
+    let file_ns =
+        File::ephemeral(Cow::Borrowed(b"prelude".as_slice()), Cow::Borrowed(PRELUDE_NS_SRC));
+    let program_ns = parse_file(&arena, &file_ns);
+    debug_assert!(
+        !program_ns.has_errors(),
+        "namespaced prelude failed to parse: {:?}",
+        program_ns.errors
+    );
+    low.hoist_classes(program_ns.statements.as_slice())
+        .expect("namespaced prelude must lower");
+    // `BcMath\Number`: another namespaced unit, same treatment.
+    let file_bc =
+        File::ephemeral(Cow::Borrowed(b"prelude".as_slice()), Cow::Borrowed(PRELUDE_BC_SRC));
+    let program_bc = parse_file(&arena, &file_bc);
+    debug_assert!(
+        !program_bc.has_errors(),
+        "bcmath prelude failed to parse: {:?}",
+        program_bc.errors
+    );
+    low.hoist_classes(program_bc.statements.as_slice())
+        .expect("bcmath prelude must lower");
+    // `GMP`: global-namespace unit with a class AND functions — hoist both.
+    let file_gmp =
+        File::ephemeral(Cow::Borrowed(b"prelude".as_slice()), Cow::Borrowed(PRELUDE_GMP_SRC));
+    let program_gmp = parse_file(&arena, &file_gmp);
+    debug_assert!(
+        !program_gmp.has_errors(),
+        "gmp prelude failed to parse: {:?}",
+        program_gmp.errors
+    );
+    low.hoist_classes(program_gmp.statements.as_slice())
+        .expect("gmp prelude classes must lower");
+    for s in program_gmp.statements.as_slice() {
+        if let Statement::Function(func) = s {
+            low.hoist_function(func).expect("gmp prelude function must lower");
+        }
+    }
+    // `mysqli`: global-namespace unit with classes AND functions — hoist both.
+    let file_mysqli =
+        File::ephemeral(Cow::Borrowed(b"prelude".as_slice()), Cow::Borrowed(PRELUDE_MYSQLI_SRC));
+    let program_mysqli = parse_file(&arena, &file_mysqli);
+    debug_assert!(
+        !program_mysqli.has_errors(),
+        "mysqli prelude failed to parse: {:?}",
+        program_mysqli.errors
+    );
+    low.hoist_classes(program_mysqli.statements.as_slice())
+        .expect("mysqli prelude classes must lower");
+    for s in program_mysqli.statements.as_slice() {
+        if let Statement::Function(func) = s {
+            low.hoist_function(func).expect("mysqli prelude function must lower");
+        }
+    }
+    // ext/gd: global-namespace unit with the GdImage class AND functions.
+    let file_gd =
+        File::ephemeral(Cow::Borrowed(b"prelude".as_slice()), Cow::Borrowed(PRELUDE_GD_SRC));
+    let program_gd = parse_file(&arena, &file_gd);
+    debug_assert!(
+        !program_gd.has_errors(),
+        "gd prelude failed to parse: {:?}",
+        program_gd.errors
+    );
+    low.hoist_classes(program_gd.statements.as_slice())
+        .expect("gd prelude classes must lower");
+    for s in program_gd.statements.as_slice() {
+        if let Statement::Function(func) = s {
+            low.hoist_function(func).expect("gd prelude function must lower");
+        }
+    }
+    // ext/fileinfo: global-namespace unit with the finfo class AND functions.
+    let file_fi =
+        File::ephemeral(Cow::Borrowed(b"prelude".as_slice()), Cow::Borrowed(PRELUDE_FILEINFO_SRC));
+    let program_fi = parse_file(&arena, &file_fi);
+    debug_assert!(
+        !program_fi.has_errors(),
+        "fileinfo prelude failed to parse: {:?}",
+        program_fi.errors
+    );
+    low.hoist_classes(program_fi.statements.as_slice())
+        .expect("fileinfo prelude classes must lower");
+    for s in program_fi.statements.as_slice() {
+        if let Statement::Function(func) = s {
+            low.hoist_function(func).expect("fileinfo prelude function must lower");
+        }
+    }
+    // S-93.0 B1/B3 (contatore del canale, predizione-misurata WP-48): con
+    // PHPR_PRELUDE_STATS=1 stampa il consumo dell'arena del preludio.
+    // allocated_bytes INCLUDE le copie morte dei buffer che raddoppiano
+    // dentro i chunk (è il touched fisico, non il live): è il numeratore
+    // della leva per-file-arena (i sei chunk huge di
+    // wp92-harness/huge-worker.out sono i raddoppi di QUESTA arena,
+    // liberati al ritorno di questa funzione — trace S-93.0). Una lettura
+    // env per init per-thread, zero costo a regime.
+    if std::env::var_os("PHPR_PRELUDE_STATS").is_some_and(|v| v == "1") {
+        eprintln!(
+            "prelude-arena allocated_bytes={} chunk_capacity={}",
+            arena.allocated_bytes(),
+            arena.chunk_capacity()
+        );
+    }
+    (low.classes, low.class_index, low.functions, low.fn_index, low.static_count)
+}
+
+/// A name→slot scope: the script globals, or one function's locals. Holds the
+/// slot *names* (positional, reproduced into `Program`/`FnDecl.slots`) and the
+/// reverse index for stable resolution.
+#[derive(Default, Clone)]
+struct Scope {
+    slots: Vec<Box<[u8]>>,
+    index: HashMap<Vec<u8>, Slot>,
+}
+
+impl Scope {
+    /// Resolve `$name` (without the leading `$`) to a stable slot in this scope,
+    /// allocating one on first sight.
+    fn slot_for(&mut self, name: &[u8]) -> Slot {
+        if let Some(&s) = self.index.get(name) {
+            return s;
+        }
+        let s = self.slots.len() as Slot;
+        self.slots.push(name.into());
+        self.index.insert(name.to_vec(), s);
+        s
+    }
+
+    /// Resolve `$name` only if it already has a slot (no allocation). Used by
+    /// arrow-function capture analysis to decide whether a free variable refers
+    /// to an enclosing-scope variable (step 18, D-18.4).
+    fn get(&self, name: &[u8]) -> Option<Slot> {
+        self.index.get(name).copied()
+    }
+}
+
+/// The three products of lowering a closure body: parameters, lexical captures,
+/// and the lowered statement list (step 18).
+type LoweredClosure = (Vec<Param>, Vec<Capture>, Vec<Stmt>);
+
+struct Lowerer<'f> {
+    file: &'f File,
+    /// `/** ... */` docblock trivia spans of the unit, `(start, end)` byte
+    /// offsets in lexical order — the parser drops comments from the AST, so
+    /// [`Self::doc_for`] re-attaches them to declarations Zend-style.
+    docs: Vec<(u32, u32)>,
+    /// The global scope (always present) and the active function-local overlay
+    /// (`Some` while a function body is lowered). `slot_for` resolves against the
+    /// active scope; the globals stay reachable so a global slot can be
+    /// pre-registered from inside a function (D-12.1).
+    globals: Scope,
+    locals: Option<Scope>,
+    /// True when the previous statement was a `?>` closing tag, so the next
+    /// inline-HTML chunk must drop one leading newline (Zend lexer rule:
+    /// `?>` consumes a single trailing `\n` / `\r\n`).
+    after_closing_tag: bool,
+    /// Hoisted top-level user functions and a name→index map (ASCII-lowercased,
+    /// since PHP function names are case-insensitive).
+    functions: Vec<std::rc::Rc<FnDecl>>,
+    fn_index: HashMap<Vec<u8>, usize>,
+    /// Indices into `functions` that are *conditional* declarations (registered at
+    /// run time by `DeclareFn`, not resolvable by name eagerly).
+    conditional_fns: HashSet<usize>,
+    /// Traits declared inside a branch, registered at run time (DeclareTrait).
+    conditional_traits: Vec<(Vec<u8>, LoweredTrait)>,
+    /// Indices into `classes` that are *conditional* declarations (registered at
+    /// run time by `DeclareClass`, not resolvable by name eagerly).
+    conditional_classes: HashSet<usize>,
+    /// Start offsets of the class-like statements the hoist RESERVED (WP-69
+    /// S-69.1 family): a statement re-declaring an in-use name is not hoisted
+    /// — it stays a runtime (re)declaration whose `DeclareClass` raises
+    /// Zend's redeclaration fatal when reached — and the main pass no-ops
+    /// only the hoisted statement itself, identified by span, never by name.
+    /// H-70.5 (WP-70, proof note): offsets are relative to ONE source — a
+    /// `Lowerer` is constructed per `lower_source_impl` call and never reused
+    /// across sources (eval/deferred snippets each get a fresh one), so
+    /// same-offset spans from different sources cannot collide here.
+    hoisted_class_spans: HashSet<u32>,
+    /// Anonymous/arrow function bodies, in one flat table (step 18, D-18.2). An
+    /// [`ExprKind::Closure`] indexes into this by position.
+    closures: Vec<FnDecl>,
+    /// The program file name, used to synthesize the `{closure:file:line}` name
+    /// PHP gives anonymous functions (step 18).
+    prog_name: Box<[u8]>,
+    /// True while lowering the body of a `function &f()`: a `return <lvalue>`
+    /// then lowers to [`StmtKind::ReturnRef`] (step 13, D-13.3).
+    fn_by_ref: bool,
+    /// Set when a `yield` / `yield from` is lowered in the *current* function
+    /// body, marking it a generator (step 39, [`FnDecl::is_generator`]). Saved
+    /// and restored around each function/closure body so a `yield` in a nested
+    /// closure does not leak to the enclosing function (the boundary PHP uses to
+    /// decide what a generator is).
+    fn_saw_yield: bool,
+    /// Running count of `static` declarations seen; each gets a unique id into
+    /// the evaluator's persistent static store (step 15, D-15.3).
+    static_count: usize,
+    /// Set by `declare(strict_types=1)` — copied into `Program.strict` (step 16).
+    strict: bool,
+    /// Hoisted user classes and a name→index map (ASCII-lowercased; PHP class
+    /// names are case-insensitive), step 19.
+    classes: Vec<std::rc::Rc<ClassDecl>>,
+    class_index: HashMap<Vec<u8>, usize>,
+    /// How many leading `classes` entries came from the cross-unit seed image
+    /// (0 for a standalone/main lowering). A statement-level class whose name
+    /// maps into the seed prefix is a RE-declaration from a re-included file
+    /// — it must lower fresh, not be suppressed (bug63741).
+    seed_class_len: usize,
+    /// WP-70 S-70.2: lowercase names of seed classes that are CONDITIONAL in
+    /// their source unit; an eager supertype bind against one flags
+    /// [`Program::used_conditional_seed`] (see [`Lowerer::note_seed_super`]).
+    seed_conditional: std::collections::HashSet<Vec<u8>>,
+    /// Set by [`Lowerer::note_seed_super`]; `Cell` because interface
+    /// resolution runs under `&self`.
+    used_conditional_seed: std::cell::Cell<bool>,
+    /// Lowered traits, keyed by ASCII-lowercased name (step 21). Held only in the
+    /// Lowerer — traits are not types and never enter `Program.classes`. Each
+    /// entry is fully resolved (nested `use` already flattened), so a consuming
+    /// class copies the members verbatim into its own [`ClassDecl`] (D-21.1/2/8).
+    traits: HashMap<Vec<u8>, LoweredTrait>,
+    /// Lexical scope for the magic constants `__CLASS__` / `__FUNCTION__` /
+    /// `__METHOD__` / `__TRAIT__` (step 49). PHP resolves these at compile time
+    /// from the *defining* scope, so we substitute them to string literals while
+    /// lowering. Each is `Some` only while the corresponding body is lowered and
+    /// is saved/restored around nested bodies, exactly like `fn_by_ref`.
+    cur_class: Option<Box<[u8]>>,
+    cur_function: Option<Box<[u8]>>,
+    cur_trait: Option<Box<[u8]>>,
+    /// The namespace currently being lowered, e.g. `b"Foo\\Bar"` (empty = global),
+    /// step 50. Names are resolved against this at compile time: PHP namespaces are
+    /// a pure compile-time name-resolution feature, so once every declaration and
+    /// reference speaks fully-qualified names the existing by-name lookups in
+    /// `compile.rs` / `vm` keep working unchanged. Saved/restored around each
+    /// `namespace` block (PHP forbids nested namespaces, so one level deep).
+    cur_namespace: Vec<u8>,
+    /// Active `use` imports for the current namespace block, keyed by ASCII-lowercased
+    /// alias → fully-qualified target (no leading `\`). PHP keeps three independent
+    /// import tables (class/namespace, function, const); all three reset per block.
+    use_classes: HashMap<Vec<u8>, Vec<u8>>,
+    use_functions: HashMap<Vec<u8>, Vec<u8>>,
+    use_consts: HashMap<Vec<u8>, Vec<u8>>,
+    /// Constructor-promoted parameters collected by the most recent `lower_params`
+    /// call (PHP 8 property promotion). The owning method (`__construct`) drains
+    /// this immediately after the param list is lowered — before the body, which
+    /// may itself contain nested param lists that overwrite it — to both declare
+    /// the instance properties and prepend `$this->p = $p` assignments.
+    promoted: Vec<PromotedParam>,
+    /// While lowering a property hook body (step 50): the hooked property's name.
+    /// A `$this-><name>` access inside the body marks the property *backed* (it
+    /// needs real storage and appears in `var_dump`); see `hook_backed`.
+    hook_prop: Option<Box<[u8]>>,
+    /// Set when the hook body currently being lowered accesses its own backing
+    /// (`$this-><hook_prop>`), making the property backed rather than virtual.
+    hook_backed: bool,
+    /// Monotonic counter for the synthetic temp slots that array destructuring
+    /// (`[$a,$b] = …`) stashes its right-hand side into (step 51). Names use a `@`
+    /// prefix, which no PHP variable can have, so they never collide with locals.
+    list_temp: u32,
+    /// Anonymous classes (`new class {…}`, step 51) discovered while lowering
+    /// expressions, with their synthetic `class@anonymous…` names. Appended to
+    /// `classes` (and registered in `class_index`) after the main pass, so they get
+    /// final ids past every named class; `new` resolves them by name at compile.
+    anon_classes: Vec<ClassDecl>,
+    /// Monotonic counter making each anonymous class's synthetic name unique.
+    anon_count: u32,
+    /// `#[Attr]` attributes on top-level `const` declarations (FQN → attrs),
+    /// accumulated while lowering and surfaced in [`Program::const_attributes`].
+    const_attributes: Vec<(Box<[u8]>, Vec<crate::hir::HirAttribute>)>,
+    /// When may a class-like whose supertype is unresolvable be *deferred* to
+    /// its execution point (Zend late binding) instead of failing the unit?
+    /// See [`DeferPolicy`].
+    defer: DeferConf,
+    /// Late-bound declarations collected while lowering ([`Program::deferred`]).
+    deferred: Vec<crate::hir::DeferredDecl>,
+    /// Byte spans of the current namespace block's `use` statements, captured by
+    /// `collect_uses` so a deferred-declaration snippet can reproduce its import
+    /// context verbatim from the original source.
+    use_spans: Vec<(u32, u32)>,
+}
+
+/// Owned form of [`DeferPolicy`] held by the [`Lowerer`].
+enum DeferConf {
+    All,
+    No,
+}
+
+/// Saved lexical-body lowering context (see [`Lowerer::save_body_ctx`]).
+struct BodyCtx {
+    cur_class: Option<Box<[u8]>>,
+    cur_function: Option<Box<[u8]>>,
+    cur_trait: Option<Box<[u8]>>,
+    locals: Option<Scope>,
+    fn_by_ref: bool,
+    fn_saw_yield: bool,
+    hook_prop: Option<Box<[u8]>>,
+    hook_backed: bool,
+}
+
+/// When lowering hits a class-like declaration whose `extends`/`implements`/
+/// trait-`use` target is not in the class image, should the declaration be
+/// *deferred* to its execution point (as Zend does — it simply skips early
+/// binding then), or surface as [`LowerError::UndefinedClass`]?
+pub enum DeferPolicy {
+    /// Defer every unresolved supertype — the main script AND every
+    /// `include`/`eval` unit (WP-68 defer-always): the autoload belongs at
+    /// the DECLARE's execution point, never inside the lowering, so the
+    /// lowering stays side-effect-free and Zend's late-binding order holds.
+    All,
+    /// Never defer — re-lowering a deferred snippet at its execution point: an
+    /// unresolved supertype there IS the faithful `… "X" not found` error.
+    No,
+}
+
+/// One constructor-promoted parameter: its property name, declared visibility, the
+/// parameter slot the prologue assignment reads from, and any property hooks (a
+/// promoted property may itself be hooked, PHP 8.4).
+struct PromotedParam {
+    name: Box<[u8]>,
+    visibility: Visibility,
+    /// `public private(set) string $x` in a constructor: the promoted
+    /// property carries the asymmetric write visibility (PHP 8.4).
+    set_visibility: Option<Visibility>,
+    slot: Slot,
+    get_hook: Option<FnDecl>,
+    set_hook: Option<FnDecl>,
+    backed: bool,
+    readonly: bool,
+    attributes: Vec<crate::hir::HirAttribute>,
+    doc: Option<Box<[u8]>>,
+}
+
+/// A trait whose members have been lowered and whose own `use` clauses have been
+/// flattened in (step 21). Copied member-by-member into each consuming class so
+/// the step-19 runtime machinery is reused with no evaluator changes.
+impl<'f> Lowerer<'f> {
+    fn new(file: &'f File, prog_name: &[u8]) -> Self {
+        Lowerer {
+            file,
+            docs: Vec::new(),
+            globals: Scope::default(),
+            locals: None,
+            after_closing_tag: false,
+            functions: Vec::new(),
+            fn_index: HashMap::new(),
+            conditional_fns: HashSet::new(),
+            conditional_classes: HashSet::new(),
+            hoisted_class_spans: HashSet::new(),
+            conditional_traits: Vec::new(),
+            closures: Vec::new(),
+            prog_name: prog_name.into(),
+            fn_by_ref: false,
+            fn_saw_yield: false,
+            static_count: 0,
+            strict: false,
+            classes: Vec::new(),
+            class_index: HashMap::new(),
+            seed_class_len: 0,
+            seed_conditional: std::collections::HashSet::new(),
+            used_conditional_seed: std::cell::Cell::new(false),
+            traits: HashMap::new(),
+            cur_class: None,
+            cur_function: None,
+            cur_trait: None,
+            cur_namespace: Vec::new(),
+            use_classes: HashMap::new(),
+            use_functions: HashMap::new(),
+            use_consts: HashMap::new(),
+            promoted: Vec::new(),
+            hook_prop: None,
+            hook_backed: false,
+            list_temp: 0,
+            anon_classes: Vec::new(),
+            anon_count: 0,
+            const_attributes: Vec::new(),
+            defer: DeferConf::No,
+            deferred: Vec::new(),
+            use_spans: Vec::new(),
+        }
+    }
+
+    /// Allocate a fresh synthetic local slot for a destructuring temp (step 51).
+    /// The `@`-prefixed name is unique and unreachable from PHP source.
+    fn fresh_list_temp(&mut self) -> Slot {
+        let n = self.list_temp;
+        self.list_temp += 1;
+        let name = format!("@list{n}");
+        self.slot_for(name.as_bytes())
+    }
+
+    /// Note a `$this-><name>` access seen while lowering a property-hook body: if
+    /// it targets the hooked property itself, the property is backed (step 50).
+    fn note_this_prop(&mut self, name: &[u8]) {
+        if self.hook_prop.as_deref() == Some(name) {
+            self.hook_backed = true;
+        }
+    }
+
+    // --- namespace name resolution (step 50) ---
+
+    /// Resolve a qualified name (`A\B\c`) by substituting an imported first
+    /// segment if `A` was `use`d as a namespace/class alias, else prefixing the
+    /// current namespace. Shared by class, function and const qualified forms.
+    fn resolve_qualified(&self, raw: &[u8]) -> Box<[u8]> {
+        let first = first_segment(raw);
+        let rest = &raw[first.len()..]; // includes the leading `\` of the remainder
+        // PHP's namespace operator: `namespace\foo` names `CURNS\foo` (never
+        // an import) — wp-cli's `namespace\strip_tags($message)`.
+        if first.eq_ignore_ascii_case(b"namespace") {
+            return join_ns(&self.cur_namespace, &rest[1..]);
+        }
+        match self.use_classes.get(&first.to_ascii_lowercase()) {
+            Some(fqn) => {
+                let mut v = fqn.clone();
+                v.extend_from_slice(rest);
+                v.into()
+            }
+            None => join_ns(&self.cur_namespace, raw),
+        }
+    }
+
+    /// Resolve a class/interface/trait/enum name reference to its fully-qualified
+    /// form. Unqualified names resolve against the class import table then the
+    /// current namespace (PHP gives class names **no** global fallback).
+    fn resolve_class(&self, id: &Identifier) -> Box<[u8]> {
+        match id {
+            Identifier::FullyQualified(f) => strip_leading_backslash(f.value).into(),
+            Identifier::Qualified(q) => self.resolve_qualified(q.value),
+            Identifier::Local(l) => match self.use_classes.get(&l.value.to_ascii_lowercase()) {
+                Some(fqn) => fqn.clone().into(),
+                None => join_ns(&self.cur_namespace, l.value),
+            },
+        }
+    }
+
+    /// Resolve a called function's name. Unlike classes, an **unqualified** name
+    /// falls back to the global function: `foo()` in namespace `N` calls `N\foo`
+    /// if such a user function was hoisted, otherwise global `foo` (a builtin or a
+    /// runtime-resolved name). Qualified/fully-qualified forms never fall back.
+    fn resolve_fn_name(&self, id: &Identifier) -> Box<[u8]> {
+        match id {
+            Identifier::FullyQualified(f) => strip_leading_backslash(f.value).into(),
+            Identifier::Qualified(q) => self.resolve_qualified(q.value),
+            Identifier::Local(l) => {
+                if let Some(fqn) = self.use_functions.get(&l.value.to_ascii_lowercase()) {
+                    return fqn.clone().into();
+                }
+                if self.cur_namespace.is_empty() {
+                    return l.value.into();
+                }
+                let cand = join_ns(&self.cur_namespace, l.value);
+                if self.fn_index.contains_key(&cand.to_ascii_lowercase()) {
+                    cand
+                } else {
+                    l.value.into() // fall back to the global function
+                }
+            }
+        }
+    }
+
+    /// Resolve a *called* function's name to its primary name plus an optional
+    /// global fallback, mirroring [`Self::resolve_const_fetch`]. An **unqualified**
+    /// call inside a namespace primarily names `CURNS\foo` and falls back to the
+    /// global `foo` — PHP tries the namespaced function first at run time, then the
+    /// global one, so a namespaced function defined in *another* compilation unit
+    /// (autoloaded / included) still binds. Unlike [`Self::resolve_fn_name`] this
+    /// does *not* consult `fn_index`: whether `CURNS\foo` is a hoisted user
+    /// function, a builtin, or defined elsewhere is decided by the call lowering.
+    /// Qualified / fully-qualified / imported and global-scope names have no
+    /// fallback.
+    fn resolve_fn_call(&self, id: &Identifier) -> (Box<[u8]>, Option<Box<[u8]>>) {
+        match id {
+            Identifier::FullyQualified(f) => (strip_leading_backslash(f.value).into(), None),
+            Identifier::Qualified(q) => (self.resolve_qualified(q.value), None),
+            Identifier::Local(l) => {
+                if let Some(fqn) = self.use_functions.get(&l.value.to_ascii_lowercase()) {
+                    (fqn.clone().into(), None)
+                } else if self.cur_namespace.is_empty() {
+                    (l.value.into(), None)
+                } else {
+                    (join_ns(&self.cur_namespace, l.value), Some(l.value.into()))
+                }
+            }
+        }
+    }
+
+    /// Resolve a constant fetch to its primary name plus an optional global
+    /// fallback. An *unqualified* constant inside a namespace primarily names
+    /// `CURNS\NAME` and falls back to the global `NAME` (PHP tries the namespaced
+    /// constant first, then global). Qualified / fully-qualified / imported and
+    /// global-scope names resolve to a single name with no fallback.
+    fn resolve_const_fetch(&self, id: &Identifier) -> (Box<[u8]>, Option<Box<[u8]>>) {
+        match id {
+            Identifier::FullyQualified(f) => (strip_leading_backslash(f.value).into(), None),
+            Identifier::Qualified(q) => (self.resolve_qualified(q.value), None),
+            Identifier::Local(l) => {
+                if let Some(fqn) = self.use_consts.get(&l.value.to_ascii_lowercase()) {
+                    (fqn.clone().into(), None)
+                } else if self.cur_namespace.is_empty() {
+                    (l.value.into(), None)
+                } else {
+                    (join_ns(&self.cur_namespace, l.value), Some(l.value.into()))
+                }
+            }
+        }
+    }
+
+    /// Run `f` once per namespace scope in `stmts`, with `cur_namespace` and the
+    /// three `use` tables set for that scope. PHP forbids nested namespaces, so
+    /// each `namespace` block is one level deep; a file with no `namespace` at all
+    /// runs `f` once over the whole list in the global namespace. Context is saved
+    /// and restored around each block. Used by the hoisting passes (step 50).
+    fn for_blocks<F>(&mut self, stmts: &[Statement], mut f: F) -> Result<(), LowerError>
+    where
+        F: FnMut(&mut Self, &[Statement]) -> Result<(), LowerError>,
+    {
+        let mut had_block = false;
+        for s in stmts {
+            if let Statement::Namespace(ns) = s {
+                had_block = true;
+                let body = ns.statements().as_slice();
+                let saved_ns =
+                    std::mem::replace(&mut self.cur_namespace, ns_name_of(ns.name.as_ref()));
+                let saved_c = std::mem::take(&mut self.use_classes);
+                let saved_f = std::mem::take(&mut self.use_functions);
+                let saved_k = std::mem::take(&mut self.use_consts);
+                self.collect_uses(body);
+                let r = f(self, body);
+                self.cur_namespace = saved_ns;
+                self.use_classes = saved_c;
+                self.use_functions = saved_f;
+                self.use_consts = saved_k;
+                r?;
+            }
+        }
+        if !had_block {
+            // No `namespace` blocks: the whole file is the global namespace.
+            self.cur_namespace.clear();
+            self.collect_uses(stmts);
+            f(self, stmts)?;
+        }
+        Ok(())
+    }
+
+    /// Reset and repopulate the three `use` import tables from a namespace block's
+    /// statements (PHP scopes imports to their namespace block). Called when a
+    /// block is entered in every pass that resolves names inside it.
+    fn collect_uses(&mut self, stmts: &[Statement]) {
+        self.use_classes.clear();
+        self.use_functions.clear();
+        self.use_consts.clear();
+        self.use_spans.clear();
+        for s in stmts {
+            if let Statement::Use(u) = s {
+                self.add_use(u);
+                self.use_spans.push((u.span().start.offset, u.span().end.offset));
+            }
+        }
+    }
+
+    /// Snapshot the lexical-body lowering context. A class-like lowering that
+    /// fails mid-member normally aborts the whole unit (so its half-updated
+    /// context is moot), but a *deferrable* failure resumes lowering — restore
+    /// from this first ([`Self::restore_body_ctx`]).
+    fn save_body_ctx(&self) -> BodyCtx {
+        BodyCtx {
+            cur_class: self.cur_class.clone(),
+            cur_function: self.cur_function.clone(),
+            cur_trait: self.cur_trait.clone(),
+            locals: self.locals.clone(),
+            fn_by_ref: self.fn_by_ref,
+            fn_saw_yield: self.fn_saw_yield,
+            hook_prop: self.hook_prop.clone(),
+            hook_backed: self.hook_backed,
+        }
+    }
+
+    /// Restore a [`Self::save_body_ctx`] snapshot after a deferrable failure.
+    fn restore_body_ctx(&mut self, ctx: BodyCtx) {
+        self.cur_class = ctx.cur_class;
+        self.cur_function = ctx.cur_function;
+        self.cur_trait = ctx.cur_trait;
+        self.locals = ctx.locals;
+        self.fn_by_ref = ctx.fn_by_ref;
+        self.fn_saw_yield = ctx.fn_saw_yield;
+        self.hook_prop = ctx.hook_prop;
+        self.hook_backed = ctx.hook_backed;
+        self.promoted.clear();
+    }
+
+    /// May a class-like whose supertype resolved to the unknown `name` be
+    /// deferred to its execution point? (See [`DeferPolicy`].)
+    fn deferrable(&self, _name: &[u8]) -> bool {
+        match &self.defer {
+            DeferConf::All => true,
+            DeferConf::No => false,
+        }
+    }
+
+    /// Byte offset where the docblock lexically attached to the declaration
+    /// starting at `decl_start` begins — the same walk as [`Self::doc_for`]
+    /// (whitespace, `#[...]` attribute lists and modifier keywords may sit
+    /// between), returning the doc's *start* so a deferred snippet can carry it.
+    fn attached_doc_start(&self, decl_start: u32) -> Option<u32> {
+        let idx = self.docs.partition_point(|&(_, end)| end <= decl_start);
+        let &(ds, de) = self.docs.get(idx.checked_sub(1)?)?;
+        let src = self.file.contents.as_ref();
+        let target = decl_start as usize;
+        let mut i = de as usize;
+        while i < target {
+            let b = src[i];
+            if b.is_ascii_whitespace() {
+                i += 1;
+            } else if b == b'#' && src.get(i + 1) == Some(&b'[') {
+                // Skip a balanced `#[...]` attribute list.
+                let mut depth = 0usize;
+                while i < target {
+                    match src[i] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            } else if b.is_ascii_alphabetic() {
+                // A modifier keyword (`final`, `abstract`, `readonly`, …).
+                while i < target && (src[i].is_ascii_alphanumeric() || src[i] == b'_') {
+                    i += 1;
+                }
+            } else {
+                return None;
+            }
+        }
+        Some(ds)
+    }
+
+    /// Build the self-contained snippet for a deferred declaration and record it,
+    /// returning its index for the emitted op. The snippet reproduces the
+    /// declaration's lexical context — `declare(strict_types)`, `namespace`, the
+    /// block's `use` imports (all folded onto line 1) — then pads with blank
+    /// lines so the declaration text keeps its original line numbers, so every
+    /// diagnostic raised when the VM re-lowers it points at the real file:line.
+    /// `wrap_return` wraps the slice in `return …;` (an anonymous-class
+    /// *expression* — the unit's return value is the instance).
+    fn push_deferred(
+        &mut self,
+        span: Span,
+        name: Box<[u8]>,
+        kind_word: &'static str,
+        wrap_return: bool,
+    ) -> usize {
+        let src = self.file.contents.as_ref();
+        let start = if wrap_return {
+            span.start.offset
+        } else {
+            // A named declaration carries its attached docblock along (its
+            // Reflection surface must survive the re-lowering).
+            self.attached_doc_start(span.start.offset).unwrap_or(span.start.offset)
+        };
+        // A docblock attached across intervening statements (Zend consume
+        // semantics, see `doc_span_for`) is outside the contiguous slice; the
+        // snippet re-emits it separately just before the declaration.
+        let detached_doc = if wrap_return || start != span.start.offset {
+            None
+        } else {
+            self.doc_span_for(span.start.offset)
+        };
+        let line = self.file.line_number(start) + 1; // 1-based
+        let mut snippet = b"<?php ".to_vec();
+        if self.strict {
+            snippet.extend_from_slice(b"declare(strict_types=1); ");
+        }
+        if !self.cur_namespace.is_empty() {
+            snippet.extend_from_slice(b"namespace ");
+            snippet.extend_from_slice(&self.cur_namespace);
+            snippet.extend_from_slice(b"; ");
+        }
+        for &(us, ue) in &self.use_spans {
+            // `use` statements cannot contain string literals, so folding their
+            // newlines to spaces keeps them valid on one line.
+            for &b in &src[us as usize..ue as usize] {
+                snippet.push(if b == b'\n' || b == b'\r' { b' ' } else { b });
+            }
+            snippet.push(b' ');
+        }
+        // Everything so far sits on line 1; pad so the declaration text starts
+        // on its original line. A detached docblock goes in first, at its own
+        // original line, the remaining padding after it — so both it and the
+        // declaration keep their file positions and the re-lowering re-attaches
+        // it by simple adjacency.
+        if let Some((ds, de)) = detached_doc {
+            let doc = &src[ds as usize..de as usize];
+            let doc_line = self.file.line_number(ds) + 1;
+            for _ in 1..doc_line {
+                snippet.push(b'\n');
+            }
+            snippet.extend_from_slice(doc);
+            let doc_end_line = doc_line + doc.iter().filter(|&&b| b == b'\n').count() as u32;
+            if line > doc_end_line {
+                for _ in doc_end_line..line {
+                    snippet.push(b'\n');
+                }
+            } else {
+                snippet.push(b' ');
+            }
+        } else {
+            for _ in 1..line {
+                snippet.push(b'\n');
+            }
+        }
+        if wrap_return {
+            snippet.extend_from_slice(b"return ");
+        }
+        snippet.extend_from_slice(&src[start as usize..span.end.offset as usize]);
+        if wrap_return {
+            snippet.push(b';');
+        }
+        let line_out = self.line_of(span);
+        self.deferred.push(crate::hir::DeferredDecl {
+            snippet: snippet.into(),
+            name,
+            kind_word,
+            line: line_out,
+        });
+        self.deferred.len() - 1
+    }
+
+    /// Insert one import: `kind` is `None` for a class/namespace import, or the
+    /// `function`/`const` discriminator. `fqn` is the absolute target (no leading
+    /// `\`), `alias` the bare local name it is reached by.
+    fn insert_use(&mut self, kind: Option<&UseType>, fqn: Vec<u8>, alias: &[u8]) {
+        let key = alias.to_ascii_lowercase();
+        match kind {
+            Some(UseType::Function(_)) => self.use_functions.insert(key, fqn),
+            Some(UseType::Const(_)) => self.use_consts.insert(key, fqn),
+            None => self.use_classes.insert(key, fqn),
+        };
+    }
+
+    /// Record one `use` statement's imports into the appropriate table. Handles
+    /// plain, typed (`use function`/`use const`), and grouped (`use Foo\{A, B}`)
+    /// forms, including the mixed-type group `use Foo\{function f, const C}`.
+    fn add_use(&mut self, u: &Use) {
+        match &u.items {
+            UseItems::Sequence(seq) => {
+                for it in seq.items.iter() {
+                    let fqn = strip_leading_backslash(it.name.value()).to_vec();
+                    let alias = it.alias.as_ref().map_or_else(|| it.name.last_segment(), |a| a.identifier.value);
+                    self.insert_use(None, fqn, alias);
+                }
+            }
+            UseItems::TypedSequence(seq) => {
+                for it in seq.items.iter() {
+                    let fqn = strip_leading_backslash(it.name.value()).to_vec();
+                    let alias = it.alias.as_ref().map_or_else(|| it.name.last_segment(), |a| a.identifier.value);
+                    self.insert_use(Some(&seq.r#type), fqn, alias);
+                }
+            }
+            UseItems::TypedList(list) => {
+                let prefix = strip_leading_backslash(list.namespace.value()).to_vec();
+                for it in list.items.iter() {
+                    let fqn = join_ns(&prefix, it.name.value()).into_vec();
+                    let alias = it.alias.as_ref().map_or_else(|| it.name.last_segment(), |a| a.identifier.value);
+                    self.insert_use(Some(&list.r#type), fqn, alias);
+                }
+            }
+            UseItems::MixedList(list) => {
+                let prefix = strip_leading_backslash(list.namespace.value()).to_vec();
+                for mit in list.items.iter() {
+                    let it = &mit.item;
+                    let fqn = join_ns(&prefix, it.name.value()).into_vec();
+                    let alias = it.alias.as_ref().map_or_else(|| it.name.last_segment(), |a| a.identifier.value);
+                    self.insert_use(mit.r#type.as_ref(), fqn, alias);
+                }
+            }
+        }
+    }
+
+    /// 1-based source line for a span's start offset (`File::line_number` is 0-based).
+    fn line_of(&self, span: Span) -> Line {
+        self.file.line_number(span.start.offset) + 1
+    }
+
+    /// 1-based source line of a span's LAST byte (its closing token, e.g. a class
+    /// body's `}`) — `ReflectionClass::getEndLine`. `span.end.offset` sits just past
+    /// the token, so step back one byte to land on the closing line itself.
+    fn line_of_end(&self, span: Span) -> Line {
+        self.file.line_number(span.end.offset.saturating_sub(1)) + 1
+    }
+
+    /// The `/** ... */` doc comment lexically attached to a declaration starting
+    /// at byte `decl_start` (Zend semantics): the closest preceding docblock
+    /// separated from the declaration only by whitespace, attribute lists
+    /// (`#[...]`) and member-modifier keywords — or, failing that, by statements
+    /// that provably contain no construct Zend's `backup_doc_comment` would have
+    /// consumed it with (see `doc_survives_across`). Zend keeps the last scanned
+    /// docblock in `CG(doc_comment)` until a declaration consumes it, so
+    /// `/** @group x */ require_once ...; class C {}` attaches to `C` (WP's test
+    /// files rely on this). When the intervening code can't be cleared safely the
+    /// answer stays `None` — "none", never a wrong one.
+    fn doc_for(&self, decl_start: u32) -> Option<Box<[u8]>> {
+        let (ds, de) = self.doc_span_for(decl_start)?;
+        let src = self.file.contents.as_ref();
+        Some(src.get(ds as usize..de as usize)?.to_vec().into())
+    }
+
+    /// The `(start, end)` byte span of the docblock `doc_for` attaches to the
+    /// declaration at `decl_start`, without slicing it (the deferred-snippet
+    /// builder needs the offsets).
+    fn doc_span_for(&self, decl_start: u32) -> Option<(u32, u32)> {
+        let idx = self.docs.partition_point(|&(_, end)| end <= decl_start);
+        let &(ds, de) = self.docs.get(idx.checked_sub(1)?)?;
+        let src = self.file.contents.as_ref();
+        let target = decl_start as usize;
+        let mut i = de as usize;
+        while i < target {
+            let b = src[i];
+            if b.is_ascii_whitespace() {
+                i += 1;
+            } else if b == b'#' && src.get(i + 1) == Some(&b'[') {
+                // Skip an attribute list, tracking bracket depth and quoted
+                // strings (a `']'` inside an argument must not end it).
+                i += 2;
+                let mut depth = 1usize;
+                while i < target && depth > 0 {
+                    match src[i] {
+                        b'[' => depth += 1,
+                        b']' => depth -= 1,
+                        q @ (b'\'' | b'"') => {
+                            i += 1;
+                            while i < target && src[i] != q {
+                                if src[i] == b'\\' {
+                                    i += 1;
+                                }
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            } else if b.is_ascii_alphabetic() {
+                let start = i;
+                while i < target && (src[i].is_ascii_alphanumeric() || src[i] == b'_') {
+                    i += 1;
+                }
+                const MODIFIERS: &[&[u8]] = &[
+                    b"public", b"protected", b"private", b"static", b"final", b"abstract",
+                    b"readonly", b"var",
+                ];
+                if !MODIFIERS.iter().any(|m| src[start..i].eq_ignore_ascii_case(m)) {
+                    return Self::doc_survives_across(src, de as usize, target).then_some((ds, de));
+                }
+            } else {
+                return Self::doc_survives_across(src, de as usize, target).then_some((ds, de));
+            }
+        }
+        Some((ds, de))
+    }
+
+    /// Whether the pending docblock ending at byte `from` survives to the
+    /// declaration at byte `to` under Zend's consume semantics. Statements do
+    /// not reset `CG(doc_comment)`; only another declaration consumes it and a
+    /// `namespace` declaration resets it. The scan clears the gap when it can
+    /// prove no such construct occurs: string/comment/`$identifier` contents are
+    /// skipped, and it bails out (→ `false`, i.e. "absent", the safe direction)
+    /// on any consumer or member-modifier keyword, on braces (a `{...}` body in
+    /// the gap means a declaration or an unanalyzable region), and on heredocs.
+    fn doc_survives_across(src: &[u8], from: usize, to: usize) -> bool {
+        const BAIL_WORDS: &[&[u8]] = &[
+            // Declarations whose grammar rule carries `backup_doc_comment`
+            // (they'd have consumed the pending docblock)...
+            b"function", b"fn", b"class", b"interface", b"trait", b"enum", b"const", b"case",
+            // ...the reset point...
+            b"namespace",
+            // ...and member modifiers: a member declaration in the gap consumes
+            // too, and its leading modifier is the cheapest tell.
+            b"public", b"protected", b"private", b"static", b"final", b"abstract", b"readonly",
+            b"var",
+        ];
+        let mut i = from;
+        while i < to {
+            match src[i] {
+                b'{' | b'}' => return false,
+                b'\'' | b'"' | b'`' => {
+                    let q = src[i];
+                    i += 1;
+                    while i < to && src[i] != q {
+                        if src[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b'<' if src.get(i + 1) == Some(&b'<') && src.get(i + 2) == Some(&b'<') => {
+                    return false; // heredoc/nowdoc: not worth parsing, stay absent
+                }
+                b'/' if src.get(i + 1) == Some(&b'/') => {
+                    while i < to && src[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if src.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < to && !(src[i] == b'*' && src[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                b'#' if src.get(i + 1) != Some(&b'[') => {
+                    while i < to && src[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'$' => {
+                    i += 1;
+                    while i < to && (src[i].is_ascii_alphanumeric() || src[i] == b'_') {
+                        i += 1;
+                    }
+                }
+                c if c.is_ascii_alphabetic() || c == b'_' => {
+                    let start = i;
+                    while i < to && (src[i].is_ascii_alphanumeric() || src[i] == b'_') {
+                        i += 1;
+                    }
+                    if BAIL_WORDS.iter().any(|w| src[start..i].eq_ignore_ascii_case(w)) {
+                        return false;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        true
+    }
+
+    /// PHP requires a `namespace` declaration to be the very first statement in
+    /// the script — only `declare(...)` (and empty `;` statements) may precede it.
+    /// When the *first* namespace is preceded by anything else (output, code,
+    /// inline HTML, `use`, `const`, …) PHP raises a compile-time fatal; emit it
+    /// verbatim rather than silently accepting the misplaced namespace (or
+    /// panicking downstream). Subsequent `namespace` declarations are unrestricted
+    /// (`namespace A; $x=1; namespace B;` is legal), so the scan stops at the first.
+    fn check_namespace_first(&self, stmts: &[Statement]) -> Result<(), LowerError> {
+        let mut seen_other = false;
+        for s in stmts {
+            match s {
+                Statement::Namespace(_) => {
+                    if seen_other {
+                        return Err(LowerError::Fatal {
+                            message: "Namespace declaration statement has to be the \
+                                      very first statement or after any declare call \
+                                      in the script"
+                                .to_string(),
+                            line: self.line_of(s.span()),
+                        });
+                    }
+                    return Ok(());
+                }
+                // The open tag, `declare(...)`, and empty `;` statements may precede
+                // a namespace; anything else makes it no longer the first statement.
+                Statement::OpeningTag(_) | Statement::Declare(_) | Statement::Noop(_) => {}
+                _ => seen_other = true,
+            }
+        }
+        Ok(())
+    }
+
+
+    /// The unit's source path (matches `Program::file`), stamped onto each lowered
+    /// `FnDecl` so traces/`getFile()` report the defining file across includes.
+    fn unit_file(&self) -> Box<[u8]> {
+        self.file.name.as_ref().into()
+    }
+
+    /// The active scope: the function-local overlay while a body is lowered,
+    /// otherwise the script globals (D-12.1).
+    fn scope_mut(&mut self) -> &mut Scope {
+        self.locals.as_mut().unwrap_or(&mut self.globals)
+    }
+
+    /// Resolve `$name` (name given *without* the leading `$`) to a stable slot in
+    /// the active scope.
+    fn slot_for(&mut self, name: &[u8]) -> Slot {
+        self.scope_mut().slot_for(name)
+    }
+
+    /// Resolve `$name` in the active (enclosing) scope *without* allocating a
+    /// slot — `None` if the name is not already bound there (step 18, D-18.4).
+    fn enclosing_slot(&self, name: &[u8]) -> Option<Slot> {
+        self.locals.as_ref().unwrap_or(&self.globals).get(name)
+    }
+
+
+
+}
+
+/// The kind of compound assignment, abstracted over the lvalue encoding.
+enum AssignFlavour {
+    Coalesce,
+    Op(BinOp),
+}
+
+/// Unqualified function name: the segment after the last `\` (so `\strlen` and
+/// `Foo\strlen` both resolve to `strlen`). Tier 1 has no namespaces, so this is
+/// a faithful-enough resolution for global/builtin calls.
+/// Collect the class names of a `catch` type hint (step 20): a single
+/// `Identifier`, or a `A | B` union (recursively). Any other hint shape in catch
+/// position is outside scope.
+/// Process PHP double-quoted escape sequences in the literal segment of an
+/// interpolated string (mago hands these back raw). Mirrors the lexer rules:
+/// `\n \r \t \v \f \e \\ \$ \"`, `\x..` hex (1-2), `\u{..}` codepoint, and
+/// `\0..\777` octal (1-3). An unknown `\X` keeps the backslash and X.
+///
+/// `process_quote` is true for double-quoted strings (`\"` -> `"`) and false in
+/// a heredoc, where double quotes are literal so `\"` stays `\"`.
+fn unescape_double_quoted(raw: &[u8], process_quote: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != b'\\' || i + 1 >= raw.len() {
+            out.push(raw[i]);
+            i += 1;
+            continue;
+        }
+        let c = raw[i + 1];
+        match c {
+            b'n' => { out.push(b'\n'); i += 2; }
+            b'r' => { out.push(b'\r'); i += 2; }
+            b't' => { out.push(b'\t'); i += 2; }
+            b'v' => { out.push(0x0B); i += 2; }
+            b'f' => { out.push(0x0C); i += 2; }
+            b'e' => { out.push(0x1B); i += 2; }
+            b'\\' => { out.push(b'\\'); i += 2; }
+            b'$' => { out.push(b'$'); i += 2; }
+            b'"' if process_quote => { out.push(b'"'); i += 2; }
+            // Zend's scanner accepts BOTH cases of the hex escape ("\X1C" in
+            // WP's kses ctrl-removal provider decodes to 0x1C, oracle-pinned).
+            b'x' | b'X' => {
+                let mut j = i + 2;
+                let mut val = 0u32;
+                let mut n = 0;
+                while n < 2 && j < raw.len() && raw[j].is_ascii_hexdigit() {
+                    val = val * 16 + (raw[j] as char).to_digit(16).unwrap();
+                    j += 1;
+                    n += 1;
+                }
+                if n == 0 {
+                    out.push(b'\\');
+                    out.push(c);
+                    i += 2;
+                } else {
+                    out.push(val as u8);
+                    i = j;
+                }
+            }
+            b'u' if i + 2 < raw.len() && raw[i + 2] == b'{' => {
+                let mut j = i + 3;
+                let mut val = 0u32;
+                let mut n = 0;
+                while j < raw.len() && raw[j].is_ascii_hexdigit() {
+                    val = val * 16 + (raw[j] as char).to_digit(16).unwrap();
+                    j += 1;
+                    n += 1;
+                }
+                if n > 0 && j < raw.len() && raw[j] == b'}' {
+                    if let Some(ch) = char::from_u32(val) {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                    i = j + 1;
+                } else {
+                    out.push(b'\\');
+                    out.push(b'u');
+                    i += 2;
+                }
+            }
+            b'0'..=b'7' => {
+                let mut j = i + 1;
+                let mut val = 0u32;
+                let mut n = 0;
+                while n < 3 && j < raw.len() && (b'0'..=b'7').contains(&raw[j]) {
+                    val = val * 8 + (raw[j] - b'0') as u32;
+                    j += 1;
+                    n += 1;
+                }
+                out.push(val as u8);
+                i = j;
+            }
+            _ => {
+                // Unknown escape: PHP keeps the backslash and the character.
+                out.push(b'\\');
+                out.push(c);
+                i += 2;
+            }
+        }
+    }
+    out
+}
+
+/// Strip up to `indent` leading whitespace (space/tab) characters from each
+/// line of a heredoc/nowdoc literal segment, mirroring PHP 7.3+ flexible
+/// dedent. `at_line_start` says whether the segment begins a fresh line (i.e.
+/// the previous byte emitted was a newline or it is the very first segment);
+/// the returned flag carries that state to the next segment.
+fn dedent_literal(lit: &[u8], indent: usize, mut at_line_start: bool) -> (Vec<u8>, bool) {
+    if indent == 0 {
+        return (lit.to_vec(), lit.last() == Some(&b'\n'));
+    }
+    let mut out = Vec::with_capacity(lit.len());
+    let mut i = 0;
+    while i < lit.len() {
+        if at_line_start {
+            let mut skipped = 0;
+            while skipped < indent && i < lit.len() && (lit[i] == b' ' || lit[i] == b'\t') {
+                i += 1;
+                skipped += 1;
+            }
+            at_line_start = false;
+            if i >= lit.len() {
+                break;
+            }
+        }
+        let b = lit[i];
+        out.push(b);
+        i += 1;
+        if b == b'\n' {
+            at_line_start = true;
+        }
+    }
+    (out, at_line_start)
+}
+
+fn collect_catch_types(
+    lo: &Lowerer,
+    hint: &Hint,
+    line: Line,
+    out: &mut Vec<Box<[u8]>>,
+) -> Result<(), LowerError> {
+    match hint {
+        Hint::Identifier(id) => {
+            out.push(lo.resolve_class(id));
+            Ok(())
+        }
+        Hint::Union(u) => {
+            collect_catch_types(lo, u.left, line, out)?;
+            collect_catch_types(lo, u.right, line, out)
+        }
+        _ => Err(LowerError::Unsupported {
+            what: "catch type",
+            line,
+        }),
+    }
+}
+
+/// ASCII-lowercased name sets for a member group — used to give a class/trait's
+/// own declarations precedence over flattened trait members (step 21, D-21.4).
+#[allow(clippy::type_complexity)]
+fn member_name_sets(
+    methods: &[MethodDecl],
+    props: &[PropDecl],
+    static_props: &[crate::hir::StaticPropDecl],
+    consts: &[crate::hir::ClassConstDecl],
+) -> (
+    HashSet<Vec<u8>>,
+    HashSet<Vec<u8>>,
+    HashSet<Vec<u8>>,
+    HashSet<Vec<u8>>,
+) {
+    (
+        methods
+            .iter()
+            .map(|m| m.decl.name.to_ascii_lowercase())
+            .collect(),
+        props.iter().map(|p| p.name.to_ascii_lowercase()).collect(),
+        static_props
+            .iter()
+            .map(|p| p.name.to_ascii_lowercase())
+            .collect(),
+        consts.iter().map(|c| c.name.to_ascii_lowercase()).collect(),
+    )
+}
+
+/// The last `\`-separated segment of a name (`A\B\c` → `c`), discarding any
+/// namespace prefix. Used only where a bareword is genuinely *not* a namespaced
+/// name — e.g. an interpolated array-key barewords inside a double-quoted string.
+fn bare_last_segment<'a>(id: &Identifier<'a>) -> &'a [u8] {
+    id.last_segment()
+}
+
+/// Drop a single leading namespace separator (`\Foo\Bar` → `Foo\Bar`).
+fn strip_leading_backslash(s: &[u8]) -> &[u8] {
+    s.strip_prefix(b"\\").unwrap_or(s)
+}
+
+/// Join a namespace and a relative name into a fully-qualified name with no
+/// leading separator (`Foo\Bar` + `Baz` → `Foo\Bar\Baz`; empty ns → `Baz`).
+fn join_ns(ns: &[u8], name: &[u8]) -> Box<[u8]> {
+    if ns.is_empty() {
+        return name.into();
+    }
+    let mut v = Vec::with_capacity(ns.len() + 1 + name.len());
+    v.extend_from_slice(ns);
+    v.push(b'\\');
+    v.extend_from_slice(name);
+    v.into()
+}
+
+/// The first `\`-separated segment of a name (`A\B\c` → `A`). For an unqualified
+/// name this is the whole thing.
+fn first_segment(s: &[u8]) -> &[u8] {
+    match s.iter().position(|&b| b == b'\\') {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
+/// The namespace name a `namespace` declaration introduces (`None`/`namespace {}`
+/// → the global namespace, empty bytes; a leading `\` is dropped).
+fn ns_name_of(name: Option<&Identifier>) -> Vec<u8> {
+    match name {
+        Some(id) => strip_leading_backslash(id.value()).to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// The single parent class name in an `extends` clause (PHP classes are
+/// single-inheritance, so only the first type matters), step 19-3. Resolved to a
+/// fully-qualified name against the current namespace + imports (step 50).
+fn parent_name(lo: &Lowerer, ext: &Extends, line: Line) -> Result<Box<[u8]>, LowerError> {
+    match ext.types.iter().next() {
+        Some(id) => Ok(lo.resolve_class(id)),
+        None => Err(LowerError::Unsupported {
+            what: "empty extends clause",
+            line,
+        }),
+    }
+}
+
+/// Map an assignment operator to the static-property assignment flavour (19-4).
+fn static_assign_op(op: &AssignmentOperator) -> StaticAssignOp {
+    match op {
+        AssignmentOperator::Assign(_) => StaticAssignOp::Plain,
+        AssignmentOperator::Coalesce(_) => StaticAssignOp::Coalesce,
+        AssignmentOperator::Addition(_) => StaticAssignOp::Op(BinOp::Add),
+        AssignmentOperator::Subtraction(_) => StaticAssignOp::Op(BinOp::Sub),
+        AssignmentOperator::Multiplication(_) => StaticAssignOp::Op(BinOp::Mul),
+        AssignmentOperator::Division(_) => StaticAssignOp::Op(BinOp::Div),
+        AssignmentOperator::Modulo(_) => StaticAssignOp::Op(BinOp::Mod),
+        AssignmentOperator::Exponentiation(_) => StaticAssignOp::Op(BinOp::Pow),
+        AssignmentOperator::Concat(_) => StaticAssignOp::Op(BinOp::Concat),
+        AssignmentOperator::BitwiseAnd(_) => StaticAssignOp::Op(BinOp::BitAnd),
+        AssignmentOperator::BitwiseOr(_) => StaticAssignOp::Op(BinOp::BitOr),
+        AssignmentOperator::BitwiseXor(_) => StaticAssignOp::Op(BinOp::BitXor),
+        AssignmentOperator::LeftShift(_) => StaticAssignOp::Op(BinOp::Shl),
+        AssignmentOperator::RightShift(_) => StaticAssignOp::Op(BinOp::Shr),
+    }
+}
+
+/// The name of a static property selector `::$name` (without the `$`), step
+/// 19-4. Only a direct variable is supported (dynamic `::$$x` stays out).
+fn static_prop_name<'a>(var: &Variable<'a>, line: Line) -> Result<&'a [u8], LowerError> {
+    match var {
+        Variable::Direct(d) => Ok(strip_dollar(d.name)),
+        _ => Err(LowerError::Unsupported {
+            what: "dynamic static property name",
+            line,
+        }),
+    }
+}
+
+/// The visibility declared by a modifier list, defaulting to `Public` when none
+/// is written (step 19, D-19.13).
+fn visibility_of<'a>(modifiers: impl Iterator<Item = &'a Modifier<'a>>) -> Visibility {
+    for m in modifiers {
+        match m {
+            Modifier::Public(_) => return Visibility::Public,
+            Modifier::Protected(_) => return Visibility::Protected,
+            Modifier::Private(_) => return Visibility::Private,
+            _ => {}
+        }
+    }
+    Visibility::Public
+}
+
+/// The asymmetric *write* visibility declared by a modifier list
+/// (`public private(set) $p`, PHP 8.4), or `None` when the set side is not
+/// narrowed. `public(set)` is the explicit default and also maps to `None`.
+fn set_visibility_of<'a>(modifiers: impl Iterator<Item = &'a Modifier<'a>>) -> Option<Visibility> {
+    for m in modifiers {
+        match m {
+            Modifier::PublicSet(_) => return Some(Visibility::Public),
+            Modifier::ProtectedSet(_) => return Some(Visibility::Protected),
+            Modifier::PrivateSet(_) => return Some(Visibility::Private),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Build the PHP link-time fatal for a concrete class that leaves abstract
+/// methods unimplemented (step 21-4, D-21.11). Singular/plural and the
+/// `Class::method` list match PHP's wording byte-for-byte.
+fn abstract_unimplemented_fatal(class: &[u8], missing: &[&[u8]], line: Line) -> LowerError {
+    let cname = String::from_utf8_lossy(class);
+    let n = missing.len();
+    let word = if n == 1 { "method" } else { "methods" };
+    let list = missing
+        .iter()
+        .map(|m| format!("{}::{}", cname, String::from_utf8_lossy(m)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    LowerError::Fatal {
+        message: format!(
+            "Class {cname} contains {n} abstract {word} and must therefore be \
+             declared abstract or implement the remaining {word} ({list})"
+        ),
+        line,
+    }
+}
+
+/// Map a single visibility modifier (from a trait `as` adaptation) to [`Visibility`].
+fn visibility_of_modifier(m: &Modifier) -> Visibility {
+    match m {
+        Modifier::Protected(_) => Visibility::Protected,
+        Modifier::Private(_) => Visibility::Private,
+        _ => Visibility::Public,
+    }
+}
+
+/// Resolve a bare constant name to its literal HIR value (step 18, D-18.7).
+/// Only engine constants are known; `true`/`false`/`null` are case-insensitive,
+/// every other name is case-sensitive (PHP constants are). `None` for an unknown
+/// (user-defined) constant — the caller turns that into an Unsupported SKIP.
+pub(crate) fn resolve_constant(name: &[u8]) -> Option<ExprKind> {
+    match name.to_ascii_lowercase().as_slice() {
+        b"true" => return Some(ExprKind::Bool(true)),
+        b"false" => return Some(ExprKind::Bool(false)),
+        b"null" => return Some(ExprKind::Null),
+        _ => {}
+    }
+    let str_lit = |s: &[u8]| ExprKind::Str(s.to_vec().into_boxed_slice());
+    Some(match name {
+        // Integer limits / sizes.
+        b"PHP_INT_MAX" => ExprKind::Int(i64::MAX),
+        b"PHP_INT_MIN" => ExprKind::Int(i64::MIN),
+        b"PHP_INT_SIZE" => ExprKind::Int(8),
+        b"PHP_FLOAT_DIG" => ExprKind::Int(15),
+        // Float limits.
+        b"PHP_FLOAT_EPSILON" => ExprKind::Float(f64::EPSILON),
+        b"PHP_FLOAT_MAX" => ExprKind::Float(f64::MAX),
+        b"PHP_FLOAT_MIN" => ExprKind::Float(f64::MIN_POSITIVE),
+        b"NAN" => ExprKind::Float(f64::NAN),
+        b"INF" => ExprKind::Float(f64::INFINITY),
+        // Versions / platform.
+        b"PHP_EOL" => str_lit(b"\n"),
+        b"PHP_VERSION" => str_lit(b"8.5.7"),
+        b"PHP_MAJOR_VERSION" => ExprKind::Int(8),
+        b"PHP_MINOR_VERSION" => ExprKind::Int(5),
+        b"PHP_RELEASE_VERSION" => ExprKind::Int(7),
+        b"PHP_VERSION_ID" => ExprKind::Int(80507),
+        b"PHP_EXTRA_VERSION" => str_lit(b""),
+        // The web host sets the SAPI name at startup, before anything is
+        // lowered, so the compile-time fold is safe (PRELUDE_CACHE included).
+        b"PHP_SAPI" => str_lit(php_types::sapi::sapi_name().as_bytes()),
+        // Build flavour — PHP 8.5 reports these as bool. phpr is a non-debug,
+        // non-thread-safe build, matching the oracle.
+        b"PHP_DEBUG" => ExprKind::Bool(false),
+        b"PHP_ZTS" => ExprKind::Bool(false),
+        // The ZEND_* spellings exist on every build (Symfony Process gates its
+        // cwd fallback on defined('ZEND_THREAD_SAFE') — the constant must BE
+        // defined, whatever its value).
+        b"ZEND_THREAD_SAFE" => ExprKind::Bool(false),
+        b"ZEND_DEBUG_BUILD" => ExprKind::Bool(false),
+        b"PHP_MAXPATHLEN" => ExprKind::Int(1024),
+        // phpinfo() section selectors. phpr's `phpinfo` is a stub, but callers
+        // (Composer's DiagnoseCommand does `phpinfo(INFO_GENERAL)`) still name the
+        // flags, so they must resolve to their canonical bitmask values.
+        b"INFO_GENERAL" => ExprKind::Int(1),
+        b"INFO_CREDITS" => ExprKind::Int(2),
+        b"INFO_CONFIGURATION" => ExprKind::Int(4),
+        b"INFO_MODULES" => ExprKind::Int(8),
+        b"INFO_ENVIRONMENT" => ExprKind::Int(16),
+        b"INFO_VARIABLES" => ExprKind::Int(32),
+        b"INFO_LICENSE" => ExprKind::Int(64),
+        b"INFO_ALL" => ExprKind::Int(0x7FFF_FFFF),
+        // Nominal platform-library versions. phpr does not link these C libraries
+        // (it uses Rust crates for regex, mbstring, and TLS via rustls), so these
+        // are representative constants for consumers that read them (e.g. Composer's
+        // PlatformRepository builds `lib-*` packages from them); they are not tied
+        // to any host install and need not match a given machine's libraries.
+        b"PCRE_VERSION" => str_lit(b"10.44 2024-06-07"),
+        b"MB_ONIGURUMA_VERSION" => str_lit(b"6.9.9"),
+        b"OPENSSL_VERSION_TEXT" => str_lit(b"OpenSSL 3.0.0 7 sep 2023"),
+        b"OPENSSL_VERSION_NUMBER" => ExprKind::Int(0x3000_0000),
+        // Platform identity (macOS oracle, matching `DIRECTORY_SEPARATOR`).
+        b"PHP_OS" => str_lit(b"Darwin"),
+        b"PHP_OS_FAMILY" => str_lit(b"Darwin"),
+        b"DIRECTORY_SEPARATOR" => str_lit(b"/"),
+        b"PATH_SEPARATOR" => str_lit(b":"),
+        // Global DATE_* format constants (ext/date mirrors of the
+        // DateTimeInterface class constants; values from the oracle).
+        b"DATE_ATOM" => str_lit(b"Y-m-d\\TH:i:sP"),
+        b"DATE_COOKIE" => str_lit(b"l, d-M-Y H:i:s T"),
+        b"DATE_ISO8601" => str_lit(b"Y-m-d\\TH:i:sO"),
+        b"DATE_ISO8601_EXPANDED" => str_lit(b"X-m-d\\TH:i:sP"),
+        b"DATE_RFC822" => str_lit(b"D, d M y H:i:s O"),
+        b"DATE_RFC850" => str_lit(b"l, d-M-y H:i:s T"),
+        b"DATE_RFC1036" => str_lit(b"D, d M y H:i:s O"),
+        b"DATE_RFC1123" => str_lit(b"D, d M Y H:i:s O"),
+        b"DATE_RFC7231" => str_lit(b"D, d M Y H:i:s \\G\\M\\T"),
+        b"DATE_RFC2822" => str_lit(b"D, d M Y H:i:s O"),
+        b"DATE_RFC3339" => str_lit(b"Y-m-d\\TH:i:sP"),
+        b"DATE_RFC3339_EXTENDED" => str_lit(b"Y-m-d\\TH:i:s.vP"),
+        b"DATE_RSS" => str_lit(b"D, d M Y H:i:s O"),
+        b"DATE_W3C" => str_lit(b"Y-m-d\\TH:i:sP"),
+        // setlocale() category selectors (macOS values, matching the oracle).
+        b"LC_ALL" => ExprKind::Int(0),
+        b"LC_COLLATE" => ExprKind::Int(1),
+        b"LC_CTYPE" => ExprKind::Int(2),
+        b"LC_MONETARY" => ExprKind::Int(3),
+        b"LC_NUMERIC" => ExprKind::Int(4),
+        b"LC_TIME" => ExprKind::Int(5),
+        b"LC_MESSAGES" => ExprKind::Int(6),
+        // ext/dom node-type codes (W3C nodeType) + ext/libxml option bitflags
+        // and error levels, with the canonical values PHP documents. phpr's DOM
+        // parser ignores most option flags (callers pass them for libxml).
+        b"XML_ELEMENT_NODE" => ExprKind::Int(1),
+        b"XML_ATTRIBUTE_NODE" => ExprKind::Int(2),
+        b"XML_TEXT_NODE" => ExprKind::Int(3),
+        b"XML_CDATA_SECTION_NODE" => ExprKind::Int(4),
+        b"XML_ENTITY_REF_NODE" => ExprKind::Int(5),
+        b"XML_ENTITY_NODE" => ExprKind::Int(6),
+        b"XML_PI_NODE" => ExprKind::Int(7),
+        b"XML_COMMENT_NODE" => ExprKind::Int(8),
+        b"XML_DOCUMENT_NODE" => ExprKind::Int(9),
+        b"XML_DOCUMENT_TYPE_NODE" => ExprKind::Int(10),
+        b"XML_DOCUMENT_FRAG_NODE" => ExprKind::Int(11),
+        b"XML_NOTATION_NODE" => ExprKind::Int(12),
+        b"XML_HTML_DOCUMENT_NODE" => ExprKind::Int(13),
+        b"XML_DTD_NODE" => ExprKind::Int(14),
+        b"XML_ELEMENT_DECL_NODE" => ExprKind::Int(15),
+        b"XML_ATTRIBUTE_DECL_NODE" => ExprKind::Int(16),
+        b"XML_ENTITY_DECL_NODE" => ExprKind::Int(17),
+        b"XML_NAMESPACE_DECL_NODE" => ExprKind::Int(18),
+        b"XML_ATTRIBUTE_CDATA" => ExprKind::Int(1),
+        b"XML_ATTRIBUTE_ID" => ExprKind::Int(2),
+        // ext/xml (expat) parser options + error codes.
+        b"XML_OPTION_CASE_FOLDING" => ExprKind::Int(1),
+        b"XML_OPTION_TARGET_ENCODING" => ExprKind::Int(2),
+        b"XML_OPTION_SKIP_TAGSTART" => ExprKind::Int(3),
+        b"XML_OPTION_SKIP_WHITE" => ExprKind::Int(4),
+        b"XML_ERROR_NONE" => ExprKind::Int(0),
+        b"XML_ERROR_NO_MEMORY" => ExprKind::Int(1),
+        b"XML_ERROR_SYNTAX" => ExprKind::Int(2),
+        b"XML_ERROR_NO_ELEMENTS" => ExprKind::Int(3),
+        b"XML_ERROR_INVALID_TOKEN" => ExprKind::Int(4),
+        b"XML_ERROR_UNCLOSED_TOKEN" => ExprKind::Int(5),
+        b"XML_ERROR_PARTIAL_CHAR" => ExprKind::Int(6),
+        b"XML_ERROR_TAG_MISMATCH" => ExprKind::Int(7),
+        b"XML_ERROR_DUPLICATE_ATTRIBUTE" => ExprKind::Int(8),
+        b"XML_ERROR_JUNK_AFTER_DOC_ELEMENT" => ExprKind::Int(9),
+        b"XML_ERROR_PARAM_ENTITY_REF" => ExprKind::Int(10),
+        b"XML_ERROR_UNDEFINED_ENTITY" => ExprKind::Int(11),
+        b"XML_ERROR_RECURSIVE_ENTITY_REF" => ExprKind::Int(12),
+        b"XML_ERROR_ASYNC_ENTITY" => ExprKind::Int(13),
+        b"XML_ERROR_BAD_CHAR_REF" => ExprKind::Int(14),
+        b"XML_ERROR_BINARY_ENTITY_REF" => ExprKind::Int(15),
+        b"XML_ERROR_ATTRIBUTE_EXTERNAL_ENTITY_REF" => ExprKind::Int(16),
+        b"XML_ERROR_MISPLACED_XML_PI" => ExprKind::Int(17),
+        b"XML_ERROR_UNKNOWN_ENCODING" => ExprKind::Int(18),
+        b"XML_ERROR_INCORRECT_ENCODING" => ExprKind::Int(19),
+        b"XML_ERROR_UNCLOSED_CDATA_SECTION" => ExprKind::Int(20),
+        b"XML_ERROR_EXTERNAL_ENTITY_HANDLING" => ExprKind::Int(21),
+        b"LIBXML_NOENT" => ExprKind::Int(2),
+        b"LIBXML_DTDLOAD" => ExprKind::Int(4),
+        b"LIBXML_DTDATTR" => ExprKind::Int(8),
+        b"LIBXML_DTDVALID" => ExprKind::Int(16),
+        b"LIBXML_NOERROR" => ExprKind::Int(32),
+        b"LIBXML_NOWARNING" => ExprKind::Int(64),
+        b"LIBXML_PEDANTIC" => ExprKind::Int(128),
+        b"LIBXML_NOBLANKS" => ExprKind::Int(256),
+        b"LIBXML_XINCLUDE" => ExprKind::Int(1024),
+        b"LIBXML_NONET" => ExprKind::Int(2048),
+        b"LIBXML_NSCLEAN" => ExprKind::Int(8192),
+        b"LIBXML_NOCDATA" => ExprKind::Int(16384),
+        b"LIBXML_NOEMPTYTAG" => ExprKind::Int(4),
+        b"LIBXML_NOXMLDECL" => ExprKind::Int(2),
+        b"LIBXML_COMPACT" => ExprKind::Int(65536),
+        b"LIBXML_PARSEHUGE" => ExprKind::Int(524288),
+        b"LIBXML_BIGLINES" => ExprKind::Int(4194304),
+        b"LIBXML_SCHEMA_CREATE" => ExprKind::Int(1),
+        b"LIBXML_HTML_NOIMPLIED" => ExprKind::Int(8192),
+        b"LIBXML_HTML_NODEFDTD" => ExprKind::Int(4),
+        b"LIBXML_ERR_NONE" => ExprKind::Int(0),
+        b"LIBXML_ERR_WARNING" => ExprKind::Int(1),
+        b"LIBXML_ERR_ERROR" => ExprKind::Int(2),
+        b"LIBXML_ERR_FATAL" => ExprKind::Int(3),
+        // Nominal libxml version (phpr parses XML with a Rust crate; these are
+        // representative, like PCRE_VERSION above).
+        b"LIBXML_VERSION" => ExprKind::Int(21300),
+        b"LIBXML_LOADED_VERSION" => ExprKind::Int(21300),
+        b"LIBXML_DOTTED_VERSION" => str_lit(b"2.13.0"),
+        // ext/session status codes (session_status()).
+        b"PHP_SESSION_DISABLED" => ExprKind::Int(0),
+        b"PHP_SESSION_NONE" => ExprKind::Int(1),
+        b"PHP_SESSION_ACTIVE" => ExprKind::Int(2),
+        // ext/filter validate/sanitize selectors + flags (`filter_var`). The
+        // oracle build lacks ext/filter, but Composer's symfony polyfill and
+        // ErrorHandler reference these, so we define them with the canonical values.
+        b"FILTER_DEFAULT" => ExprKind::Int(516),
+        b"FILTER_VALIDATE_INT" => ExprKind::Int(257),
+        b"FILTER_VALIDATE_BOOLEAN" | b"FILTER_VALIDATE_BOOL" => ExprKind::Int(258),
+        b"FILTER_VALIDATE_FLOAT" => ExprKind::Int(259),
+        b"FILTER_VALIDATE_REGEXP" => ExprKind::Int(272),
+        b"FILTER_VALIDATE_DOMAIN" => ExprKind::Int(277),
+        b"FILTER_VALIDATE_URL" => ExprKind::Int(273),
+        b"FILTER_VALIDATE_EMAIL" => ExprKind::Int(274),
+        b"FILTER_VALIDATE_IP" => ExprKind::Int(275),
+        b"FILTER_VALIDATE_MAC" => ExprKind::Int(276),
+        b"FILTER_CALLBACK" => ExprKind::Int(1024),
+        b"FILTER_NULL_ON_FAILURE" => ExprKind::Int(134217728),
+        // ext/iconv (§3.19 catena composer, S-127): valori dell'oracle 8.5.7
+        // (PlatformRepository legge ICONV_VERSION per la versione dell'ext).
+        b"ICONV_VERSION" => ExprKind::Str(b"1.11".to_vec().into_boxed_slice()),
+        b"ICONV_IMPL" => ExprKind::Str(b"libiconv".to_vec().into_boxed_slice()),
+        b"ICONV_MIME_DECODE_STRICT" => ExprKind::Int(1),
+        b"ICONV_MIME_DECODE_CONTINUE_ON_ERROR" => ExprKind::Int(2),
+        b"FILTER_REQUIRE_SCALAR" => ExprKind::Int(33554432),
+        b"FILTER_REQUIRE_ARRAY" => ExprKind::Int(16777216),
+        b"FILTER_FORCE_ARRAY" => ExprKind::Int(67108864),
+        b"FILTER_SANITIZE_STRING" => ExprKind::Int(513),
+        b"FILTER_SANITIZE_NUMBER_INT" => ExprKind::Int(519),
+        b"FILTER_UNSAFE_RAW" => ExprKind::Int(516),
+        b"FILTER_SANITIZE_SPECIAL_CHARS" => ExprKind::Int(515),
+        b"FILTER_SANITIZE_FULL_SPECIAL_CHARS" => ExprKind::Int(522),
+        b"FILTER_SANITIZE_EMAIL" => ExprKind::Int(517),
+        b"FILTER_SANITIZE_URL" => ExprKind::Int(518),
+        b"FILTER_SANITIZE_ENCODED" => ExprKind::Int(514),
+        b"FILTER_SANITIZE_ADD_SLASHES" => ExprKind::Int(523),
+        b"FILTER_FLAG_STRIP_LOW" => ExprKind::Int(4),
+        b"FILTER_FLAG_STRIP_HIGH" => ExprKind::Int(8),
+        b"FILTER_FLAG_STRIP_BACKTICK" => ExprKind::Int(512),
+        b"FILTER_FLAG_ENCODE_LOW" => ExprKind::Int(16),
+        b"FILTER_FLAG_ENCODE_HIGH" => ExprKind::Int(32),
+        b"FILTER_FLAG_ENCODE_AMP" => ExprKind::Int(64),
+        b"FILTER_FLAG_NO_ENCODE_QUOTES" => ExprKind::Int(128),
+        b"FILTER_FLAG_EMPTY_STRING_NULL" => ExprKind::Int(256),
+        b"FILTER_FLAG_ALLOW_OCTAL" => ExprKind::Int(1),
+        b"FILTER_FLAG_ALLOW_HEX" => ExprKind::Int(2),
+        b"FILTER_FLAG_ALLOW_FRACTION" => ExprKind::Int(4096),
+        b"FILTER_FLAG_ALLOW_THOUSAND" => ExprKind::Int(8192),
+        b"FILTER_FLAG_ALLOW_SCIENTIFIC" => ExprKind::Int(16384),
+        b"FILTER_FLAG_PATH_REQUIRED" => ExprKind::Int(262144),
+        b"FILTER_FLAG_QUERY_REQUIRED" => ExprKind::Int(524288),
+        b"FILTER_FLAG_SCHEME_REQUIRED" => ExprKind::Int(65536),
+        b"FILTER_FLAG_HOST_REQUIRED" => ExprKind::Int(131072),
+        b"FILTER_FLAG_HOSTNAME" => ExprKind::Int(1048576),
+        // §3.19 catena composer (S-127): json-schema valida le email degli
+        // authors con questo flag (local-part unicode); il valore CONDIVIDE
+        // 1048576 con HOSTNAME (filtri diversi, spazi di flag diversi).
+        b"FILTER_FLAG_EMAIL_UNICODE" => ExprKind::Int(1048576),
+        // FILTER_VALIDATE_IP flags (+ the aggregate GLOBAL_RANGE, 8.2).
+        b"FILTER_FLAG_IPV4" => ExprKind::Int(1048576),
+        b"FILTER_FLAG_IPV6" => ExprKind::Int(2097152),
+        b"FILTER_FLAG_NO_RES_RANGE" => ExprKind::Int(4194304),
+        b"FILTER_FLAG_NO_PRIV_RANGE" => ExprKind::Int(8388608),
+        b"FILTER_FLAG_GLOBAL_RANGE" => ExprKind::Int(536870912),
+        // File-upload error codes (`$_FILES[...]['error']`); value 5 is unused
+        // in PHP itself.
+        b"UPLOAD_ERR_OK" => ExprKind::Int(0),
+        b"UPLOAD_ERR_INI_SIZE" => ExprKind::Int(1),
+        b"UPLOAD_ERR_FORM_SIZE" => ExprKind::Int(2),
+        b"UPLOAD_ERR_PARTIAL" => ExprKind::Int(3),
+        b"UPLOAD_ERR_NO_FILE" => ExprKind::Int(4),
+        b"UPLOAD_ERR_NO_TMP_DIR" => ExprKind::Int(6),
+        b"UPLOAD_ERR_CANT_WRITE" => ExprKind::Int(7),
+        b"UPLOAD_ERR_EXTENSION" => ExprKind::Int(8),
+        // ext/intl grapheme_extract() size-measurement types.
+        b"GRAPHEME_EXTR_COUNT" => ExprKind::Int(0),
+        b"GRAPHEME_EXTR_MAXBYTES" => ExprKind::Int(1),
+        b"GRAPHEME_EXTR_MAXCHARS" => ExprKind::Int(2),
+        // `filter_input()` source ids (ext/filter): the superglobal to read from.
+        b"INPUT_POST" => ExprKind::Int(0),
+        b"INPUT_GET" => ExprKind::Int(1),
+        b"INPUT_COOKIE" => ExprKind::Int(2),
+        b"INPUT_ENV" => ExprKind::Int(4),
+        b"INPUT_SERVER" => ExprKind::Int(5),
+        b"INPUT_SESSION" => ExprKind::Int(6),
+        b"INPUT_REQUEST" => ExprKind::Int(99),
+        // Stream seek whence (step 51b): `fseek($f, $offset, $whence)`.
+        b"SEEK_SET" => ExprKind::Int(0),
+        b"SEEK_CUR" => ExprKind::Int(1),
+        b"SEEK_END" => ExprKind::Int(2),
+        // file_put_contents / file flags (step 51c, 55a).
+        b"FILE_USE_INCLUDE_PATH" => ExprKind::Int(1),
+        b"LOCK_EX" => ExprKind::Int(2),
+        b"FILE_IGNORE_NEW_LINES" => ExprKind::Int(2),
+        b"FILE_SKIP_EMPTY_LINES" => ExprKind::Int(4),
+        b"FILE_APPEND" => ExprKind::Int(8),
+        // parse_url() component selectors.
+        b"PHP_URL_SCHEME" => ExprKind::Int(0),
+        b"PHP_URL_HOST" => ExprKind::Int(1),
+        b"PHP_URL_PORT" => ExprKind::Int(2),
+        b"PHP_URL_USER" => ExprKind::Int(3),
+        b"PHP_URL_PASS" => ExprKind::Int(4),
+        b"PHP_URL_PATH" => ExprKind::Int(5),
+        b"PHP_URL_QUERY" => ExprKind::Int(6),
+        b"PHP_URL_FRAGMENT" => ExprKind::Int(7),
+        // pathinfo() component selectors (step 52a).
+        b"PATHINFO_DIRNAME" => ExprKind::Int(1),
+        b"PATHINFO_BASENAME" => ExprKind::Int(2),
+        b"PATHINFO_EXTENSION" => ExprKind::Int(4),
+        b"PATHINFO_FILENAME" => ExprKind::Int(8),
+        // crypt() capability flags (step 64) — PHP bundles every algorithm, so
+        // all are available; CRYPT_SALT_LENGTH is PHP_MAX_SALT_LEN.
+        b"CRYPT_SALT_LENGTH" => ExprKind::Int(123),
+        b"CRYPT_STD_DES" => ExprKind::Int(1),
+        b"CRYPT_EXT_DES" => ExprKind::Int(1),
+        b"CRYPT_MD5" => ExprKind::Int(1),
+        b"CRYPT_BLOWFISH" => ExprKind::Int(1),
+        b"CRYPT_SHA256" => ExprKind::Int(1),
+        b"CRYPT_SHA512" => ExprKind::Int(1),
+        // htmlspecialchars / htmlentities flags (step 56b).
+        b"ENT_NOQUOTES" => ExprKind::Int(0),
+        b"ENT_HTML401" => ExprKind::Int(0),
+        b"ENT_COMPAT" => ExprKind::Int(2),
+        b"ENT_QUOTES" => ExprKind::Int(3),
+        b"ENT_IGNORE" => ExprKind::Int(4),
+        b"ENT_SUBSTITUTE" => ExprKind::Int(8),
+        b"ENT_XML1" => ExprKind::Int(16),
+        b"ENT_XHTML" => ExprKind::Int(32),
+        b"ENT_HTML5" => ExprKind::Int(48),
+        // scandir() sort order (step 52e).
+        b"SCANDIR_SORT_ASCENDING" => ExprKind::Int(0),
+        b"SCANDIR_SORT_DESCENDING" => ExprKind::Int(1),
+        b"SCANDIR_SORT_NONE" => ExprKind::Int(2),
+        // glob() flags (step 52e).
+        b"GLOB_MARK" => ExprKind::Int(8),
+        b"GLOB_NOSORT" => ExprKind::Int(32),
+        b"GLOB_NOCHECK" => ExprKind::Int(16),
+        b"GLOB_NOESCAPE" => ExprKind::Int(4096),
+        b"GLOB_BRACE" => ExprKind::Int(128),
+        b"GLOB_ONLYDIR" => ExprKind::Int(1_073_741_824),
+        b"GLOB_ERR" => ExprKind::Int(4),
+        // error_reporting / set_error_handler levels (bit flags). PHP 8.5 keeps
+        // the E_STRICT slot (2048) reserved/unused; E_ALL is 32767.
+        b"E_ERROR" => ExprKind::Int(1),
+        b"E_WARNING" => ExprKind::Int(2),
+        b"E_PARSE" => ExprKind::Int(4),
+        b"E_NOTICE" => ExprKind::Int(8),
+        b"E_CORE_ERROR" => ExprKind::Int(16),
+        b"E_CORE_WARNING" => ExprKind::Int(32),
+        b"E_COMPILE_ERROR" => ExprKind::Int(64),
+        b"E_COMPILE_WARNING" => ExprKind::Int(128),
+        b"E_USER_ERROR" => ExprKind::Int(256),
+        b"E_USER_WARNING" => ExprKind::Int(512),
+        b"E_USER_NOTICE" => ExprKind::Int(1024),
+        b"E_STRICT" => ExprKind::Int(2048),
+        b"E_RECOVERABLE_ERROR" => ExprKind::Int(4096),
+        b"E_DEPRECATED" => ExprKind::Int(8192),
+        b"E_USER_DEPRECATED" => ExprKind::Int(16384),
+        // PHP 8.0 removed E_STRICT from E_ALL; PHP 8.4 made E_STRICT a no-op. The
+        // current value is 30719 (E_ALL without E_STRICT=2048), matching 8.5.
+        b"E_ALL" => ExprKind::Int(30719),
+        // hash_init() flag.
+        b"HASH_HMAC" => ExprKind::Int(1),
+        // http_build_query() encoding selectors.
+        b"PHP_QUERY_RFC1738" => ExprKind::Int(1),
+        b"PHP_QUERY_RFC3986" => ExprKind::Int(2),
+        // POSIX signal numbers (macOS values, brew-php-pinned; ext/pcntl defines
+        // these — monolog's SignalHandler references them even when the pcntl
+        // *functions* are unavailable). SIGEMT is undefined on macOS PHP too.
+        b"SIGHUP" => ExprKind::Int(1),
+        b"SIGINT" => ExprKind::Int(2),
+        b"SIGQUIT" => ExprKind::Int(3),
+        b"SIGILL" => ExprKind::Int(4),
+        b"SIGTRAP" => ExprKind::Int(5),
+        b"SIGABRT" => ExprKind::Int(6),
+        b"SIGFPE" => ExprKind::Int(8),
+        b"SIGKILL" => ExprKind::Int(9),
+        b"SIGBUS" => ExprKind::Int(10),
+        b"SIGSEGV" => ExprKind::Int(11),
+        b"SIGSYS" => ExprKind::Int(12),
+        b"SIGPIPE" => ExprKind::Int(13),
+        b"SIGALRM" => ExprKind::Int(14),
+        b"SIGTERM" => ExprKind::Int(15),
+        b"SIGURG" => ExprKind::Int(16),
+        b"SIGSTOP" => ExprKind::Int(17),
+        b"SIGTSTP" => ExprKind::Int(18),
+        b"SIGCONT" => ExprKind::Int(19),
+        b"SIGCHLD" => ExprKind::Int(20),
+        b"SIGTTIN" => ExprKind::Int(21),
+        b"SIGTTOU" => ExprKind::Int(22),
+        b"SIGIO" => ExprKind::Int(23),
+        b"SIGXCPU" => ExprKind::Int(24),
+        b"SIGXFSZ" => ExprKind::Int(25),
+        b"SIGVTALRM" => ExprKind::Int(26),
+        b"SIGPROF" => ExprKind::Int(27),
+        b"SIGWINCH" => ExprKind::Int(28),
+        b"SIGINFO" => ExprKind::Int(29),
+        b"SIGUSR1" => ExprKind::Int(30),
+        b"SIGUSR2" => ExprKind::Int(31),
+        b"SIG_DFL" => ExprKind::Int(0),
+        b"SIG_IGN" => ExprKind::Int(1),
+        b"SIG_ERR" => ExprKind::Int(-1),
+        b"SIG_BLOCK" => ExprKind::Int(1),
+        b"SIG_UNBLOCK" => ExprKind::Int(2),
+        b"SIG_SETMASK" => ExprKind::Int(3),
+        // flock operations / debug_backtrace flags (oracle-pinned).
+        // (`LOCK_EX` lives with the file_put_contents flags above.)
+        b"LOCK_SH" => ExprKind::Int(1),
+        b"LOCK_UN" => ExprKind::Int(3),
+        b"LOCK_NB" => ExprKind::Int(4),
+        b"DEBUG_BACKTRACE_PROVIDE_OBJECT" => ExprKind::Int(1),
+        b"DEBUG_BACKTRACE_IGNORE_ARGS" => ExprKind::Int(2),
+        // syslog() priorities / facilities / options (macOS values, oracle-pinned).
+        b"LOG_EMERG" => ExprKind::Int(0),
+        b"LOG_ALERT" => ExprKind::Int(1),
+        b"LOG_CRIT" => ExprKind::Int(2),
+        b"LOG_ERR" => ExprKind::Int(3),
+        b"LOG_WARNING" => ExprKind::Int(4),
+        b"LOG_NOTICE" => ExprKind::Int(5),
+        b"LOG_INFO" => ExprKind::Int(6),
+        b"LOG_DEBUG" => ExprKind::Int(7),
+        b"LOG_AUTH" => ExprKind::Int(32),
+        b"LOG_AUTHPRIV" => ExprKind::Int(80),
+        b"LOG_CRON" => ExprKind::Int(72),
+        b"LOG_DAEMON" => ExprKind::Int(24),
+        b"LOG_KERN" => ExprKind::Int(0),
+        b"LOG_LPR" => ExprKind::Int(48),
+        b"LOG_MAIL" => ExprKind::Int(16),
+        b"LOG_NEWS" => ExprKind::Int(56),
+        b"LOG_SYSLOG" => ExprKind::Int(40),
+        b"LOG_UUCP" => ExprKind::Int(64),
+        b"LOG_USER" => ExprKind::Int(8),
+        b"LOG_LOCAL0" => ExprKind::Int(128),
+        b"LOG_LOCAL1" => ExprKind::Int(136),
+        b"LOG_LOCAL2" => ExprKind::Int(144),
+        b"LOG_LOCAL3" => ExprKind::Int(152),
+        b"LOG_LOCAL4" => ExprKind::Int(160),
+        b"LOG_LOCAL5" => ExprKind::Int(168),
+        b"LOG_LOCAL6" => ExprKind::Int(176),
+        b"LOG_LOCAL7" => ExprKind::Int(184),
+        b"LOG_NDELAY" => ExprKind::Int(8),
+        b"LOG_ODELAY" => ExprKind::Int(4),
+        b"LOG_PERROR" => ExprKind::Int(32),
+        b"LOG_PID" => ExprKind::Int(1),
+        b"LOG_CONS" => ExprKind::Int(2),
+        // str_pad / array_filter / count flags.
+        b"STR_PAD_RIGHT" => ExprKind::Int(1),
+        b"STR_PAD_LEFT" => ExprKind::Int(0),
+        b"STR_PAD_BOTH" => ExprKind::Int(2),
+        // mb_convert_case modes (mbstring).
+        b"MB_CASE_UPPER" => ExprKind::Int(0),
+        b"MB_CASE_LOWER" => ExprKind::Int(1),
+        b"MB_CASE_TITLE" => ExprKind::Int(2),
+        b"MB_CASE_FOLD" => ExprKind::Int(3),
+        b"MB_CASE_UPPER_SIMPLE" => ExprKind::Int(4),
+        b"MB_CASE_LOWER_SIMPLE" => ExprKind::Int(5),
+        b"MB_CASE_TITLE_SIMPLE" => ExprKind::Int(6),
+        b"MB_CASE_FOLD_SIMPLE" => ExprKind::Int(7),
+        b"ARRAY_FILTER_USE_KEY" => ExprKind::Int(2),
+        b"ARRAY_FILTER_USE_BOTH" => ExprKind::Int(1),
+        b"COUNT_NORMAL" => ExprKind::Int(0),
+        b"COUNT_RECURSIVE" => ExprKind::Int(1),
+        // ext/standard image types (getimagesize / image_type_to_*).
+        b"IMAGETYPE_UNKNOWN" => ExprKind::Int(0),
+        b"IMAGETYPE_GIF" => ExprKind::Int(1),
+        b"IMAGETYPE_JPEG" => ExprKind::Int(2),
+        b"IMAGETYPE_PNG" => ExprKind::Int(3),
+        b"IMAGETYPE_SWF" => ExprKind::Int(4),
+        b"IMAGETYPE_PSD" => ExprKind::Int(5),
+        b"IMAGETYPE_BMP" => ExprKind::Int(6),
+        b"IMAGETYPE_TIFF_II" => ExprKind::Int(7),
+        b"IMAGETYPE_TIFF_MM" => ExprKind::Int(8),
+        b"IMAGETYPE_JPC" => ExprKind::Int(9),
+        b"IMAGETYPE_JPEG2000" => ExprKind::Int(9),
+        b"IMAGETYPE_JP2" => ExprKind::Int(10),
+        b"IMAGETYPE_JPX" => ExprKind::Int(11),
+        b"IMAGETYPE_JB2" => ExprKind::Int(12),
+        b"IMAGETYPE_SWC" => ExprKind::Int(13),
+        b"IMAGETYPE_IFF" => ExprKind::Int(14),
+        b"IMAGETYPE_WBMP" => ExprKind::Int(15),
+        b"IMAGETYPE_XBM" => ExprKind::Int(16),
+        b"IMAGETYPE_ICO" => ExprKind::Int(17),
+        b"IMAGETYPE_WEBP" => ExprKind::Int(18),
+        b"IMAGETYPE_AVIF" => ExprKind::Int(19),
+        b"IMAGETYPE_HEIF" => ExprKind::Int(20),
+        b"IMAGETYPE_COUNT" => ExprKind::Int(22),
+        // ext/standard password_* (bcrypt only; PASSWORD_DEFAULT/BCRYPT are the
+        // string identifier "2y" in PHP 8.4+).
+        b"PASSWORD_DEFAULT" => ExprKind::Str(b"2y".to_vec().into()),
+        b"PASSWORD_BCRYPT" => ExprKind::Str(b"2y".to_vec().into()),
+        b"PASSWORD_BCRYPT_DEFAULT_COST" => ExprKind::Int(12),
+        b"PASSWORD_ARGON2I" => ExprKind::Str(b"argon2i".to_vec().into()),
+        b"PASSWORD_ARGON2ID" => ExprKind::Str(b"argon2id".to_vec().into()),
+        b"PASSWORD_ARGON2_DEFAULT_MEMORY_COST" => ExprKind::Int(65536),
+        b"PASSWORD_ARGON2_DEFAULT_TIME_COST" => ExprKind::Int(4),
+        b"PASSWORD_ARGON2_DEFAULT_THREADS" => ExprKind::Int(1),
+        // extract() strategies.
+        b"EXTR_OVERWRITE" => ExprKind::Int(0),
+        b"EXTR_SKIP" => ExprKind::Int(1),
+        b"EXTR_PREFIX_SAME" => ExprKind::Int(2),
+        b"EXTR_PREFIX_ALL" => ExprKind::Int(3),
+        b"EXTR_PREFIX_INVALID" => ExprKind::Int(4),
+        b"EXTR_PREFIX_IF_EXISTS" => ExprKind::Int(5),
+        b"EXTR_IF_EXISTS" => ExprKind::Int(6),
+        b"EXTR_REFS" => ExprKind::Int(256),
+        // array_change_key_case flags.
+        b"CASE_LOWER" => ExprKind::Int(0),
+        b"CASE_UPPER" => ExprKind::Int(1),
+        // ext/sqlite3 (fetch modes, value types, open flags).
+        b"SQLITE3_ASSOC" => ExprKind::Int(1),
+        b"SQLITE3_NUM" => ExprKind::Int(2),
+        b"SQLITE3_BOTH" => ExprKind::Int(3),
+        b"SQLITE3_INTEGER" => ExprKind::Int(1),
+        b"SQLITE3_FLOAT" => ExprKind::Int(2),
+        b"SQLITE3_TEXT" => ExprKind::Int(3),
+        b"SQLITE3_BLOB" => ExprKind::Int(4),
+        b"SQLITE3_NULL" => ExprKind::Int(5),
+        b"SQLITE3_OPEN_READONLY" => ExprKind::Int(1),
+        b"SQLITE3_OPEN_READWRITE" => ExprKind::Int(2),
+        b"SQLITE3_OPEN_CREATE" => ExprKind::Int(4),
+        // json_encode / json_decode flags (step 26).
+        b"JSON_HEX_TAG" => ExprKind::Int(1),
+        b"JSON_HEX_AMP" => ExprKind::Int(2),
+        b"JSON_HEX_APOS" => ExprKind::Int(4),
+        b"JSON_HEX_QUOT" => ExprKind::Int(8),
+        b"JSON_FORCE_OBJECT" => ExprKind::Int(16),
+        b"JSON_NUMERIC_CHECK" => ExprKind::Int(32),
+        b"JSON_UNESCAPED_SLASHES" => ExprKind::Int(64),
+        b"JSON_PRETTY_PRINT" => ExprKind::Int(128),
+        b"JSON_UNESCAPED_UNICODE" => ExprKind::Int(256),
+        b"JSON_PARTIAL_OUTPUT_ON_ERROR" => ExprKind::Int(512),
+        b"JSON_PRESERVE_ZERO_FRACTION" => ExprKind::Int(1024),
+        b"JSON_UNESCAPED_LINE_TERMINATORS" => ExprKind::Int(2048),
+        // ext/intl IDNA (WP-17): valori dell'oracolo 8.5 (IDNA_DEFAULT = 48 =
+        // NONTRANSITIONAL_TO_ASCII|NONTRANSITIONAL_TO_UNICODE).
+        b"IDNA_DEFAULT" => ExprKind::Int(48),
+        b"IDNA_ALLOW_UNASSIGNED" => ExprKind::Int(1),
+        b"IDNA_USE_STD3_RULES" => ExprKind::Int(2),
+        b"IDNA_CHECK_BIDI" => ExprKind::Int(4),
+        b"IDNA_CHECK_CONTEXTJ" => ExprKind::Int(8),
+        b"IDNA_NONTRANSITIONAL_TO_ASCII" => ExprKind::Int(16),
+        b"IDNA_NONTRANSITIONAL_TO_UNICODE" => ExprKind::Int(32),
+        b"INTL_IDNA_VARIANT_UTS46" => ExprKind::Int(1),
+        b"IDNA_ERROR_EMPTY_LABEL" => ExprKind::Int(1),
+        b"IDNA_ERROR_LABEL_TOO_LONG" => ExprKind::Int(2),
+        b"IDNA_ERROR_DOMAIN_NAME_TOO_LONG" => ExprKind::Int(4),
+        b"IDNA_ERROR_LEADING_HYPHEN" => ExprKind::Int(8),
+        b"IDNA_ERROR_TRAILING_HYPHEN" => ExprKind::Int(16),
+        b"IDNA_ERROR_HYPHEN_3_4" => ExprKind::Int(32),
+        b"IDNA_ERROR_LEADING_COMBINING_MARK" => ExprKind::Int(64),
+        b"IDNA_ERROR_DISALLOWED" => ExprKind::Int(128),
+        b"IDNA_ERROR_PUNYCODE" => ExprKind::Int(256),
+        b"IDNA_ERROR_LABEL_HAS_DOT" => ExprKind::Int(512),
+        b"IDNA_ERROR_INVALID_ACE_LABEL" => ExprKind::Int(1024),
+        b"IDNA_ERROR_BIDI" => ExprKind::Int(2048),
+        b"IDNA_ERROR_CONTEXTJ" => ExprKind::Int(4096),
+        // preg_last_error() (WP-16): phpr produce solo 0/1/4, ma le costanti
+        // esistono tutte come in ext/pcre.
+        b"PREG_NO_ERROR" => ExprKind::Int(0),
+        b"PREG_INTERNAL_ERROR" => ExprKind::Int(1),
+        b"PREG_BACKTRACK_LIMIT_ERROR" => ExprKind::Int(2),
+        b"PREG_RECURSION_LIMIT_ERROR" => ExprKind::Int(3),
+        b"PREG_BAD_UTF8_ERROR" => ExprKind::Int(4),
+        b"PREG_BAD_UTF8_OFFSET_ERROR" => ExprKind::Int(5),
+        b"PREG_JIT_STACKLIMIT_ERROR" => ExprKind::Int(6),
+        b"JSON_INVALID_UTF8_IGNORE" => ExprKind::Int(1_048_576),
+        b"JSON_INVALID_UTF8_SUBSTITUTE" => ExprKind::Int(2_097_152),
+        b"JSON_THROW_ON_ERROR" => ExprKind::Int(4_194_304),
+        b"JSON_OBJECT_AS_ARRAY" => ExprKind::Int(1),
+        b"JSON_BIGINT_AS_STRING" => ExprKind::Int(2),
+        b"JSON_ERROR_NONE" => ExprKind::Int(0),
+        b"JSON_ERROR_DEPTH" => ExprKind::Int(1),
+        b"JSON_ERROR_STATE_MISMATCH" => ExprKind::Int(2),
+        b"JSON_ERROR_CTRL_CHAR" => ExprKind::Int(3),
+        b"JSON_ERROR_SYNTAX" => ExprKind::Int(4),
+        b"JSON_ERROR_UTF8" => ExprKind::Int(5),
+        b"JSON_ERROR_RECURSION" => ExprKind::Int(6),
+        b"JSON_ERROR_INF_OR_NAN" => ExprKind::Int(7),
+        b"JSON_ERROR_UNSUPPORTED_TYPE" => ExprKind::Int(8),
+        b"JSON_ERROR_INVALID_PROPERTY_NAME" => ExprKind::Int(9),
+        b"JSON_ERROR_UTF16" => ExprKind::Int(10),
+        b"JSON_ERROR_NON_BACKED_ENUM" => ExprKind::Int(11),
+        // preg flags (step 31).
+        b"PREG_PATTERN_ORDER" => ExprKind::Int(1),
+        b"PREG_SET_ORDER" => ExprKind::Int(2),
+        b"PREG_OFFSET_CAPTURE" => ExprKind::Int(256),
+        b"PREG_UNMATCHED_AS_NULL" => ExprKind::Int(512),
+        b"PREG_SPLIT_NO_EMPTY" => ExprKind::Int(1),
+        b"PREG_SPLIT_DELIM_CAPTURE" => ExprKind::Int(2),
+        b"PREG_SPLIT_OFFSET_CAPTURE" => ExprKind::Int(4),
+        b"PREG_GREP_INVERT" => ExprKind::Int(1),
+        // sort flags.
+        b"SORT_REGULAR" => ExprKind::Int(0),
+        b"SORT_NUMERIC" => ExprKind::Int(1),
+        b"SORT_STRING" => ExprKind::Int(2),
+        b"SORT_DESC" => ExprKind::Int(3),
+        b"SORT_ASC" => ExprKind::Int(4),
+        b"SORT_LOCALE_STRING" => ExprKind::Int(5),
+        b"SORT_NATURAL" => ExprKind::Int(6),
+        b"SORT_FLAG_CASE" => ExprKind::Int(8),
+        // ini_get_all() access levels (WordPress wp_is_ini_value_changeable).
+        b"INI_USER" => ExprKind::Int(1),
+        b"INI_PERDIR" => ExprKind::Int(2),
+        b"INI_SYSTEM" => ExprKind::Int(4),
+        b"INI_ALL" => ExprKind::Int(7),
+        // GMP (ext/gmp).
+        b"GMP_ROUND_ZERO" => ExprKind::Int(0),
+        b"GMP_ROUND_PLUSINF" => ExprKind::Int(1),
+        b"GMP_ROUND_MINUSINF" => ExprKind::Int(2),
+        b"GMP_MSW_FIRST" => ExprKind::Int(1),
+        b"GMP_LSW_FIRST" => ExprKind::Int(2),
+        b"GMP_LITTLE_ENDIAN" => ExprKind::Int(4),
+        b"GMP_BIG_ENDIAN" => ExprKind::Int(8),
+        b"GMP_NATIVE_ENDIAN" => ExprKind::Int(16),
+        b"GMP_VERSION" => str_lit(b"6.3.0"),
+        // ext/mysqli (values from the PHP 8.5 oracle probe, WP-8).
+        b"MYSQLI_REPORT_OFF" => ExprKind::Int(0),
+        b"MYSQLI_REPORT_ERROR" => ExprKind::Int(1),
+        b"MYSQLI_REPORT_STRICT" => ExprKind::Int(2),
+        b"MYSQLI_REPORT_INDEX" => ExprKind::Int(4),
+        b"MYSQLI_REPORT_ALL" => ExprKind::Int(255),
+        b"MYSQLI_STORE_RESULT" => ExprKind::Int(0),
+        b"MYSQLI_USE_RESULT" => ExprKind::Int(1),
+        b"MYSQLI_ASYNC" => ExprKind::Int(8),
+        b"MYSQLI_STORE_RESULT_COPY_DATA" => ExprKind::Int(16),
+        b"MYSQLI_ASSOC" => ExprKind::Int(1),
+        b"MYSQLI_NUM" => ExprKind::Int(2),
+        b"MYSQLI_BOTH" => ExprKind::Int(3),
+        b"MYSQLI_NOT_NULL_FLAG" => ExprKind::Int(1),
+        b"MYSQLI_PRI_KEY_FLAG" => ExprKind::Int(2),
+        b"MYSQLI_UNIQUE_KEY_FLAG" => ExprKind::Int(4),
+        b"MYSQLI_MULTIPLE_KEY_FLAG" => ExprKind::Int(8),
+        b"MYSQLI_BLOB_FLAG" => ExprKind::Int(16),
+        b"MYSQLI_UNSIGNED_FLAG" => ExprKind::Int(32),
+        b"MYSQLI_ZEROFILL_FLAG" => ExprKind::Int(64),
+        b"MYSQLI_BINARY_FLAG" => ExprKind::Int(128),
+        b"MYSQLI_ENUM_FLAG" => ExprKind::Int(256),
+        b"MYSQLI_AUTO_INCREMENT_FLAG" => ExprKind::Int(512),
+        b"MYSQLI_TIMESTAMP_FLAG" => ExprKind::Int(1024),
+        b"MYSQLI_SET_FLAG" => ExprKind::Int(2048),
+        b"MYSQLI_NO_DEFAULT_VALUE_FLAG" => ExprKind::Int(4096),
+        b"MYSQLI_ON_UPDATE_NOW_FLAG" => ExprKind::Int(8192),
+        b"MYSQLI_PART_KEY_FLAG" => ExprKind::Int(16384),
+        b"MYSQLI_GROUP_FLAG" => ExprKind::Int(32768),
+        b"MYSQLI_NUM_FLAG" => ExprKind::Int(32768),
+        b"MYSQLI_TYPE_DECIMAL" => ExprKind::Int(0),
+        b"MYSQLI_TYPE_TINY" => ExprKind::Int(1),
+        b"MYSQLI_TYPE_CHAR" => ExprKind::Int(1),
+        b"MYSQLI_TYPE_SHORT" => ExprKind::Int(2),
+        b"MYSQLI_TYPE_LONG" => ExprKind::Int(3),
+        b"MYSQLI_TYPE_FLOAT" => ExprKind::Int(4),
+        b"MYSQLI_TYPE_DOUBLE" => ExprKind::Int(5),
+        b"MYSQLI_TYPE_NULL" => ExprKind::Int(6),
+        b"MYSQLI_TYPE_TIMESTAMP" => ExprKind::Int(7),
+        b"MYSQLI_TYPE_LONGLONG" => ExprKind::Int(8),
+        b"MYSQLI_TYPE_INT24" => ExprKind::Int(9),
+        b"MYSQLI_TYPE_DATE" => ExprKind::Int(10),
+        b"MYSQLI_TYPE_TIME" => ExprKind::Int(11),
+        b"MYSQLI_TYPE_DATETIME" => ExprKind::Int(12),
+        b"MYSQLI_TYPE_YEAR" => ExprKind::Int(13),
+        b"MYSQLI_TYPE_NEWDATE" => ExprKind::Int(14),
+        b"MYSQLI_TYPE_BIT" => ExprKind::Int(16),
+        b"MYSQLI_TYPE_VECTOR" => ExprKind::Int(242),
+        b"MYSQLI_TYPE_JSON" => ExprKind::Int(245),
+        b"MYSQLI_TYPE_NEWDECIMAL" => ExprKind::Int(246),
+        b"MYSQLI_TYPE_ENUM" => ExprKind::Int(247),
+        b"MYSQLI_TYPE_SET" => ExprKind::Int(248),
+        b"MYSQLI_TYPE_TINY_BLOB" => ExprKind::Int(249),
+        b"MYSQLI_TYPE_MEDIUM_BLOB" => ExprKind::Int(250),
+        b"MYSQLI_TYPE_LONG_BLOB" => ExprKind::Int(251),
+        b"MYSQLI_TYPE_BLOB" => ExprKind::Int(252),
+        b"MYSQLI_TYPE_VAR_STRING" => ExprKind::Int(253),
+        b"MYSQLI_TYPE_STRING" => ExprKind::Int(254),
+        b"MYSQLI_TYPE_GEOMETRY" => ExprKind::Int(255),
+        b"MYSQLI_CLIENT_FOUND_ROWS" => ExprKind::Int(2),
+        b"MYSQLI_CLIENT_NO_SCHEMA" => ExprKind::Int(16),
+        b"MYSQLI_CLIENT_COMPRESS" => ExprKind::Int(32),
+        b"MYSQLI_CLIENT_IGNORE_SPACE" => ExprKind::Int(256),
+        b"MYSQLI_CLIENT_INTERACTIVE" => ExprKind::Int(1024),
+        b"MYSQLI_CLIENT_SSL" => ExprKind::Int(2048),
+        b"MYSQLI_CLIENT_SSL_VERIFY_SERVER_CERT" => ExprKind::Int(1073741824),
+        b"MYSQLI_CLIENT_SSL_DONT_VERIFY_SERVER_CERT" => ExprKind::Int(64),
+        b"MYSQLI_OPT_CONNECT_TIMEOUT" => ExprKind::Int(0),
+        b"MYSQLI_INIT_COMMAND" => ExprKind::Int(3),
+        b"MYSQLI_SET_CHARSET_NAME" => ExprKind::Int(7),
+        b"MYSQLI_OPT_LOCAL_INFILE" => ExprKind::Int(8),
+        b"MYSQLI_OPT_READ_TIMEOUT" => ExprKind::Int(11),
+        b"MYSQLI_OPT_INT_AND_FLOAT_NATIVE" => ExprKind::Int(201),
+        b"MYSQLI_OPT_NET_CMD_BUFFER_SIZE" => ExprKind::Int(202),
+        b"MYSQLI_OPT_NET_READ_BUFFER_SIZE" => ExprKind::Int(203),
+        b"MYSQLI_OPT_SSL_VERIFY_SERVER_CERT" => ExprKind::Int(21),
+        b"MYSQLI_SERVER_PUBLIC_KEY" => ExprKind::Int(35),
+        b"MYSQLI_TRANS_START_WITH_CONSISTENT_SNAPSHOT" => ExprKind::Int(1),
+        b"MYSQLI_TRANS_START_READ_WRITE" => ExprKind::Int(2),
+        b"MYSQLI_TRANS_START_READ_ONLY" => ExprKind::Int(4),
+        b"MYSQLI_TRANS_COR_AND_CHAIN" => ExprKind::Int(1),
+        b"MYSQLI_TRANS_COR_AND_NO_CHAIN" => ExprKind::Int(2),
+        b"MYSQLI_TRANS_COR_RELEASE" => ExprKind::Int(4),
+        b"MYSQLI_TRANS_COR_NO_RELEASE" => ExprKind::Int(8),
+        b"MYSQLI_REFRESH_GRANT" => ExprKind::Int(1),
+        b"MYSQLI_REFRESH_LOG" => ExprKind::Int(2),
+        b"MYSQLI_REFRESH_TABLES" => ExprKind::Int(4),
+        b"MYSQLI_REFRESH_HOSTS" => ExprKind::Int(8),
+        b"MYSQLI_REFRESH_STATUS" => ExprKind::Int(16),
+        b"MYSQLI_REFRESH_THREADS" => ExprKind::Int(32),
+        b"MYSQLI_REFRESH_REPLICA" => ExprKind::Int(64),
+        b"MYSQLI_REFRESH_SLAVE" => ExprKind::Int(64),
+        b"MYSQLI_REFRESH_MASTER" => ExprKind::Int(128),
+        b"MYSQLI_DEBUG_TRACE_ENABLED" => ExprKind::Int(0),
+        b"MYSQLI_SERVER_QUERY_NO_GOOD_INDEX_USED" => ExprKind::Int(16),
+        b"MYSQLI_SERVER_QUERY_NO_INDEX_USED" => ExprKind::Int(32),
+        b"MYSQLI_SERVER_QUERY_WAS_SLOW" => ExprKind::Int(2048),
+        b"MYSQLI_SERVER_PS_OUT_PARAMS" => ExprKind::Int(4096),
+        b"MYSQLI_IS_MARIADB" => ExprKind::Int(0),
+        // ext/gd (values from the PHP 8.5 oracle probe p01, WP-9).
+        b"IMG_GIF" => ExprKind::Int(1),
+        b"IMG_JPG" | b"IMG_JPEG" => ExprKind::Int(2),
+        b"IMG_PNG" => ExprKind::Int(4),
+        b"IMG_WBMP" => ExprKind::Int(8),
+        b"IMG_XPM" => ExprKind::Int(16),
+        b"IMG_WEBP" => ExprKind::Int(32),
+        // ext/xsl (values from the PHP 8.5 oracle probe, WP-19: the version
+        // constants are the SDK-header macros PHP was compiled against — the
+        // same system libxslt/libexslt we FFI to in php_types::xsltio).
+        b"XSL_CLONE_AUTO" => ExprKind::Int(0),
+        b"XSL_CLONE_NEVER" => ExprKind::Int(-1),
+        b"XSL_CLONE_ALWAYS" => ExprKind::Int(1),
+        b"XSL_SECPREF_NONE" => ExprKind::Int(0),
+        b"XSL_SECPREF_READ_FILE" => ExprKind::Int(2),
+        b"XSL_SECPREF_WRITE_FILE" => ExprKind::Int(4),
+        b"XSL_SECPREF_CREATE_DIRECTORY" => ExprKind::Int(8),
+        b"XSL_SECPREF_READ_NETWORK" => ExprKind::Int(16),
+        b"XSL_SECPREF_WRITE_NETWORK" => ExprKind::Int(32),
+        b"XSL_SECPREF_DEFAULT" => ExprKind::Int(44),
+        b"LIBXSLT_VERSION" => ExprKind::Int(10135),
+        b"LIBXSLT_DOTTED_VERSION" => ExprKind::Str(b"1.1.35".to_vec().into()),
+        b"LIBEXSLT_VERSION" => ExprKind::Int(820),
+        b"LIBEXSLT_DOTTED_VERSION" => ExprKind::Str(b"0.8.20".to_vec().into()),
+        // ext/tidy (all 161 constants from the PHP 8.5 oracle, WP-23; the
+        // node types are libtidy's TidyNodeType, the tags its TidyTagId).
+        b"TIDY_NODETYPE_ROOT" => ExprKind::Int(0),
+        b"TIDY_NODETYPE_DOCTYPE" => ExprKind::Int(1),
+        b"TIDY_NODETYPE_COMMENT" => ExprKind::Int(2),
+        b"TIDY_NODETYPE_PROCINS" => ExprKind::Int(3),
+        b"TIDY_NODETYPE_TEXT" => ExprKind::Int(4),
+        b"TIDY_NODETYPE_START" => ExprKind::Int(5),
+        b"TIDY_NODETYPE_END" => ExprKind::Int(6),
+        b"TIDY_NODETYPE_STARTEND" => ExprKind::Int(7),
+        b"TIDY_NODETYPE_CDATA" => ExprKind::Int(8),
+        b"TIDY_NODETYPE_SECTION" => ExprKind::Int(9),
+        b"TIDY_NODETYPE_ASP" => ExprKind::Int(10),
+        b"TIDY_NODETYPE_JSTE" => ExprKind::Int(11),
+        b"TIDY_NODETYPE_PHP" => ExprKind::Int(12),
+        b"TIDY_NODETYPE_XMLDECL" => ExprKind::Int(13),
+        b"TIDY_TAG_UNKNOWN" => ExprKind::Int(0),
+        b"TIDY_TAG_A" => ExprKind::Int(1),
+        b"TIDY_TAG_ABBR" => ExprKind::Int(2),
+        b"TIDY_TAG_ACRONYM" => ExprKind::Int(3),
+        b"TIDY_TAG_ADDRESS" => ExprKind::Int(4),
+        b"TIDY_TAG_ALIGN" => ExprKind::Int(5),
+        b"TIDY_TAG_APPLET" => ExprKind::Int(6),
+        b"TIDY_TAG_AREA" => ExprKind::Int(7),
+        b"TIDY_TAG_B" => ExprKind::Int(8),
+        b"TIDY_TAG_BASE" => ExprKind::Int(9),
+        b"TIDY_TAG_BASEFONT" => ExprKind::Int(10),
+        b"TIDY_TAG_BDO" => ExprKind::Int(11),
+        b"TIDY_TAG_BGSOUND" => ExprKind::Int(12),
+        b"TIDY_TAG_BIG" => ExprKind::Int(13),
+        b"TIDY_TAG_BLINK" => ExprKind::Int(14),
+        b"TIDY_TAG_BLOCKQUOTE" => ExprKind::Int(15),
+        b"TIDY_TAG_BODY" => ExprKind::Int(16),
+        b"TIDY_TAG_BR" => ExprKind::Int(17),
+        b"TIDY_TAG_BUTTON" => ExprKind::Int(18),
+        b"TIDY_TAG_CAPTION" => ExprKind::Int(19),
+        b"TIDY_TAG_CENTER" => ExprKind::Int(20),
+        b"TIDY_TAG_CITE" => ExprKind::Int(21),
+        b"TIDY_TAG_CODE" => ExprKind::Int(22),
+        b"TIDY_TAG_COL" => ExprKind::Int(23),
+        b"TIDY_TAG_COLGROUP" => ExprKind::Int(24),
+        b"TIDY_TAG_COMMENT" => ExprKind::Int(25),
+        b"TIDY_TAG_DD" => ExprKind::Int(26),
+        b"TIDY_TAG_DEL" => ExprKind::Int(27),
+        b"TIDY_TAG_DFN" => ExprKind::Int(28),
+        b"TIDY_TAG_DIR" => ExprKind::Int(29),
+        b"TIDY_TAG_DIV" => ExprKind::Int(30),
+        b"TIDY_TAG_DL" => ExprKind::Int(31),
+        b"TIDY_TAG_DT" => ExprKind::Int(32),
+        b"TIDY_TAG_EM" => ExprKind::Int(33),
+        b"TIDY_TAG_EMBED" => ExprKind::Int(34),
+        b"TIDY_TAG_FIELDSET" => ExprKind::Int(35),
+        b"TIDY_TAG_FONT" => ExprKind::Int(36),
+        b"TIDY_TAG_FORM" => ExprKind::Int(37),
+        b"TIDY_TAG_FRAME" => ExprKind::Int(38),
+        b"TIDY_TAG_FRAMESET" => ExprKind::Int(39),
+        b"TIDY_TAG_H1" => ExprKind::Int(40),
+        b"TIDY_TAG_H2" => ExprKind::Int(41),
+        b"TIDY_TAG_H3" => ExprKind::Int(42),
+        b"TIDY_TAG_H4" => ExprKind::Int(43),
+        b"TIDY_TAG_H5" => ExprKind::Int(44),
+        b"TIDY_TAG_H6" => ExprKind::Int(45),
+        b"TIDY_TAG_HEAD" => ExprKind::Int(46),
+        b"TIDY_TAG_HR" => ExprKind::Int(47),
+        b"TIDY_TAG_HTML" => ExprKind::Int(48),
+        b"TIDY_TAG_I" => ExprKind::Int(49),
+        b"TIDY_TAG_IFRAME" => ExprKind::Int(50),
+        b"TIDY_TAG_ILAYER" => ExprKind::Int(51),
+        b"TIDY_TAG_IMG" => ExprKind::Int(52),
+        b"TIDY_TAG_INPUT" => ExprKind::Int(53),
+        b"TIDY_TAG_INS" => ExprKind::Int(54),
+        b"TIDY_TAG_ISINDEX" => ExprKind::Int(55),
+        b"TIDY_TAG_KBD" => ExprKind::Int(56),
+        b"TIDY_TAG_KEYGEN" => ExprKind::Int(57),
+        b"TIDY_TAG_LABEL" => ExprKind::Int(58),
+        b"TIDY_TAG_LAYER" => ExprKind::Int(59),
+        b"TIDY_TAG_LEGEND" => ExprKind::Int(60),
+        b"TIDY_TAG_LI" => ExprKind::Int(61),
+        b"TIDY_TAG_LINK" => ExprKind::Int(62),
+        b"TIDY_TAG_LISTING" => ExprKind::Int(63),
+        b"TIDY_TAG_MAP" => ExprKind::Int(64),
+        b"TIDY_TAG_MARQUEE" => ExprKind::Int(66),
+        b"TIDY_TAG_MENU" => ExprKind::Int(67),
+        b"TIDY_TAG_META" => ExprKind::Int(68),
+        b"TIDY_TAG_MULTICOL" => ExprKind::Int(69),
+        b"TIDY_TAG_NOBR" => ExprKind::Int(70),
+        b"TIDY_TAG_NOEMBED" => ExprKind::Int(71),
+        b"TIDY_TAG_NOFRAMES" => ExprKind::Int(72),
+        b"TIDY_TAG_NOLAYER" => ExprKind::Int(73),
+        b"TIDY_TAG_NOSAVE" => ExprKind::Int(74),
+        b"TIDY_TAG_NOSCRIPT" => ExprKind::Int(75),
+        b"TIDY_TAG_OBJECT" => ExprKind::Int(76),
+        b"TIDY_TAG_OL" => ExprKind::Int(77),
+        b"TIDY_TAG_OPTGROUP" => ExprKind::Int(78),
+        b"TIDY_TAG_OPTION" => ExprKind::Int(79),
+        b"TIDY_TAG_P" => ExprKind::Int(80),
+        b"TIDY_TAG_PARAM" => ExprKind::Int(81),
+        b"TIDY_TAG_PLAINTEXT" => ExprKind::Int(83),
+        b"TIDY_TAG_PRE" => ExprKind::Int(84),
+        b"TIDY_TAG_Q" => ExprKind::Int(85),
+        b"TIDY_TAG_RB" => ExprKind::Int(86),
+        b"TIDY_TAG_RBC" => ExprKind::Int(87),
+        b"TIDY_TAG_RP" => ExprKind::Int(88),
+        b"TIDY_TAG_RT" => ExprKind::Int(89),
+        b"TIDY_TAG_RTC" => ExprKind::Int(90),
+        b"TIDY_TAG_RUBY" => ExprKind::Int(91),
+        b"TIDY_TAG_S" => ExprKind::Int(92),
+        b"TIDY_TAG_SAMP" => ExprKind::Int(93),
+        b"TIDY_TAG_SCRIPT" => ExprKind::Int(94),
+        b"TIDY_TAG_SELECT" => ExprKind::Int(95),
+        b"TIDY_TAG_SERVER" => ExprKind::Int(96),
+        b"TIDY_TAG_SERVLET" => ExprKind::Int(97),
+        b"TIDY_TAG_SMALL" => ExprKind::Int(98),
+        b"TIDY_TAG_SPACER" => ExprKind::Int(99),
+        b"TIDY_TAG_SPAN" => ExprKind::Int(100),
+        b"TIDY_TAG_STRIKE" => ExprKind::Int(101),
+        b"TIDY_TAG_STRONG" => ExprKind::Int(102),
+        b"TIDY_TAG_STYLE" => ExprKind::Int(103),
+        b"TIDY_TAG_SUB" => ExprKind::Int(104),
+        b"TIDY_TAG_SUP" => ExprKind::Int(105),
+        b"TIDY_TAG_TABLE" => ExprKind::Int(107),
+        b"TIDY_TAG_TBODY" => ExprKind::Int(108),
+        b"TIDY_TAG_TD" => ExprKind::Int(109),
+        b"TIDY_TAG_TEXTAREA" => ExprKind::Int(110),
+        b"TIDY_TAG_TFOOT" => ExprKind::Int(111),
+        b"TIDY_TAG_TH" => ExprKind::Int(112),
+        b"TIDY_TAG_THEAD" => ExprKind::Int(113),
+        b"TIDY_TAG_TITLE" => ExprKind::Int(114),
+        b"TIDY_TAG_TR" => ExprKind::Int(115),
+        b"TIDY_TAG_TT" => ExprKind::Int(116),
+        b"TIDY_TAG_U" => ExprKind::Int(117),
+        b"TIDY_TAG_UL" => ExprKind::Int(118),
+        b"TIDY_TAG_VAR" => ExprKind::Int(119),
+        b"TIDY_TAG_WBR" => ExprKind::Int(120),
+        b"TIDY_TAG_XMP" => ExprKind::Int(121),
+        b"TIDY_TAG_ARTICLE" => ExprKind::Int(123),
+        b"TIDY_TAG_ASIDE" => ExprKind::Int(124),
+        b"TIDY_TAG_AUDIO" => ExprKind::Int(125),
+        b"TIDY_TAG_BDI" => ExprKind::Int(126),
+        b"TIDY_TAG_CANVAS" => ExprKind::Int(127),
+        b"TIDY_TAG_COMMAND" => ExprKind::Int(128),
+        b"TIDY_TAG_DATALIST" => ExprKind::Int(130),
+        b"TIDY_TAG_DETAILS" => ExprKind::Int(131),
+        b"TIDY_TAG_DIALOG" => ExprKind::Int(132),
+        b"TIDY_TAG_FIGCAPTION" => ExprKind::Int(133),
+        b"TIDY_TAG_FIGURE" => ExprKind::Int(134),
+        b"TIDY_TAG_FOOTER" => ExprKind::Int(135),
+        b"TIDY_TAG_HEADER" => ExprKind::Int(136),
+        b"TIDY_TAG_HGROUP" => ExprKind::Int(137),
+        b"TIDY_TAG_MAIN" => ExprKind::Int(138),
+        b"TIDY_TAG_MARK" => ExprKind::Int(139),
+        b"TIDY_TAG_MENUITEM" => ExprKind::Int(140),
+        b"TIDY_TAG_METER" => ExprKind::Int(141),
+        b"TIDY_TAG_NAV" => ExprKind::Int(142),
+        b"TIDY_TAG_OUTPUT" => ExprKind::Int(143),
+        b"TIDY_TAG_PROGRESS" => ExprKind::Int(144),
+        b"TIDY_TAG_SECTION" => ExprKind::Int(145),
+        b"TIDY_TAG_SOURCE" => ExprKind::Int(146),
+        b"TIDY_TAG_SUMMARY" => ExprKind::Int(147),
+        b"TIDY_TAG_TEMPLATE" => ExprKind::Int(148),
+        b"TIDY_TAG_TIME" => ExprKind::Int(149),
+        b"TIDY_TAG_TRACK" => ExprKind::Int(150),
+        b"TIDY_TAG_VIDEO" => ExprKind::Int(151),
+        // ext/fileinfo (fileinfo.c REGISTER_LONG_CONSTANT values)
+        b"FILEINFO_NONE" => ExprKind::Int(0),
+        b"FILEINFO_SYMLINK" => ExprKind::Int(2),
+        b"FILEINFO_MIME" => ExprKind::Int(1040),
+        b"FILEINFO_MIME_TYPE" => ExprKind::Int(16),
+        b"FILEINFO_MIME_ENCODING" => ExprKind::Int(1024),
+        b"FILEINFO_DEVICES" => ExprKind::Int(8),
+        b"FILEINFO_CONTINUE" => ExprKind::Int(32),
+        b"FILEINFO_PRESERVE_ATIME" => ExprKind::Int(128),
+        b"FILEINFO_RAW" => ExprKind::Int(256),
+        b"FILEINFO_EXTENSION" => ExprKind::Int(16777216),
+        b"FILEINFO_APPLE" => ExprKind::Int(2048),
+        b"IMG_BMP" => ExprKind::Int(64),
+        b"IMG_TGA" => ExprKind::Int(128),
+        b"IMG_AVIF" => ExprKind::Int(256),
+        b"IMG_WEBP_LOSSLESS" => ExprKind::Int(101),
+        b"IMG_FLIP_HORIZONTAL" => ExprKind::Int(1),
+        b"IMG_FLIP_VERTICAL" => ExprKind::Int(2),
+        b"IMG_FLIP_BOTH" => ExprKind::Int(3),
+        b"IMG_COLOR_STYLED" => ExprKind::Int(-2),
+        b"IMG_COLOR_BRUSHED" => ExprKind::Int(-3),
+        b"IMG_COLOR_STYLEDBRUSHED" => ExprKind::Int(-4),
+        b"IMG_COLOR_TILED" => ExprKind::Int(-5),
+        b"IMG_COLOR_TRANSPARENT" => ExprKind::Int(-6),
+        b"IMG_ARC_ROUNDED" | b"IMG_ARC_PIE" => ExprKind::Int(0),
+        b"IMG_ARC_CHORD" => ExprKind::Int(1),
+        b"IMG_ARC_NOFILL" => ExprKind::Int(2),
+        b"IMG_ARC_EDGED" => ExprKind::Int(4),
+        b"IMG_GD2_RAW" => ExprKind::Int(1),
+        b"IMG_GD2_COMPRESSED" => ExprKind::Int(2),
+        b"IMG_EFFECT_REPLACE" => ExprKind::Int(0),
+        b"IMG_EFFECT_ALPHABLEND" => ExprKind::Int(1),
+        b"IMG_EFFECT_NORMAL" => ExprKind::Int(2),
+        b"IMG_EFFECT_OVERLAY" => ExprKind::Int(3),
+        b"IMG_EFFECT_MULTIPLY" => ExprKind::Int(4),
+        b"IMG_CROP_DEFAULT" => ExprKind::Int(0),
+        b"IMG_CROP_TRANSPARENT" => ExprKind::Int(1),
+        b"IMG_CROP_BLACK" => ExprKind::Int(2),
+        b"IMG_CROP_WHITE" => ExprKind::Int(3),
+        b"IMG_CROP_SIDES" => ExprKind::Int(4),
+        b"IMG_CROP_THRESHOLD" => ExprKind::Int(5),
+        b"IMG_BELL" => ExprKind::Int(1),
+        b"IMG_BESSEL" => ExprKind::Int(2),
+        b"IMG_BILINEAR_FIXED" => ExprKind::Int(3),
+        b"IMG_BICUBIC" => ExprKind::Int(4),
+        b"IMG_BICUBIC_FIXED" => ExprKind::Int(5),
+        b"IMG_BLACKMAN" => ExprKind::Int(6),
+        b"IMG_BOX" => ExprKind::Int(7),
+        b"IMG_BSPLINE" => ExprKind::Int(8),
+        b"IMG_CATMULLROM" => ExprKind::Int(9),
+        b"IMG_GAUSSIAN" => ExprKind::Int(10),
+        b"IMG_GENERALIZED_CUBIC" => ExprKind::Int(11),
+        b"IMG_HERMITE" => ExprKind::Int(12),
+        b"IMG_HAMMING" => ExprKind::Int(13),
+        b"IMG_HANNING" => ExprKind::Int(14),
+        b"IMG_MITCHELL" => ExprKind::Int(15),
+        b"IMG_NEAREST_NEIGHBOUR" => ExprKind::Int(16),
+        b"IMG_POWER" => ExprKind::Int(17),
+        b"IMG_QUADRATIC" => ExprKind::Int(18),
+        b"IMG_SINC" => ExprKind::Int(19),
+        b"IMG_TRIANGLE" => ExprKind::Int(20),
+        b"IMG_WEIGHTED4" => ExprKind::Int(21),
+        b"IMG_AFFINE_TRANSLATE" => ExprKind::Int(0),
+        b"IMG_AFFINE_SCALE" => ExprKind::Int(1),
+        b"IMG_AFFINE_ROTATE" => ExprKind::Int(2),
+        b"IMG_AFFINE_SHEAR_HORIZONTAL" => ExprKind::Int(3),
+        b"IMG_AFFINE_SHEAR_VERTICAL" => ExprKind::Int(4),
+        b"IMG_FILTER_NEGATE" => ExprKind::Int(0),
+        b"IMG_FILTER_GRAYSCALE" => ExprKind::Int(1),
+        b"IMG_FILTER_BRIGHTNESS" => ExprKind::Int(2),
+        b"IMG_FILTER_CONTRAST" => ExprKind::Int(3),
+        b"IMG_FILTER_COLORIZE" => ExprKind::Int(4),
+        b"IMG_FILTER_EDGEDETECT" => ExprKind::Int(5),
+        b"IMG_FILTER_EMBOSS" => ExprKind::Int(6),
+        b"IMG_FILTER_GAUSSIAN_BLUR" => ExprKind::Int(7),
+        b"IMG_FILTER_SELECTIVE_BLUR" => ExprKind::Int(8),
+        b"IMG_FILTER_MEAN_REMOVAL" => ExprKind::Int(9),
+        b"IMG_FILTER_SMOOTH" => ExprKind::Int(10),
+        b"IMG_FILTER_PIXELATE" => ExprKind::Int(11),
+        b"IMG_FILTER_SCATTER" => ExprKind::Int(12),
+        b"GD_VERSION" => str_lit(b"2.3.3"),
+        b"GD_MAJOR_VERSION" => ExprKind::Int(2),
+        b"GD_MINOR_VERSION" => ExprKind::Int(3),
+        b"GD_RELEASE_VERSION" => ExprKind::Int(3),
+        b"GD_EXTRA_VERSION" => str_lit(b""),
+        b"GD_BUNDLED" => ExprKind::Int(0),
+        b"PNG_NO_FILTER" => ExprKind::Int(0),
+        b"PNG_FILTER_NONE" => ExprKind::Int(8),
+        b"PNG_FILTER_SUB" => ExprKind::Int(16),
+        b"PNG_FILTER_UP" => ExprKind::Int(32),
+        b"PNG_FILTER_AVG" => ExprKind::Int(64),
+        b"PNG_FILTER_PAETH" => ExprKind::Int(128),
+        b"PNG_ALL_FILTERS" => ExprKind::Int(248),
+        // ext/exif.
+        b"EXIF_USE_MBSTRING" => ExprKind::Int(1),
+        // ext/zlib: encodings (deflate windowBits), strategies, version.
+        b"ZLIB_ENCODING_RAW" => ExprKind::Int(-15),
+        b"ZLIB_ENCODING_DEFLATE" => ExprKind::Int(15),
+        b"ZLIB_ENCODING_GZIP" => ExprKind::Int(31),
+        b"FORCE_GZIP" => ExprKind::Int(31),
+        b"FORCE_DEFLATE" => ExprKind::Int(15),
+        b"ZLIB_DEFAULT_STRATEGY" => ExprKind::Int(0),
+        b"ZLIB_FILTERED" => ExprKind::Int(1),
+        b"ZLIB_HUFFMAN_ONLY" => ExprKind::Int(2),
+        b"ZLIB_RLE" => ExprKind::Int(3),
+        b"ZLIB_FIXED" => ExprKind::Int(4),
+        b"ZLIB_BLOCK" => ExprKind::Int(5),
+        b"ZLIB_NO_FLUSH" => ExprKind::Int(0),
+        b"ZLIB_PARTIAL_FLUSH" => ExprKind::Int(1),
+        b"ZLIB_SYNC_FLUSH" => ExprKind::Int(2),
+        b"ZLIB_FULL_FLUSH" => ExprKind::Int(3),
+        b"ZLIB_FINISH" => ExprKind::Int(4),
+        b"ZLIB_VERSION" => str_lit(b"1.2.12"),
+        b"ZLIB_VERNUM" => ExprKind::Int(0x12c0),
+        // zlib status codes (inflate_get_status).
+        b"ZLIB_OK" => ExprKind::Int(0),
+        b"ZLIB_STREAM_END" => ExprKind::Int(1),
+        b"ZLIB_NEED_DICT" => ExprKind::Int(2),
+        b"ZLIB_ERRNO" => ExprKind::Int(-1),
+        b"ZLIB_STREAM_ERROR" => ExprKind::Int(-2),
+        b"ZLIB_DATA_ERROR" => ExprKind::Int(-3),
+        b"ZLIB_MEM_ERROR" => ExprKind::Int(-4),
+        b"ZLIB_BUF_ERROR" => ExprKind::Int(-5),
+        b"ZLIB_VERSION_ERROR" => ExprKind::Int(-6),
+        // Stream filter directions (stream_filter_append).
+        b"STREAM_FILTER_READ" => ExprKind::Int(1),
+        b"STREAM_FILTER_WRITE" => ExprKind::Int(2),
+        b"STREAM_FILTER_ALL" => ExprKind::Int(3),
+        // stream_socket_enable_crypto methods (oracle 8.5 values; WP-72:
+        // Symfony HttpClientKernel reads TLSv1_2_CLIENT).
+        b"STREAM_CRYPTO_METHOD_ANY_CLIENT" => ExprKind::Int(127),
+        b"STREAM_CRYPTO_METHOD_SSLv2_CLIENT" => ExprKind::Int(3),
+        b"STREAM_CRYPTO_METHOD_SSLv3_CLIENT" => ExprKind::Int(5),
+        b"STREAM_CRYPTO_METHOD_SSLv23_CLIENT" => ExprKind::Int(57),
+        b"STREAM_CRYPTO_METHOD_TLS_CLIENT" => ExprKind::Int(121),
+        b"STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT" => ExprKind::Int(9),
+        b"STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT" => ExprKind::Int(17),
+        b"STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT" => ExprKind::Int(33),
+        b"STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT" => ExprKind::Int(65),
+        b"STREAM_CRYPTO_METHOD_ANY_SERVER" => ExprKind::Int(126),
+        b"STREAM_CRYPTO_METHOD_SSLv2_SERVER" => ExprKind::Int(2),
+        b"STREAM_CRYPTO_METHOD_SSLv3_SERVER" => ExprKind::Int(4),
+        b"STREAM_CRYPTO_METHOD_SSLv23_SERVER" => ExprKind::Int(120),
+        b"STREAM_CRYPTO_METHOD_TLS_SERVER" => ExprKind::Int(120),
+        b"STREAM_CRYPTO_METHOD_TLSv1_0_SERVER" => ExprKind::Int(8),
+        b"STREAM_CRYPTO_METHOD_TLSv1_1_SERVER" => ExprKind::Int(16),
+        b"STREAM_CRYPTO_METHOD_TLSv1_2_SERVER" => ExprKind::Int(32),
+        b"STREAM_CRYPTO_METHOD_TLSv1_3_SERVER" => ExprKind::Int(64),
+        b"STREAM_CRYPTO_PROTO_SSLv3" => ExprKind::Int(4),
+        b"STREAM_CRYPTO_PROTO_TLSv1_0" => ExprKind::Int(8),
+        b"STREAM_CRYPTO_PROTO_TLSv1_1" => ExprKind::Int(16),
+        b"STREAM_CRYPTO_PROTO_TLSv1_2" => ExprKind::Int(32),
+        b"STREAM_CRYPTO_PROTO_TLSv1_3" => ExprKind::Int(64),
+        // Output-handler phase flags (ob_start callbacks).
+        b"PHP_OUTPUT_HANDLER_WRITE" | b"PHP_OUTPUT_HANDLER_CONT" => ExprKind::Int(0),
+        b"PHP_OUTPUT_HANDLER_START" => ExprKind::Int(1),
+        b"PHP_OUTPUT_HANDLER_CLEAN" => ExprKind::Int(2),
+        b"PHP_OUTPUT_HANDLER_FLUSH" => ExprKind::Int(4),
+        b"PHP_OUTPUT_HANDLER_FINAL" | b"PHP_OUTPUT_HANDLER_END" => ExprKind::Int(8),
+        b"PHP_OUTPUT_HANDLER_CLEANABLE" => ExprKind::Int(16),
+        b"PHP_OUTPUT_HANDLER_FLUSHABLE" => ExprKind::Int(32),
+        b"PHP_OUTPUT_HANDLER_REMOVABLE" => ExprKind::Int(64),
+        b"PHP_OUTPUT_HANDLER_STDFLAGS" => ExprKind::Int(112),
+        // ext/tokenizer T_* token ids (PHP 8.5 parser values).
+        b"T_LNUMBER" => ExprKind::Int(260),
+        b"T_DNUMBER" => ExprKind::Int(261),
+        b"T_STRING" => ExprKind::Int(262),
+        b"T_NAME_FULLY_QUALIFIED" => ExprKind::Int(263),
+        b"T_NAME_RELATIVE" => ExprKind::Int(264),
+        b"T_NAME_QUALIFIED" => ExprKind::Int(265),
+        b"T_VARIABLE" => ExprKind::Int(266),
+        b"T_INLINE_HTML" => ExprKind::Int(267),
+        b"T_ENCAPSED_AND_WHITESPACE" => ExprKind::Int(268),
+        b"T_CONSTANT_ENCAPSED_STRING" => ExprKind::Int(269),
+        b"T_STRING_VARNAME" => ExprKind::Int(270),
+        b"T_NUM_STRING" => ExprKind::Int(271),
+        b"T_INCLUDE" => ExprKind::Int(272),
+        b"T_INCLUDE_ONCE" => ExprKind::Int(273),
+        b"T_EVAL" => ExprKind::Int(274),
+        b"T_REQUIRE" => ExprKind::Int(275),
+        b"T_REQUIRE_ONCE" => ExprKind::Int(276),
+        b"T_LOGICAL_OR" => ExprKind::Int(277),
+        b"T_LOGICAL_XOR" => ExprKind::Int(278),
+        b"T_LOGICAL_AND" => ExprKind::Int(279),
+        b"T_PRINT" => ExprKind::Int(280),
+        b"T_YIELD" => ExprKind::Int(281),
+        b"T_YIELD_FROM" => ExprKind::Int(282),
+        b"T_INSTANCEOF" => ExprKind::Int(283),
+        b"T_NEW" => ExprKind::Int(284),
+        b"T_CLONE" => ExprKind::Int(285),
+        b"T_EXIT" => ExprKind::Int(286),
+        b"T_IF" => ExprKind::Int(287),
+        b"T_ELSEIF" => ExprKind::Int(288),
+        b"T_ELSE" => ExprKind::Int(289),
+        b"T_ENDIF" => ExprKind::Int(290),
+        b"T_ECHO" => ExprKind::Int(291),
+        b"T_DO" => ExprKind::Int(292),
+        b"T_WHILE" => ExprKind::Int(293),
+        b"T_ENDWHILE" => ExprKind::Int(294),
+        b"T_FOR" => ExprKind::Int(295),
+        b"T_ENDFOR" => ExprKind::Int(296),
+        b"T_FOREACH" => ExprKind::Int(297),
+        b"T_ENDFOREACH" => ExprKind::Int(298),
+        b"T_DECLARE" => ExprKind::Int(299),
+        b"T_ENDDECLARE" => ExprKind::Int(300),
+        b"T_AS" => ExprKind::Int(301),
+        b"T_SWITCH" => ExprKind::Int(302),
+        b"T_ENDSWITCH" => ExprKind::Int(303),
+        b"T_CASE" => ExprKind::Int(304),
+        b"T_DEFAULT" => ExprKind::Int(305),
+        b"T_MATCH" => ExprKind::Int(306),
+        b"T_BREAK" => ExprKind::Int(307),
+        b"T_CONTINUE" => ExprKind::Int(308),
+        b"T_GOTO" => ExprKind::Int(309),
+        b"T_FUNCTION" => ExprKind::Int(310),
+        b"T_FN" => ExprKind::Int(311),
+        b"T_CONST" => ExprKind::Int(312),
+        b"T_RETURN" => ExprKind::Int(313),
+        b"T_TRY" => ExprKind::Int(314),
+        b"T_CATCH" => ExprKind::Int(315),
+        b"T_FINALLY" => ExprKind::Int(316),
+        b"T_THROW" => ExprKind::Int(317),
+        b"T_USE" => ExprKind::Int(318),
+        b"T_INSTEADOF" => ExprKind::Int(319),
+        b"T_GLOBAL" => ExprKind::Int(320),
+        b"T_STATIC" => ExprKind::Int(321),
+        b"T_ABSTRACT" => ExprKind::Int(322),
+        b"T_FINAL" => ExprKind::Int(323),
+        b"T_PRIVATE" => ExprKind::Int(324),
+        b"T_PROTECTED" => ExprKind::Int(325),
+        b"T_PUBLIC" => ExprKind::Int(326),
+        b"T_PRIVATE_SET" => ExprKind::Int(327),
+        b"T_PROTECTED_SET" => ExprKind::Int(328),
+        b"T_PUBLIC_SET" => ExprKind::Int(329),
+        b"T_READONLY" => ExprKind::Int(330),
+        b"T_VAR" => ExprKind::Int(331),
+        b"T_UNSET" => ExprKind::Int(332),
+        b"T_ISSET" => ExprKind::Int(333),
+        b"T_EMPTY" => ExprKind::Int(334),
+        b"T_HALT_COMPILER" => ExprKind::Int(335),
+        b"T_CLASS" => ExprKind::Int(336),
+        b"T_TRAIT" => ExprKind::Int(337),
+        b"T_INTERFACE" => ExprKind::Int(338),
+        b"T_ENUM" => ExprKind::Int(339),
+        b"T_EXTENDS" => ExprKind::Int(340),
+        b"T_IMPLEMENTS" => ExprKind::Int(341),
+        b"T_NAMESPACE" => ExprKind::Int(342),
+        b"T_LIST" => ExprKind::Int(343),
+        b"T_ARRAY" => ExprKind::Int(344),
+        b"T_CALLABLE" => ExprKind::Int(345),
+        b"T_LINE" => ExprKind::Int(346),
+        b"T_FILE" => ExprKind::Int(347),
+        b"T_DIR" => ExprKind::Int(348),
+        b"T_CLASS_C" => ExprKind::Int(349),
+        b"T_TRAIT_C" => ExprKind::Int(350),
+        b"T_METHOD_C" => ExprKind::Int(351),
+        b"T_FUNC_C" => ExprKind::Int(352),
+        b"T_PROPERTY_C" => ExprKind::Int(353),
+        b"T_NS_C" => ExprKind::Int(354),
+        b"T_ATTRIBUTE" => ExprKind::Int(355),
+        b"T_PLUS_EQUAL" => ExprKind::Int(356),
+        b"T_MINUS_EQUAL" => ExprKind::Int(357),
+        b"T_MUL_EQUAL" => ExprKind::Int(358),
+        b"T_DIV_EQUAL" => ExprKind::Int(359),
+        b"T_CONCAT_EQUAL" => ExprKind::Int(360),
+        b"T_MOD_EQUAL" => ExprKind::Int(361),
+        b"T_AND_EQUAL" => ExprKind::Int(362),
+        b"T_OR_EQUAL" => ExprKind::Int(363),
+        b"T_XOR_EQUAL" => ExprKind::Int(364),
+        b"T_SL_EQUAL" => ExprKind::Int(365),
+        b"T_SR_EQUAL" => ExprKind::Int(366),
+        b"T_COALESCE_EQUAL" => ExprKind::Int(367),
+        b"T_BOOLEAN_OR" => ExprKind::Int(368),
+        b"T_BOOLEAN_AND" => ExprKind::Int(369),
+        b"T_IS_EQUAL" => ExprKind::Int(370),
+        b"T_IS_NOT_EQUAL" => ExprKind::Int(371),
+        b"T_IS_IDENTICAL" => ExprKind::Int(372),
+        b"T_IS_NOT_IDENTICAL" => ExprKind::Int(373),
+        b"T_IS_SMALLER_OR_EQUAL" => ExprKind::Int(374),
+        b"T_IS_GREATER_OR_EQUAL" => ExprKind::Int(375),
+        b"T_SPACESHIP" => ExprKind::Int(376),
+        b"T_SL" => ExprKind::Int(377),
+        b"T_SR" => ExprKind::Int(378),
+        b"T_INC" => ExprKind::Int(379),
+        b"T_DEC" => ExprKind::Int(380),
+        b"T_INT_CAST" => ExprKind::Int(381),
+        b"T_DOUBLE_CAST" => ExprKind::Int(382),
+        b"T_STRING_CAST" => ExprKind::Int(383),
+        b"T_ARRAY_CAST" => ExprKind::Int(384),
+        b"T_OBJECT_CAST" => ExprKind::Int(385),
+        b"T_BOOL_CAST" => ExprKind::Int(386),
+        b"T_UNSET_CAST" => ExprKind::Int(387),
+        b"T_VOID_CAST" => ExprKind::Int(388),
+        b"T_OBJECT_OPERATOR" => ExprKind::Int(389),
+        b"T_NULLSAFE_OBJECT_OPERATOR" => ExprKind::Int(390),
+        b"T_DOUBLE_ARROW" => ExprKind::Int(391),
+        b"T_COMMENT" => ExprKind::Int(392),
+        b"T_DOC_COMMENT" => ExprKind::Int(393),
+        b"T_OPEN_TAG" => ExprKind::Int(394),
+        b"T_OPEN_TAG_WITH_ECHO" => ExprKind::Int(395),
+        b"T_CLOSE_TAG" => ExprKind::Int(396),
+        b"T_WHITESPACE" => ExprKind::Int(397),
+        b"T_START_HEREDOC" => ExprKind::Int(398),
+        b"T_END_HEREDOC" => ExprKind::Int(399),
+        b"T_DOLLAR_OPEN_CURLY_BRACES" => ExprKind::Int(400),
+        b"T_CURLY_OPEN" => ExprKind::Int(401),
+        b"T_DOUBLE_COLON" => ExprKind::Int(402),
+        b"T_NS_SEPARATOR" => ExprKind::Int(403),
+        b"T_ELLIPSIS" => ExprKind::Int(404),
+        b"T_COALESCE" => ExprKind::Int(405),
+        b"T_POW" => ExprKind::Int(406),
+        b"T_POW_EQUAL" => ExprKind::Int(407),
+        b"T_PIPE" => ExprKind::Int(408),
+        b"T_AMPERSAND_FOLLOWED_BY_VAR_OR_VARARG" => ExprKind::Int(409),
+        b"T_AMPERSAND_NOT_FOLLOWED_BY_VAR_OR_VARARG" => ExprKind::Int(410),
+        b"T_BAD_CHARACTER" => ExprKind::Int(411),
+        b"T_PAAMAYIM_NEKUDOTAYIM" => ExprKind::Int(402),
+        b"TOKEN_PARSE" => ExprKind::Int(1),
+        b"TOKEN_AS_OBJECT" => ExprKind::Int(1),
+        // Math.
+        b"M_PI" => ExprKind::Float(std::f64::consts::PI),
+        b"M_E" => ExprKind::Float(std::f64::consts::E),
+        b"M_SQRT2" => ExprKind::Float(std::f64::consts::SQRT_2),
+        b"M_SQRT1_2" => ExprKind::Float(std::f64::consts::FRAC_1_SQRT_2),
+        b"M_SQRT3" => ExprKind::Float(1.732_050_807_568_877_2),
+        b"M_PI_2" => ExprKind::Float(std::f64::consts::FRAC_PI_2),
+        b"M_PI_4" => ExprKind::Float(std::f64::consts::FRAC_PI_4),
+        b"M_2_PI" => ExprKind::Float(std::f64::consts::FRAC_2_PI),
+        b"M_LN2" => ExprKind::Float(std::f64::consts::LN_2),
+        b"M_LN10" => ExprKind::Float(std::f64::consts::LN_10),
+        b"M_LOG2E" => ExprKind::Float(std::f64::consts::LOG2_E),
+        b"M_LOG10E" => ExprKind::Float(std::f64::consts::LOG10_E),
+        b"M_EULER" => ExprKind::Float(0.577_215_664_901_532_9),
+        // The 689 ext/curl constants live in a generated sorted table
+        // (lower/curl_consts.rs) rather than as match arms here.
+        _ => return curl_consts::curl_constant(name).map(ExprKind::Int),
+    })
+}
+
+/// Collect the names (with leading `$`) of every direct variable reachable from
+/// `expr`, used to discover an arrow function's free variables (step 18, D-18.4).
+///
+/// The walk descends into nested closures/arrows too. Over-collecting is safe:
+/// a captured-but-unused value is bound into an unused slot and never observed,
+/// while a variable a nested closure references via `use` must be available in
+/// the arrow's frame — so seeing it here is exactly what makes that work.
+fn collect_direct_vars<'a>(expr: &'a Expression<'a>, out: &mut Vec<&'a [u8]>) {
+    let mut stack: Vec<Node<'a, 'a>> = vec![Node::Expression(expr)];
+    while let Some(node) = stack.pop() {
+        if let Node::DirectVariable(d) = node {
+            if !out.contains(&d.name) {
+                out.push(d.name);
+            }
+        }
+        stack.extend(node.children());
+    }
+}
+
+/// PHP `dirname()` of the script path, for `__DIR__` (step 49). No separator →
+/// `"."`; a leading-slash-only parent → `"/"`; otherwise the bytes before the
+/// last `/`. Matches PHP for the POSIX paths `.phpt` runners use.
+fn dirname(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        None => b".",
+        Some(0) => b"/",
+        Some(i) => &path[..i],
+    }
+}
+
+/// Drop a single leading newline (`\r\n` or `\n`) — the byte `?>` swallows.
+fn strip_one_newline(bytes: &[u8]) -> &[u8] {
+    if let Some(rest) = bytes.strip_prefix(b"\r\n") {
+        rest
+    } else if let Some(rest) = bytes.strip_prefix(b"\n") {
+        rest
+    } else {
+        bytes
+    }
+}
+
+/// Strip the leading `$` from a mago direct-variable name (`b"$foo"` → `b"foo"`).
+/// Recognise `$GLOBALS['constant-string']` — the superglobal indexed by a
+/// literal string — and return the decoded global variable name (step 12-3,
+/// D-12.3). A dynamic index or the whole `$GLOBALS` array yields `None`; the
+/// caller then treats `$GLOBALS` as an ordinary variable (those forms are out of
+/// step 12 scope, D-12.6).
+fn globals_key(array: &Expression, index: &Expression) -> Option<Vec<u8>> {
+    let Expression::Variable(Variable::Direct(d)) = array else {
+        return None;
+    };
+    if strip_dollar(d.name) != b"GLOBALS".as_slice() {
+        return None;
+    }
+    match index {
+        Expression::Literal(Literal::String(s)) => s.value.map(|b| b.to_vec()),
+        _ => None,
+    }
+}
+
+/// Whether `e` is a place that can be returned by reference (`return <lvalue>`
+/// in a `function &f()`, step 13). Only the lvalue shapes `lower_place` accepts
+/// as a *readable* place: a direct variable or an array access (incl.
+/// `$GLOBALS['x']`), through parentheses. `$a[]` (append) is not readable.
+fn is_returnable_lvalue(e: &Expression) -> bool {
+    match e {
+        Expression::Variable(Variable::Direct(_)) => true,
+        Expression::ArrayAccess(_) => true,
+        // `return $obj->prop;` / `return $this->$name;` — a (non-nullsafe) property
+        // access is a place `lower_place` accepts, so it returns a real reference
+        // (D-13.3) rather than copying with the by-ref Notice.
+        Expression::Access(mago_syntax::ast::Access::Property(_)) => true,
+        Expression::Parenthesized(p) => is_returnable_lvalue(p.expression),
+        _ => false,
+    }
+}
+
+/// Map an AST type hint to an enforced [`TypeHint`], or `None` for any hint that
+/// step 14 does not enforce (class, union, array, mixed, …). Only the four
+/// scalar hints and their nullable forms are enforced (D-14.1/D-14.2).
+fn lower_hint(lo: &Lowerer, hint: &Hint) -> Option<TypeHint> {
+    let kind = match hint {
+        Hint::Integer(_) => HintKind::Scalar(ScalarType::Int),
+        Hint::Float(_) => HintKind::Scalar(ScalarType::Float),
+        Hint::String(_) => HintKind::Scalar(ScalarType::String),
+        Hint::Bool(_) => HintKind::Scalar(ScalarType::Bool),
+        Hint::Array(_) => HintKind::Array,
+        Hint::Callable(_) => HintKind::Callable,
+        Hint::Iterable(_) => HintKind::Iterable,
+        Hint::Object(_) => HintKind::Object,
+        // A class / interface name → an `instanceof` check at the binder. A name
+        // that is actually a reserved type keyword (a *qualified* `\int`, `\bool`,
+        // …, which PHP rejects as "must be unqualified") is left unenforced rather
+        // than mistaken for a class.
+        Hint::Identifier(id) => {
+            // A reserved scalar/type keyword is decided on the *bare* last segment
+            // (`\int` → `int`); a real class hint resolves to its FQN (step 50).
+            if is_reserved_type_name(bare_last_segment(id)) {
+                return None;
+            }
+            HintKind::Class(lo.resolve_class(id))
+        }
+        Hint::Nullable(n) => {
+            // `?T`: enforce only when the inner hint is itself enforced.
+            let inner = lower_hint(lo, n.hint)?;
+            return Some(TypeHint { nullable: true, ..inner });
+        }
+        // `A|B[|null]`: enforced when EVERY member is itself enforceable —
+        // `null` folds into nullability, a single surviving member collapses
+        // to a plain hint. Any unenforceable member (mixed, `self`, literal
+        // `true`, a nested intersection, …) keeps the whole union unenforced.
+        Hint::Union(_) => {
+            let mut members: Vec<HintKind> = Vec::new();
+            let mut nullable = false;
+            if !collect_enforced_union(lo, hint, &mut members, &mut nullable) {
+                return None;
+            }
+            return match members.len() {
+                0 => None,
+                1 => Some(TypeHint { kind: members.pop().expect("len checked"), nullable }),
+                _ => Some(TypeHint { kind: HintKind::Union(members), nullable }),
+            };
+        }
+        // Intersection / `self`/`parent`/`static` / `mixed` / `void` /
+        // literal types stay unenforced (lowered to `None`) for now.
+        _ => return None,
+    };
+    Some(TypeHint { kind, nullable: false })
+}
+
+/// Collect the enforceable members of a union hint, flattening nested unions
+/// and folding `null` / `?T` into `nullable`. Returns `false` when any member
+/// is not enforceable — the caller then leaves the whole union unenforced.
+fn collect_enforced_union(
+    lo: &Lowerer,
+    hint: &Hint,
+    out: &mut Vec<HintKind>,
+    nullable: &mut bool,
+) -> bool {
+    match hint {
+        Hint::Union(u) => {
+            collect_enforced_union(lo, u.left, out, nullable)
+                && collect_enforced_union(lo, u.right, out, nullable)
+        }
+        Hint::Parenthesized(p) => collect_enforced_union(lo, p.hint, out, nullable),
+        Hint::Null(_) => {
+            *nullable = true;
+            true
+        }
+        other => match lower_hint(lo, other) {
+            Some(TypeHint { kind, nullable: n }) => {
+                if n {
+                    *nullable = true;
+                }
+                out.push(kind);
+                true
+            }
+            None => false,
+        },
+    }
+}
+
+
+/// Capture a *composite* (union/intersection) declared type for reflection only.
+/// Returns `None` for any single type (which reflects through the enforced
+/// [`TypeHint`]) — so this never participates in the coercion binder and cannot
+/// change run-time behaviour. `A|B|null` / `A&B` flatten to their members.
+fn lower_reflect_type(lo: &Lowerer, hint: &Hint) -> Option<crate::hir::ReflectType> {
+    use crate::hir::ReflectType;
+    match hint {
+        Hint::Union(_) => {
+            let mut out = Vec::new();
+            collect_union_members(lo, hint, &mut out);
+            Some(ReflectType::Union(out))
+        }
+        Hint::Intersection(_) => {
+            let mut out = Vec::new();
+            collect_intersection_members(lo, hint, &mut out);
+            Some(ReflectType::Intersection(out))
+        }
+        Hint::Parenthesized(p) => lower_reflect_type(lo, p.hint),
+        // `?T` where T is a special single type the enforced hint can't model.
+        Hint::Nullable(n) => single_special(lo, n.hint).map(|(named, _)| ReflectType::Single(named, true)),
+        // A bare special single type (`mixed`/`void`/`self`/…); scalars, `array`,
+        // class names, etc. return `None` here and reflect via the enforced hint.
+        other => single_special(lo, other).map(|(named, nullable)| ReflectType::Single(named, nullable)),
+    }
+}
+
+/// A *special* single type (one the enforced [`TypeHint`] lowers to `None`) →
+/// its reflection `(name, builtin)` plus implicit `allowsNull`. Returns `None`
+/// for an ordinary type (scalar / `array` / class / object / …) so the enforced
+/// hint keeps reflecting it.
+fn single_special(lo: &Lowerer, hint: &Hint) -> Option<(crate::hir::ReflectNamed, bool)> {
+    use crate::hir::ReflectNamed;
+    let mk = |name: &[u8], builtin: bool, nullable: bool| {
+        Some((ReflectNamed { name: name.to_vec().into_boxed_slice(), builtin }, nullable))
+    };
+    match hint {
+        Hint::Mixed(_) => mk(b"mixed", true, true),
+        Hint::Null(_) => mk(b"null", true, true),
+        Hint::Void(_) => mk(b"void", true, false),
+        Hint::Never(_) => mk(b"never", true, false),
+        Hint::True(_) => mk(b"true", true, false),
+        Hint::False(_) => mk(b"false", true, false),
+        Hint::Static(_) => mk(b"static", false, false),
+        Hint::Parent(_) => mk(b"parent", false, false),
+        // `self` reflects as the enclosing class name (PHP resolves it).
+        Hint::Self_(_) => Some((
+            ReflectNamed {
+                name: lo.cur_class.clone().unwrap_or_else(|| b"self".to_vec().into_boxed_slice()),
+                builtin: false,
+            },
+            false,
+        )),
+        _ => None,
+    }
+}
+
+fn collect_union_members(lo: &Lowerer, hint: &Hint, out: &mut Vec<crate::hir::ReflectNamed>) {
+    match hint {
+        Hint::Union(u) => {
+            collect_union_members(lo, u.left, out);
+            collect_union_members(lo, u.right, out);
+        }
+        Hint::Parenthesized(p) => collect_union_members(lo, p.hint, out),
+        other => {
+            if let Some(n) = reflect_named(lo, other) {
+                out.push(n);
+            }
+        }
+    }
+}
+
+fn collect_intersection_members(lo: &Lowerer, hint: &Hint, out: &mut Vec<crate::hir::ReflectNamed>) {
+    match hint {
+        Hint::Intersection(i) => {
+            collect_intersection_members(lo, i.left, out);
+            collect_intersection_members(lo, i.right, out);
+        }
+        Hint::Parenthesized(p) => collect_intersection_members(lo, p.hint, out),
+        other => {
+            if let Some(n) = reflect_named(lo, other) {
+                out.push(n);
+            }
+        }
+    }
+}
+
+/// One leaf of a composite type → its reflection name + `builtin` flag.
+fn reflect_named(lo: &Lowerer, hint: &Hint) -> Option<crate::hir::ReflectNamed> {
+    use crate::hir::ReflectNamed;
+    let (name, builtin): (&[u8], bool) = match hint {
+        Hint::Integer(_) => (b"int", true),
+        Hint::Float(_) => (b"float", true),
+        Hint::String(_) => (b"string", true),
+        Hint::Bool(_) => (b"bool", true),
+        Hint::Array(_) => (b"array", true),
+        Hint::Callable(_) => (b"callable", true),
+        Hint::Iterable(_) => (b"iterable", true),
+        Hint::Object(_) => (b"object", true),
+        Hint::Null(_) => (b"null", true),
+        Hint::True(_) => (b"true", true),
+        Hint::False(_) => (b"false", true),
+        Hint::Void(_) => (b"void", true),
+        Hint::Never(_) => (b"never", true),
+        Hint::Mixed(_) => (b"mixed", true),
+        Hint::Static(_) => (b"static", false),
+        // `self` in a union reflects as the enclosing class name (PHP resolves it).
+        Hint::Self_(_) => {
+            return Some(ReflectNamed {
+                name: lo.cur_class.clone().unwrap_or_else(|| b"self".to_vec().into_boxed_slice()),
+                builtin: false,
+            })
+        }
+        Hint::Parent(_) => (b"parent", false),
+        Hint::Identifier(id) => return Some(ReflectNamed { name: lo.resolve_class(id), builtin: false }),
+        _ => return None,
+    };
+    Some(ReflectNamed { name: name.into(), builtin })
+}
+
+/// Whether `name` (case-insensitive) is a reserved type keyword rather than a
+/// class name — so a qualified form like `\int` is not mistaken for a class.
+fn is_reserved_type_name(name: &[u8]) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_slice(),
+        b"int" | b"float" | b"string" | b"bool" | b"array" | b"object" | b"callable"
+            | b"iterable" | b"void" | b"never" | b"mixed" | b"null" | b"false" | b"true"
+            | b"self" | b"parent" | b"static"
+    )
+}
+
+fn strip_dollar(name: &[u8]) -> &[u8] {
+    if name.first() == Some(&b'$') {
+        &name[1..]
+    } else {
+        name
+    }
+}
+
+/// PHP integer literal → HIR. Values exceeding `i64::MAX` promote to float,
+/// matching PHP's lexer. A literal too large even for `u64` (mago clamps its
+/// `value` to `u64::MAX`) is re-parsed from its own decimal text, so a
+/// several-hundred-digit literal becomes `INF` exactly as PHP does (bug #74947)
+/// rather than the clamped `~1.8e19`.
+fn lower_int(lit: &LiteralInteger, line: Line) -> Result<ExprKind, LowerError> {
+    if let Some(v) = lit.value {
+        if v <= i64::MAX as u64 {
+            return Ok(ExprKind::Int(v as i64));
+        }
+    }
+    // Overflows i64: promote to float by parsing the literal's own text (decimal
+    // only — hex/oct/bin overflow falls back to mago's value).
+    let raw = std::str::from_utf8(lit.raw).map_err(|_| LowerError::Unsupported {
+        what: "integer literal",
+        line,
+    })?;
+    let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+    if let Ok(f) = cleaned.parse::<f64>() {
+        return Ok(ExprKind::Float(f));
+    }
+    match lit.value {
+        Some(v) => Ok(ExprKind::Float(v as f64)),
+        None => Err(LowerError::Unsupported {
+            what: "integer literal overflow",
+            line,
+        }),
+    }
+}
+
+/// Map a non-logical, non-coalesce binary operator to its HIR counterpart.
+/// Logical (`&&`, `||`, `and`, `or`, `xor`), `??`, and `instanceof` are handled
+/// by the caller before reaching here.
+fn map_binop(op: BinaryOperator) -> BinOp {
+    match op {
+        BinaryOperator::Addition(_) => BinOp::Add,
+        BinaryOperator::Subtraction(_) => BinOp::Sub,
+        BinaryOperator::Multiplication(_) => BinOp::Mul,
+        BinaryOperator::Division(_) => BinOp::Div,
+        BinaryOperator::Modulo(_) => BinOp::Mod,
+        BinaryOperator::Exponentiation(_) => BinOp::Pow,
+        BinaryOperator::StringConcat(_) => BinOp::Concat,
+        BinaryOperator::BitwiseAnd(_) => BinOp::BitAnd,
+        BinaryOperator::BitwiseOr(_) => BinOp::BitOr,
+        BinaryOperator::BitwiseXor(_) => BinOp::BitXor,
+        BinaryOperator::LeftShift(_) => BinOp::Shl,
+        BinaryOperator::RightShift(_) => BinOp::Shr,
+        BinaryOperator::Equal(_) => BinOp::Eq,
+        BinaryOperator::NotEqual(_) | BinaryOperator::AngledNotEqual(_) => BinOp::NotEq,
+        BinaryOperator::Identical(_) => BinOp::Identical,
+        BinaryOperator::NotIdentical(_) => BinOp::NotIdentical,
+        BinaryOperator::LessThan(_) => BinOp::Lt,
+        BinaryOperator::LessThanOrEqual(_) => BinOp::Le,
+        BinaryOperator::GreaterThan(_) => BinOp::Gt,
+        BinaryOperator::GreaterThanOrEqual(_) => BinOp::Ge,
+        BinaryOperator::Spaceship(_) => BinOp::Spaceship,
+        // Logical / coalesce / instanceof are intercepted by the caller.
+        BinaryOperator::And(_)
+        | BinaryOperator::Or(_)
+        | BinaryOperator::LowAnd(_)
+        | BinaryOperator::LowOr(_)
+        | BinaryOperator::LowXor(_)
+        | BinaryOperator::NullCoalesce(_)
+        | BinaryOperator::Instanceof(_) => unreachable!("handled by lower_expr Binary arm"),
+    }
+}
