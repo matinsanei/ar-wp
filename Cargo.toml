@@ -7,15 +7,15 @@ members = [
     "crates/php-cli",
     "crates/phpt-runner",
     "crates/php-server",
-    "crates/wprust-server",
-    "crates/wprust-prototype",
+    "crates/arwp-server",
+    "crates/arwp-prototype",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "PHP-3.01"
-authors = ["Matin Sanei", "Francesco Tinti", "php-rust contributors"]
+license = "Apache-2.0"
+authors = ["Matin Sanei <saneimatin33@gmail.com>"]
 
 [workspace.dependencies]
 php-types = { path = "crates/php-types" }
