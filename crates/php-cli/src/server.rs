@@ -803,13 +803,13 @@ pub fn serve(addr: &str, mut rest: std::iter::Peekable<impl Iterator<Item = std:
     // relative fopen resolves against it).
     let _ = std::env::set_current_dir(&docroot);
 
-    let registry = php_builtins::registry();
-    let cfg = ServerConfig {
+    let registry = std::sync::Arc::new(php_builtins::registry());
+    let cfg = std::sync::Arc::new(ServerConfig {
         host: host.to_string(),
         port,
         docroot,
         router,
-    };
+    });
     let listener = match TcpListener::bind((host, port)) {
         Ok(l) => l,
         Err(e) => {
@@ -818,19 +818,57 @@ pub fn serve(addr: &str, mut rest: std::iter::Peekable<impl Iterator<Item = std:
         }
     };
     log_line(&format!(
-        "PHP 8.5.7 Development Server (http://{host}:{port}) started"
+        "AR-WP High-Performance Server (http://{host}:{port}) started"
     ));
+    let quiet = std::env::var_os("ARWP_QUIET").is_some();
+    let num_workers = std::env::var("ARWP_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .clamp(4, 32)
+        });
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TcpStream>(2048);
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+
+    for i in 0..num_workers {
+        let rx = std::sync::Arc::clone(&rx);
+        let cfg = std::sync::Arc::clone(&cfg);
+        let registry = std::sync::Arc::clone(&registry);
+        std::thread::Builder::new()
+            .name(format!("arwp-worker-{i}"))
+            .spawn(move || {
+                loop {
+                    let stream = {
+                        let Ok(guard) = rx.lock() else { break };
+                        guard.recv()
+                    };
+                    let Ok(mut stream) = stream else { break };
+                    let peer = stream
+                        .peer_addr()
+                        .map(|a| (a.ip().to_string(), a.port()))
+                        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 0));
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+                    if !quiet {
+                        log_line(&format!("{}:{} Accepted", peer.0, peer.1));
+                    }
+                    handle_client(&cfg, &registry, &mut stream, peer.clone());
+                    let _ = stream.flush();
+                    if !quiet {
+                        log_line(&format!("{}:{} Closing", peer.0, peer.1));
+                    }
+                }
+            })
+            .expect("spawn arwp worker thread");
+    }
+
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        let peer = stream
-            .peer_addr()
-            .map(|a| (a.ip().to_string(), a.port()))
-            .unwrap_or_else(|_| ("127.0.0.1".to_string(), 0));
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
-        log_line(&format!("{}:{} Accepted", peer.0, peer.1));
-        handle_client(&cfg, &registry, &mut stream, peer.clone());
-        let _ = stream.flush();
-        log_line(&format!("{}:{} Closing", peer.0, peer.1));
+        let Ok(stream) = stream else { continue };
+        let _ = tx.send(stream);
     }
     0
 }
