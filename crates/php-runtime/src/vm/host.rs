@@ -7724,4 +7724,197 @@ impl<'m> super::Vm<'m> {
         }
         Ok(Zval::Null)
     }
+
+    // =========================================================================
+    // AR-WP: Native High-Performance In-Memory Object Cache (DashMap backed)
+    // =========================================================================
+
+    pub(super) fn ho_arwp_cache_set(&mut self, args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let key_z = args.first().map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let val_z = args.get(1).map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let group_z = args.get(2).map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let expire_z = args.get(3).map(Zval::deref_clone).unwrap_or(Zval::Null);
+
+        let key = convert::to_zstr_cast(&key_z, &mut self.diags);
+        let group_zstr = match &group_z {
+            Zval::Null => None,
+            _ => Some(convert::to_zstr_cast(&group_z, &mut self.diags)),
+        };
+        let group = group_zstr.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
+        let expire_secs = match &expire_z {
+            Zval::Null => 0u64,
+            _ => convert::to_long_cast(&expire_z, &mut self.diags).max(0) as u64,
+        };
+
+        use crate::arwp_cache::{ArwpCache, CacheVal};
+        let cache_val = match &val_z {
+            Zval::Null => CacheVal::Null,
+            Zval::Bool(b) => CacheVal::Bool(*b),
+            Zval::Long(n) => CacheVal::Long(*n),
+            Zval::Double(d) => CacheVal::Double(*d),
+            Zval::Str(s) => CacheVal::Str(s.as_bytes().to_vec()),
+            _ => {
+                let ser_result = self.ho_serialize(vec![val_z])?;
+                match ser_result {
+                    Zval::Str(bytes) => CacheVal::Serialized(bytes.as_bytes().to_vec()),
+                    _ => CacheVal::Null,
+                }
+            }
+        };
+
+        let ok = ArwpCache::global().set(key.as_bytes(), cache_val, group, expire_secs);
+        Ok(Zval::Bool(ok))
+    }
+
+    pub(super) fn ho_arwp_cache_add(&mut self, args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let key_z = args.first().map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let val_z = args.get(1).map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let group_z = args.get(2).map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let expire_z = args.get(3).map(Zval::deref_clone).unwrap_or(Zval::Null);
+
+        let key = convert::to_zstr_cast(&key_z, &mut self.diags);
+        let group_zstr = match &group_z {
+            Zval::Null => None,
+            _ => Some(convert::to_zstr_cast(&group_z, &mut self.diags)),
+        };
+        let group = group_zstr.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
+        let expire_secs = match &expire_z {
+            Zval::Null => 0u64,
+            _ => convert::to_long_cast(&expire_z, &mut self.diags).max(0) as u64,
+        };
+
+        use crate::arwp_cache::{ArwpCache, CacheVal};
+        let cache_val = match &val_z {
+            Zval::Null => CacheVal::Null,
+            Zval::Bool(b) => CacheVal::Bool(*b),
+            Zval::Long(n) => CacheVal::Long(*n),
+            Zval::Double(d) => CacheVal::Double(*d),
+            Zval::Str(s) => CacheVal::Str(s.as_bytes().to_vec()),
+            _ => {
+                let ser_result = self.ho_serialize(vec![val_z])?;
+                match ser_result {
+                    Zval::Str(bytes) => CacheVal::Serialized(bytes.as_bytes().to_vec()),
+                    _ => CacheVal::Null,
+                }
+            }
+        };
+
+        let ok = ArwpCache::global().add(key.as_bytes(), cache_val, group, expire_secs);
+        Ok(Zval::Bool(ok))
+    }
+
+    pub(super) fn ho_arwp_cache_get(&mut self, args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let key_z = args.first().map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let group_z = args.get(1).map(Zval::deref_clone).unwrap_or(Zval::Null);
+
+        let key = convert::to_zstr_cast(&key_z, &mut self.diags);
+        let group_zstr = match &group_z {
+            Zval::Null => None,
+            _ => Some(convert::to_zstr_cast(&group_z, &mut self.diags)),
+        };
+        let group = group_zstr.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
+
+        use crate::arwp_cache::{ArwpCache, CacheVal};
+        match ArwpCache::global().get(key.as_bytes(), group) {
+            Some(val) => {
+                if let Some(Zval::Ref(r)) = args.get(3) {
+                    *r.borrow_mut() = Zval::Bool(true);
+                }
+                match val {
+                    CacheVal::Null => Ok(Zval::Null),
+                    CacheVal::Bool(b) => Ok(Zval::Bool(b)),
+                    CacheVal::Long(n) => Ok(Zval::Long(n)),
+                    CacheVal::Double(d) => Ok(Zval::Double(d)),
+                    CacheVal::Str(s) => Ok(Zval::Str(PhpStr::new(s))),
+                    CacheVal::Serialized(bytes) => {
+                        match crate::unserialize::parse(&bytes) {
+                            Some(ser) => self.vm_ser_to_zval(ser),
+                            None => Ok(Zval::Bool(false)),
+                        }
+                    }
+                }
+            }
+            None => {
+                if let Some(Zval::Ref(r)) = args.get(3) {
+                    *r.borrow_mut() = Zval::Bool(false);
+                }
+                Ok(Zval::Bool(false))
+            }
+        }
+    }
+
+    pub(super) fn ho_arwp_cache_delete(&mut self, args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let key_z = args.first().map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let group_z = args.get(1).map(Zval::deref_clone).unwrap_or(Zval::Null);
+
+        let key = convert::to_zstr_cast(&key_z, &mut self.diags);
+        let group_zstr = match &group_z {
+            Zval::Null => None,
+            _ => Some(convert::to_zstr_cast(&group_z, &mut self.diags)),
+        };
+        let group = group_zstr.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
+
+        let ok = crate::arwp_cache::ArwpCache::global().delete(key.as_bytes(), group);
+        Ok(Zval::Bool(ok))
+    }
+
+    pub(super) fn ho_arwp_cache_flush(&mut self, _args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let ok = crate::arwp_cache::ArwpCache::global().flush();
+        Ok(Zval::Bool(ok))
+    }
+
+    pub(super) fn ho_arwp_cache_incr(&mut self, args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let key_z = args.first().map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let offset_z = args.get(1).map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let group_z = args.get(2).map(Zval::deref_clone).unwrap_or(Zval::Null);
+
+        let key = convert::to_zstr_cast(&key_z, &mut self.diags);
+        let offset = match &offset_z {
+            Zval::Null => 1i64,
+            _ => convert::to_long_cast(&offset_z, &mut self.diags),
+        };
+        let group_zstr = match &group_z {
+            Zval::Null => None,
+            _ => Some(convert::to_zstr_cast(&group_z, &mut self.diags)),
+        };
+        let group = group_zstr.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
+
+        match crate::arwp_cache::ArwpCache::global().incr(key.as_bytes(), offset, group) {
+            Some(val) => Ok(Zval::Long(val)),
+            None => Ok(Zval::Bool(false)),
+        }
+    }
+
+    pub(super) fn ho_arwp_cache_decr(&mut self, args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let key_z = args.first().map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let offset_z = args.get(1).map(Zval::deref_clone).unwrap_or(Zval::Null);
+        let group_z = args.get(2).map(Zval::deref_clone).unwrap_or(Zval::Null);
+
+        let key = convert::to_zstr_cast(&key_z, &mut self.diags);
+        let offset = match &offset_z {
+            Zval::Null => 1i64,
+            _ => convert::to_long_cast(&offset_z, &mut self.diags),
+        };
+        let group_zstr = match &group_z {
+            Zval::Null => None,
+            _ => Some(convert::to_zstr_cast(&group_z, &mut self.diags)),
+        };
+        let group = group_zstr.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
+
+        match crate::arwp_cache::ArwpCache::global().decr(key.as_bytes(), offset, group) {
+            Some(val) => Ok(Zval::Long(val)),
+            None => Ok(Zval::Bool(false)),
+        }
+    }
+
+    pub(super) fn ho_arwp_cache_stats(&mut self, _args: Vec<Zval>) -> Result<Zval, PhpError> {
+        let (items, hits, misses, sets) = crate::arwp_cache::ArwpCache::global().stats();
+        let mut arr = PhpArray::new();
+        arr.insert(Key::from_bytes(b"items"), Zval::Long(items as i64));
+        arr.insert(Key::from_bytes(b"hits"), Zval::Long(hits as i64));
+        arr.insert(Key::from_bytes(b"misses"), Zval::Long(misses as i64));
+        arr.insert(Key::from_bytes(b"sets"), Zval::Long(sets as i64));
+        arr.insert(Key::from_bytes(b"engine"), Zval::Str(PhpStr::new(b"AR-WP Lock-Free DashMap".to_vec())));
+        Ok(Zval::Array(Rc::new(arr)))
+    }
 }

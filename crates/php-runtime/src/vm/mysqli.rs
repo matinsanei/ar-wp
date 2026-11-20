@@ -23,16 +23,18 @@
 use std::collections::VecDeque;
 
 use mysql::prelude::Queryable;
-use mysql::{Column, Conn, OptsBuilder, Value};
+use mysql::{Column, Conn, OptsBuilder, Pool, PooledConn, Value};
 use php_types::{convert, Key, PhpArray, PhpError, PhpStr, Zval};
 
 use super::Vm;
+
+static MYSQL_POOLS: std::sync::OnceLock<dashmap::DashMap<String, Pool>> = std::sync::OnceLock::new();
 
 /// One open connection: the wire handle plus the client-side state mysqli
 /// exposes (current charset name, buffered extra result sets of a
 /// `multi_query`, the last statement's info string).
 pub(super) struct MysqliConn {
-    conn: Conn,
+    conn: PooledConn,
     charset: String,
     /// Result sets after the current one (multi_query): payload arrays ready
     /// to hand to the prelude, popped by `__mysqli_next_result`.
@@ -345,9 +347,9 @@ impl<'m> Vm<'m> {
         // configs which always use TCP hosts; a socket path is honoured.
         let use_socket = socket.is_some();
         let mut builder = OptsBuilder::new()
-            .user(Some(user))
+            .user(Some(user.clone()))
             .pass(Some(pass))
-            .db_name(db)
+            .db_name(db.clone())
             .prefer_socket(false);
         if let Some(sock) = &socket {
             builder = builder.socket(Some(sock.clone()));
@@ -355,7 +357,21 @@ impl<'m> Vm<'m> {
             let tcp_host = if host == "localhost" { "127.0.0.1".to_string() } else { host.clone() };
             builder = builder.ip_or_hostname(Some(tcp_host)).tcp_port(port);
         }
-        match Conn::new(builder) {
+        let pool_key = format!("{user}@{host}:{port}/{:?}", db);
+        let pools = MYSQL_POOLS.get_or_init(dashmap::DashMap::new);
+        let conn_res = if let Some(pool) = pools.get(&pool_key) {
+            pool.get_conn()
+        } else {
+            match Pool::new(builder) {
+                Ok(pool) => {
+                    let conn = pool.get_conn();
+                    pools.insert(pool_key, pool);
+                    conn
+                }
+                Err(e) => Err(e),
+            }
+        };
+        match conn_res {
             Ok(mut conn) => {
                 // mysqlnd's handshake charset is utf8mb4 with the *server's*
                 // default collation (utf8mb4_0900_ai_ci on 8.0+); the crate
@@ -462,7 +478,7 @@ impl<'m> Vm<'m> {
             Err(e) => return Ok(e),
         };
         let db = String::from_utf8_lossy(&db).into_owned();
-        match mc.conn.select_db(&db) {
+        match mc.conn.as_mut().select_db(&db) {
             Ok(()) => Ok(Zval::Bool(true)),
             Err(e) => Ok(err_from(&e)),
         }
@@ -521,7 +537,7 @@ impl<'m> Vm<'m> {
             Ok(mc) => mc,
             Err(_) => return Ok(Zval::Bool(false)),
         };
-        Ok(Zval::Bool(mc.conn.ping().is_ok()))
+        Ok(Zval::Bool(mc.conn.as_mut().ping().is_ok()))
     }
 
     /// `__mysqli_stat($h)`: the COM_STATISTICS-shaped one-liner. Assembled
@@ -534,19 +550,19 @@ impl<'m> Vm<'m> {
         let one = |conn: &mut Conn, q: &str| -> Option<String> {
             conn.query_first::<(String, String), _>(q).ok().flatten().map(|(_, v)| v)
         };
-        let uptime = one(&mut mc.conn, "SHOW GLOBAL STATUS LIKE 'Uptime'").unwrap_or_default();
+        let uptime = one(mc.conn.as_mut(), "SHOW GLOBAL STATUS LIKE 'Uptime'").unwrap_or_default();
         let threads =
-            one(&mut mc.conn, "SHOW GLOBAL STATUS LIKE 'Threads_connected'").unwrap_or_default();
+            one(mc.conn.as_mut(), "SHOW GLOBAL STATUS LIKE 'Threads_connected'").unwrap_or_default();
         let questions =
-            one(&mut mc.conn, "SHOW GLOBAL STATUS LIKE 'Questions'").unwrap_or_default();
+            one(mc.conn.as_mut(), "SHOW GLOBAL STATUS LIKE 'Questions'").unwrap_or_default();
         let slow =
-            one(&mut mc.conn, "SHOW GLOBAL STATUS LIKE 'Slow_queries'").unwrap_or_default();
+            one(mc.conn.as_mut(), "SHOW GLOBAL STATUS LIKE 'Slow_queries'").unwrap_or_default();
         let opens =
-            one(&mut mc.conn, "SHOW GLOBAL STATUS LIKE 'Opened_tables'").unwrap_or_default();
+            one(mc.conn.as_mut(), "SHOW GLOBAL STATUS LIKE 'Opened_tables'").unwrap_or_default();
         let flush =
-            one(&mut mc.conn, "SHOW GLOBAL STATUS LIKE 'Flush_commands'").unwrap_or_default();
+            one(mc.conn.as_mut(), "SHOW GLOBAL STATUS LIKE 'Flush_commands'").unwrap_or_default();
         let open =
-            one(&mut mc.conn, "SHOW GLOBAL STATUS LIKE 'Open_tables'").unwrap_or_default();
+            one(mc.conn.as_mut(), "SHOW GLOBAL STATUS LIKE 'Open_tables'").unwrap_or_default();
         Ok(zstr(format!(
             "Uptime: {uptime}  Threads: {threads}  Questions: {questions}  Slow queries: {slow}  Opens: {opens}  Flush tables: {flush}  Open tables: {open}  Queries per second avg: 0.000"
         )))

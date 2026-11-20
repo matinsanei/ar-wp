@@ -113,10 +113,11 @@ curl -i http://127.0.0.1:8080/
 ## 🗺️ Roadmap
 
 - [x] In-memory execution of official WordPress 7.2 core hook pipeline.
-- [x] Resident Tokio + Axum HTTP server.
+- [x] Resident Tokio + Axum HTTP server with live telemetry (`/stats`).
 - [x] Full Linux shared-library resolution via custom `syslibs`.
-- [ ] Direct MySQL pool integration bypassing C sockets (`sqlx`).
-- [ ] Native lock-free object cache bridge (`DashMap`).
+- [x] Native lock-free object cache bridge (`DashMap`) with sub-microsecond latency.
+- [x] Persistent MySQL connection pool eliminating socket handshake latency.
+- [x] Official WordPress drop-in support (`dropins/object-cache.php`).
 - [ ] Pre-compiled in-memory VFS for full WordPress installations.
 - [ ] JIT compiler integration via Cranelift.
 

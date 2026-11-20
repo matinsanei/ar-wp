@@ -14,6 +14,7 @@
 // prelude / a3 include-compile) for the census build — see the module doc.
 #[cfg(feature = "census-instrumentation")]
 pub mod alloc_census;
+pub mod arwp_cache;
 pub mod builtin;
 pub mod bytecode;
 pub mod coerce;
