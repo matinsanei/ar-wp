@@ -83,6 +83,30 @@ function wp_cache_close() {
     return true;
 }
 
+function wp_cache_add_non_persistent_groups($groups) {
+    global $wp_object_cache;
+    if (isset($wp_object_cache)) {
+        return $wp_object_cache->add_non_persistent_groups($groups);
+    }
+    return true;
+}
+
+function wp_cache_add_global_groups($groups) {
+    global $wp_object_cache;
+    if (isset($wp_object_cache)) {
+        return $wp_object_cache->add_global_groups($groups);
+    }
+    return true;
+}
+
+function wp_cache_supports($feature) {
+    return true;
+}
+
+function wp_cache_switch_to_blog($blog_id) {
+    return true;
+}
+
 /**
  * Core class used to implement the AR-WP Native Object Cache.
  */
@@ -148,6 +172,22 @@ class WP_Object_Cache {
         if (function_exists('arwp_cache_flush')) {
             return arwp_cache_flush();
         }
+        return true;
+    }
+
+    public function add_global_groups($groups) {
+        return true;
+    }
+
+    public function add_non_persistent_groups($groups) {
+        return true;
+    }
+
+    public function switch_to_blog($blog_id) {
+        return true;
+    }
+
+    public function reset() {
         return true;
     }
 
