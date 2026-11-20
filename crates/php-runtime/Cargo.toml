@@ -59,10 +59,13 @@ php-types.workspace = true
 rustc-hash.workspace = true
 log.workspace = true
 log4rs.workspace = true
-mago-syntax = "1.30"
-mago-syntax-core = "1.30"
-mago-database = "1.30"
-mago-span = "1.30"
+mago-syntax = "=1.30.0"
+mago-syntax-core = "=1.30.0"
+mago-database = "=1.30.0"
+mago-span = "=1.30.0"
+mago-php-version = "=1.30.0"
+mago-text-edit = "=1.30.0"
+mago-reporting = "=1.30.0"
 bumpalo = "3"
 regex = "1"
 fancy-regex = "0.14"
